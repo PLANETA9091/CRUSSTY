@@ -18,6 +18,28 @@ pub fn get_value(
 }
 
 #[inline]
+fn get_value_scaled_second(
+    first: &PerlinNoise,
+    second: &PerlinNoise,
+    value_factor: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+    second_x: f64,
+    second_y: f64,
+    second_z: f64,
+) -> f64 {
+    (first.get_value_direct_math_wrap(x, y, z)
+        + second.get_value_direct_math_wrap(second_x, second_y, second_z))
+        * value_factor
+}
+
+#[inline]
+fn scaled_second(value: f64) -> f64 {
+    value * INPUT_FACTOR
+}
+
+#[inline]
 pub fn fill_positions(
     first: &PerlinNoise,
     second: &PerlinNoise,
@@ -35,7 +57,17 @@ pub fn fill_positions(
     }
 
     for index in 0..xs.len() {
-        dst[index] = get_value(first, second, value_factor, xs[index], ys[index], zs[index]);
+        dst[index] = get_value_scaled_second(
+            first,
+            second,
+            value_factor,
+            xs[index],
+            ys[index],
+            zs[index],
+            scaled_second(xs[index]),
+            scaled_second(ys[index]),
+            scaled_second(zs[index]),
+        );
     }
 
     Ok(())
@@ -61,13 +93,19 @@ pub fn fill_scaled_positions(
     }
 
     for index in 0..block_x.len() {
-        dst[index] = get_value(
+        let noise_x = block_x[index] as f64 * xz_scale;
+        let noise_y = block_y[index] as f64 * y_scale;
+        let noise_z = block_z[index] as f64 * xz_scale;
+        dst[index] = get_value_scaled_second(
             first,
             second,
             value_factor,
-            block_x[index] as f64 * xz_scale,
-            block_y[index] as f64 * y_scale,
-            block_z[index] as f64 * xz_scale,
+            noise_x,
+            noise_y,
+            noise_z,
+            scaled_second(noise_x),
+            scaled_second(noise_y),
+            scaled_second(noise_z),
         );
     }
 
@@ -98,13 +136,19 @@ pub fn fill_shifted_positions_in_place(
     }
 
     for index in 0..shift_x_and_dst.len() {
-        shift_x_and_dst[index] = get_value(
+        let noise_x = block_x[index] as f64 * xz_scale + shift_x_and_dst[index];
+        let noise_y = block_y[index] as f64 * y_scale + shift_y[index];
+        let noise_z = block_z[index] as f64 * xz_scale + shift_z[index];
+        shift_x_and_dst[index] = get_value_scaled_second(
             first,
             second,
             value_factor,
-            block_x[index] as f64 * xz_scale + shift_x_and_dst[index],
-            block_y[index] as f64 * y_scale + shift_y[index],
-            block_z[index] as f64 * xz_scale + shift_z[index],
+            noise_x,
+            noise_y,
+            noise_z,
+            scaled_second(noise_x),
+            scaled_second(noise_y),
+            scaled_second(noise_z),
         );
     }
 
@@ -129,13 +173,19 @@ pub fn fill_shift_positions(
     }
 
     for index in 0..block_x.len() {
-        dst[index] = get_value(
+        let noise_x = block_x[index] as f64 * 0.25;
+        let noise_y = block_y[index] as f64 * 0.25;
+        let noise_z = block_z[index] as f64 * 0.25;
+        dst[index] = get_value_scaled_second(
             first,
             second,
             value_factor,
-            block_x[index] as f64 * 0.25,
-            block_y[index] as f64 * 0.25,
-            block_z[index] as f64 * 0.25,
+            noise_x,
+            noise_y,
+            noise_z,
+            scaled_second(noise_x),
+            scaled_second(noise_y),
+            scaled_second(noise_z),
         ) * 4.0;
     }
 
@@ -159,13 +209,18 @@ pub fn fill_shift_a(
     }
 
     for index in 0..block_x.len() {
-        dst[index] = get_value(
+        let noise_x = block_x[index] as f64 * 0.25;
+        let noise_z = block_z[index] as f64 * 0.25;
+        dst[index] = get_value_scaled_second(
             first,
             second,
             value_factor,
-            block_x[index] as f64 * 0.25,
+            noise_x,
             0.0,
-            block_z[index] as f64 * 0.25,
+            noise_z,
+            scaled_second(noise_x),
+            0.0,
+            scaled_second(noise_z),
         ) * 4.0;
     }
 
@@ -189,12 +244,17 @@ pub fn fill_shift_b(
     }
 
     for index in 0..block_x.len() {
-        dst[index] = get_value(
+        let noise_x = block_z[index] as f64 * 0.25;
+        let noise_y = block_x[index] as f64 * 0.25;
+        dst[index] = get_value_scaled_second(
             first,
             second,
             value_factor,
-            block_z[index] as f64 * 0.25,
-            block_x[index] as f64 * 0.25,
+            noise_x,
+            noise_y,
+            0.0,
+            scaled_second(noise_x),
+            scaled_second(noise_y),
             0.0,
         ) * 4.0;
     }
@@ -213,14 +273,20 @@ pub fn fill_vertical(
     z: f64,
     dst: &mut [f64],
 ) {
+    let second_x = scaled_second(x);
+    let second_z = scaled_second(z);
     for (index, value) in dst.iter_mut().enumerate() {
-        *value = get_value(
+        let noise_y = start_y + index as f64 * y_step;
+        *value = get_value_scaled_second(
             first,
             second,
             value_factor,
             x,
-            start_y + index as f64 * y_step,
+            noise_y,
             z,
+            second_x,
+            scaled_second(noise_y),
+            second_z,
         );
     }
 }
@@ -250,16 +316,22 @@ pub fn fill_cell(
     let mut index = 0;
     for y in (0..cell_height).rev() {
         let noise_y = (base_y + y as f64) * y_scale;
+        let second_y = scaled_second(noise_y);
         for x in 0..cell_width {
             let noise_x = (base_x + x as f64) * xz_scale;
+            let second_x = scaled_second(noise_x);
             for z in 0..cell_width {
-                dst[index] = get_value(
+                let noise_z = (base_z + z as f64) * xz_scale;
+                dst[index] = get_value_scaled_second(
                     first,
                     second,
                     value_factor,
                     noise_x,
                     noise_y,
-                    (base_z + z as f64) * xz_scale,
+                    noise_z,
+                    second_x,
+                    second_y,
+                    scaled_second(noise_z),
                 );
                 index += 1;
             }
