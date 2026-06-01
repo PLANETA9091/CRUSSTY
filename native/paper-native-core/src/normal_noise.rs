@@ -14,7 +14,24 @@ pub fn get_value(
     let d = x * INPUT_FACTOR;
     let d1 = y * INPUT_FACTOR;
     let d2 = z * INPUT_FACTOR;
-    (first.get_value_direct_math_wrap(x, y, z) + second.get_value_direct_math_wrap(d, d1, d2)) * value_factor
+    get_value_with_scaled_second(first, second, value_factor, x, y, z, d, d1, d2)
+}
+
+#[inline]
+fn get_value_with_scaled_second(
+    first: &PerlinNoise,
+    second: &PerlinNoise,
+    value_factor: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+    scaled_x: f64,
+    scaled_y: f64,
+    scaled_z: f64,
+) -> f64 {
+    (first.get_value_direct_math_wrap(x, y, z)
+        + second.get_value_direct_math_wrap(scaled_x, scaled_y, scaled_z))
+        * value_factor
 }
 
 #[inline]
@@ -213,14 +230,21 @@ pub fn fill_vertical(
     z: f64,
     dst: &mut [f64],
 ) {
+    let scaled_x = x * INPUT_FACTOR;
+    let scaled_z = z * INPUT_FACTOR;
     for (index, value) in dst.iter_mut().enumerate() {
-        *value = get_value(
+        let y = start_y + index as f64 * y_step;
+        let scaled_y = y * INPUT_FACTOR;
+        *value = get_value_with_scaled_second(
             first,
             second,
             value_factor,
             x,
-            start_y + index as f64 * y_step,
+            y,
             z,
+            scaled_x,
+            scaled_y,
+            scaled_z,
         );
     }
 }
@@ -250,16 +274,23 @@ pub fn fill_cell(
     let mut index = 0;
     for y in (0..cell_height).rev() {
         let noise_y = (base_y + y as f64) * y_scale;
+        let scaled_noise_y = noise_y * INPUT_FACTOR;
         for x in 0..cell_width {
             let noise_x = (base_x + x as f64) * xz_scale;
+            let scaled_noise_x = noise_x * INPUT_FACTOR;
             for z in 0..cell_width {
-                dst[index] = get_value(
+                let noise_z = (base_z + z as f64) * xz_scale;
+                let scaled_noise_z = noise_z * INPUT_FACTOR;
+                dst[index] = get_value_with_scaled_second(
                     first,
                     second,
                     value_factor,
                     noise_x,
                     noise_y,
-                    (base_z + z as f64) * xz_scale,
+                    noise_z,
+                    scaled_noise_x,
+                    scaled_noise_y,
+                    scaled_noise_z,
                 );
                 index += 1;
             }
