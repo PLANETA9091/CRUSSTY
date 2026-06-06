@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${ROOT}/bench/native-entity-bounding-box/.classes"
+REPORT="${ROOT}/reports/native-entity-bounding-box-bench.txt"
+LIB_DIR="${ROOT}/native/target/release"
+RUNTIME_CP_FILE="${ROOT}/artifacts/optimized-runtime/classpath.txt"
+
+if [[ ! -f "${LIB_DIR}/libpaper_native_jni.so" ]]; then
+  "${ROOT}/scripts/build_native.sh" >/dev/null
+fi
+
+if [[ ! -s "${RUNTIME_CP_FILE}" ]]; then
+  echo "optimized runtime classpath not found; run scripts/build_optimized.sh first" >&2
+  exit 1
+fi
+
+RUNTIME_CP="$(<"${RUNTIME_CP_FILE}")"
+
+mkdir -p "${OUT}" "${ROOT}/reports"
+javac -proc:none -cp "${RUNTIME_CP}" -d "${OUT}" \
+  "${ROOT}/bench/native-entity-bounding-box/PaperNativeEntityBoundingBox.java" \
+  "${ROOT}/bench/native-entity-bounding-box/NativeEntityBoundingBoxBench.java"
+
+{
+  echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "host=$(hostname)"
+  echo "kernel=$(uname -srmo)"
+  lscpu | sed -n 's/^Model name:[[:space:]]*/cpu_model=/p; s/^CPU(s):[[:space:]]*/cpu_count=/p'
+  echo "java=$(java -version 2>&1 | head -n 1)"
+  echo "rustc=$(rustc --version)"
+  echo "cargo=$(cargo --version)"
+  echo "native_lib=${LIB_DIR}/libpaper_native_jni.so"
+  echo "command=java -Xms512m -Xmx512m -Djava.library.path=\"${LIB_DIR}\" -cp \"${OUT}:${RUNTIME_CP}\" NativeEntityBoundingBoxBench"
+  java -Xms512m -Xmx512m -Djava.library.path="${LIB_DIR}" -cp "${OUT}:${RUNTIME_CP}" NativeEntityBoundingBoxBench
+} | tee "${REPORT}"

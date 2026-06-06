@@ -1,0 +1,5 @@
+name: LibraryProbe
+version: 0.1.0
+main: dev.codex.libraryprobe.LibraryProbePlugin
+loader: dev.codex.libraryprobe.LibraryProbeLoader
+api-version: '1.21'

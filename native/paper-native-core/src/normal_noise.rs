@@ -1,6 +1,7 @@
 use crate::perlin_noise::PerlinNoise;
 
 pub const INPUT_FACTOR: f64 = 1.018_126_888_217_522_7;
+const INLINE_AXIS_CACHE: usize = 32;
 
 #[inline]
 pub fn get_value(
@@ -269,6 +270,47 @@ pub fn fill_cell(
         .ok_or("cell dimensions overflow")?;
     if dst.len() != expected {
         return Err("destination length does not match cell dimensions");
+    }
+
+    if cell_width <= INLINE_AXIS_CACHE {
+        let mut noise_x_axis = [0.0; INLINE_AXIS_CACHE];
+        let mut scaled_noise_x_axis = [0.0; INLINE_AXIS_CACHE];
+        let mut noise_z_axis = [0.0; INLINE_AXIS_CACHE];
+        let mut scaled_noise_z_axis = [0.0; INLINE_AXIS_CACHE];
+        for axis in 0..cell_width {
+            let noise_x = (base_x + axis as f64) * xz_scale;
+            let noise_z = (base_z + axis as f64) * xz_scale;
+            noise_x_axis[axis] = noise_x;
+            scaled_noise_x_axis[axis] = noise_x * INPUT_FACTOR;
+            noise_z_axis[axis] = noise_z;
+            scaled_noise_z_axis[axis] = noise_z * INPUT_FACTOR;
+        }
+
+        let mut index = 0;
+        for y in (0..cell_height).rev() {
+            let noise_y = (base_y + y as f64) * y_scale;
+            let scaled_noise_y = noise_y * INPUT_FACTOR;
+            for x in 0..cell_width {
+                let noise_x = noise_x_axis[x];
+                let scaled_noise_x = scaled_noise_x_axis[x];
+                for z in 0..cell_width {
+                    dst[index] = get_value_with_scaled_second(
+                        first,
+                        second,
+                        value_factor,
+                        noise_x,
+                        noise_y,
+                        noise_z_axis[z],
+                        scaled_noise_x,
+                        scaled_noise_y,
+                        scaled_noise_z_axis[z],
+                    );
+                    index += 1;
+                }
+            }
+        }
+
+        return Ok(());
     }
 
     let mut index = 0;
