@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License">
 </p>
 
-<h1 align="center">Paper Native Accelerator — Community Edition</h1>
+<h1 align="center">Crussty — Community Edition</h1>
 
 <p align="center">
   <strong>Rust-powered hot-path replacement for PaperMC via JNI</strong><br>
@@ -16,7 +16,7 @@
 
 ## What Is This?
 
-Paper Native Accelerator replaces performance-critical Java code paths in PaperMC with
+Crussty replaces performance-critical Java code paths in PaperMC with
 Rust implementations called via JNI (Java Native Interface). This is a **drop-in
 acceleration layer** — your existing Paper plugins, worlds, and configurations work
 unchanged.
@@ -76,7 +76,7 @@ See `native/README.md` for full module-by-module documentation.
 ## Project Structure
 
 ```
-paper-native-accelerator/
+crussty/
 ├── native/                  # Rust workspace (4 crates, 98 .rs files)
 │   ├── paper-native-core/   # Pure Rust implementations
 │   ├── paper-native-jni/    # JNI bridge (cdylib)
