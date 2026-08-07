@@ -80,7 +80,7 @@ order modules expect their patches applied.
 ## Platform bricks
 
 Below the ABI layer, the runtime ships twelve reusable primitives in
-`src/platform/` (see [Platform bricks](./platform-bricks.html) for the API
+`src/platform/` (see [Platform bricks](./platform.html) for the API
 surface): an event bus, a class-patch pipeline (`transform`), crash
 isolation that chains the JVM's own signal handlers (`signals`), tick
 routing (`scheduler`), persistence (`storage`), an O(1) side table
