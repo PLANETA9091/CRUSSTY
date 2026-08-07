@@ -1,0 +1,26 @@
+title: Crussty Platform
+description: >-
+  Crussty — a native Rust plugin platform for Paper-family Minecraft kernels
+url: https://planeta9091.github.io
+baseurl: /CRUSSTY
+
+remote_theme: just-the-docs/just-the-docs
+color_scheme: dark
+
+logo: assets/images/crussty-logo.png
+
+aux_links:
+  "View on GitHub":
+    - https://github.com/PLANETA9091/CRUSSTY
+
+heading_anchors: true
+search_enabled: true
+
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: https://github.com/PLANETA9091/CRUSSTY
+gh_edit_branch: master
+gh_edit_view_mode: edit
+gh_edit_source: docs
+
+footer_content: "Copyright &copy; 2026 PLANETA9091. Distributed under the MIT license."
