@@ -1,313 +1,176 @@
-/* Crussty theme - progressive enhancements layered on top of mdBook's book.js.
+/* ===========================================================================
+ * Crussty enhancements on top of mdBook's default book.js.
  *
- * Loaded via `additional-js`, so it runs after book.js has set up the sidebar,
- * theme system, search and syntax highlighting. Adds: a branded header, a
- * one-click light/dark toggle, code block cards with copy buttons, a right-hand
- * "On this page" outline with scroll-spy, a breadcrumb, and the ASCII boot
- * sequence on the front page. Ported from Glide (MIT). */
+ * 1. Smooth navigation: internal links are fetched and swapped in place with
+ *    the View Transitions API when available — no full page reload, no white
+ *    flash (pattern: pjax / Turbo Drive).
+ * 2. Copy buttons for every code block (with event delegation, so they keep
+ *    working after in-place navigation).
+ * 3. Boot sequence on the front page — played once per browser session.
+ * ======================================================================== */
 
 (function () {
     'use strict';
 
-    const DARK_THEMES = ['navy', 'coal', 'ayu'];
-    const html = document.documentElement;
-
-    function isDark() {
-        return DARK_THEMES.some(t => html.classList.contains(t));
-    }
-
-    const ICONS = {
-        sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>',
-        moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>',
-        copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
-        check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"></path></svg>',
-        play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"></path></svg>',
-    };
-
-    /* --- Logo badge + version pill ---------------------------------------- */
-    function setupBranding() {
-        const name = document.querySelector('.glide-logo-name');
-        const badge = document.querySelector('.glide-logo-badge');
-        if (badge && name) {
-            const letter = (name.textContent || '').trim().charAt(0).toUpperCase();
-            badge.textContent = letter || 'C';
-        }
-        const img = document.querySelector('.glide-logo-img');
-        if (img) {
-            const reveal = () => {
-                if (img.naturalWidth > 0) {
-                    img.hidden = false;
-                    if (badge) badge.hidden = true;
-                } else {
-                    img.hidden = true;
-                }
-            };
-            if (img.complete) reveal();
-            else {
-                img.addEventListener('load', reveal);
-                img.addEventListener('error', () => { img.hidden = true; });
-            }
-        }
-        const version = document.querySelector('meta[name="glide-version"]');
-        const pill = document.querySelector('.glide-version');
-        if (pill && version && version.content) {
-            pill.textContent = version.content;
-            pill.hidden = false;
+    /* --- Helpers -------------------------------------------------------- */
+    function pagePath(href) {
+        try {
+            const u = new URL(href, location.href);
+            if (u.origin !== location.origin) return null;
+            let p = u.pathname;
+            if (p.endsWith('/')) p += 'index.html';
+            return p;
+        } catch (err) {
+            return null;
         }
     }
 
-    /* --- One-click light / dark toggle ------------------------------------ */
-    function setupThemeToggle() {
-        const btn = document.getElementById('glide-theme-btn');
-        const icon = btn && btn.querySelector('.glide-theme-icon');
-        if (!btn || !icon) return;
-
-        function render() {
-            icon.innerHTML = isDark() ? ICONS.sun : ICONS.moon;
-            btn.setAttribute('aria-pressed', String(isDark()));
-        }
-        render();
-
-        btn.addEventListener('click', function () {
-            const target = isDark() ? 'mdbook-theme-light' : 'mdbook-theme-navy';
-            const themeButton = document.getElementById(target);
-            if (themeButton) {
-                themeButton.click();
-            } else {
-                const next = isDark() ? 'light' : 'navy';
-                DARK_THEMES.concat('light').forEach(t => html.classList.remove(t));
-                html.classList.add(next);
-                try { localStorage.setItem('mdbook-theme', next); } catch (err) { /* ignore */ }
-            }
-            render();
-        });
-
-        new MutationObserver(render).observe(html, { attributes: true, attributeFilter: ['class'] });
+    function currentPath() {
+        return pagePath(location.href);
     }
 
-    /* --- Header search trigger -------------------------------------------- */
-    function setupSearchTrigger() {
-        const btn = document.getElementById('glide-search-btn');
-        const toggle = document.getElementById('mdbook-search-toggle');
-        if (!btn || !toggle) return;
-        btn.addEventListener('click', function () {
-            toggle.click();
-            const input = document.getElementById('mdbook-searchbar');
-            if (input) {
-                setTimeout(() => input.focus(), 0);
-            }
-        });
-    }
-
-    /* --- Code block cards with a copy button ------------------------------ */
-    function makeCopyButton(code) {
-        const copyBtn = document.createElement('button');
-        copyBtn.type = 'button';
-        copyBtn.className = 'glide-copy-btn';
-        copyBtn.innerHTML = ICONS.copy + '<span>Copy</span>';
-        copyBtn.addEventListener('click', function () {
-            const text = code.textContent;
-            const done = () => {
-                copyBtn.classList.add('copied');
-                copyBtn.innerHTML = ICONS.check + '<span>Copied</span>';
-                setTimeout(() => {
-                    copyBtn.classList.remove('copied');
-                    copyBtn.innerHTML = ICONS.copy + '<span>Copy</span>';
-                }, 1300);
-            };
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(done).catch(() => {});
-            } else {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                document.body.appendChild(ta);
-                ta.select();
-                try { document.execCommand('copy'); done(); } catch (err) { /* ignore */ }
-                document.body.removeChild(ta);
-            }
-        });
-        return copyBtn;
-    }
-
-    function setupCodeBlocks() {
-        const blocks = document.querySelectorAll('#mdbook-content main pre > code');
-        blocks.forEach(function (code) {
+    /* --- Copy buttons (delegated, survive pjax) -------------------------- */
+    function ensureCopyButtons() {
+        document.querySelectorAll('pre code').forEach(function (code) {
             const pre = code.parentElement;
-            if (!pre) return;
-            if (pre.parentElement && pre.parentElement.classList.contains('glide-code')) return;
-
-            const langClass = Array.from(code.classList).find(c => c.startsWith('language-'));
-            const label = langClass ? langClass.replace('language-', '') : 'code';
-
-            const card = document.createElement('div');
-            card.className = 'glide-code';
-
-            const header = document.createElement('div');
-            header.className = 'glide-code-header';
-
-            const name = document.createElement('span');
-            name.className = 'glide-code-name';
-            name.textContent = label;
-
-            const actions = document.createElement('div');
-            actions.className = 'glide-code-actions';
-
-            const nativeButtons = pre.querySelector(':scope > .buttons');
-            if (nativeButtons) {
-                const play = nativeButtons.querySelector('.play-button');
-                const hide = nativeButtons.querySelector('button[title*="hidden lines"]');
-
-                if (play) {
-                    const runBtn = document.createElement('button');
-                    runBtn.type = 'button';
-                    runBtn.className = 'glide-run-btn';
-                    runBtn.title = 'Run this code';
-                    runBtn.innerHTML = ICONS.play + '<span>Run</span>';
-                    runBtn.addEventListener('click', () => play.click());
-                    const syncRun = () => {
-                        const shown = !play.hidden && !play.classList.contains('hidden');
-                        runBtn.style.display = shown ? '' : 'none';
-                    };
-                    syncRun();
-                    new MutationObserver(syncRun).observe(play, {
-                        attributes: true, attributeFilter: ['hidden', 'class'],
-                    });
-                    actions.appendChild(runBtn);
-                }
-
-                if (hide) {
-                    hide.classList.add('glide-hide-btn');
-                    actions.appendChild(hide);
-                }
+            if (!pre || pre.classList.contains('playground') || pre.querySelector('.crussty-copy-btn')) return;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'crussty-copy-btn';
+            btn.title = 'Copy to clipboard';
+            btn.setAttribute('aria-label', 'Copy to clipboard');
+            btn.innerHTML = '<i class="tooltiptext"></i>';
+            btn.appendChild(copyIcon());
+            let buttons = pre.querySelector('.buttons');
+            if (!buttons) {
+                buttons = document.createElement('div');
+                buttons.className = 'buttons';
+                pre.insertBefore(buttons, pre.firstChild);
             }
-
-            actions.appendChild(makeCopyButton(code));
-
-            header.appendChild(name);
-            header.appendChild(actions);
-
-            pre.parentNode.insertBefore(card, pre);
-            card.appendChild(header);
-            card.appendChild(pre);
+            buttons.insertBefore(btn, buttons.firstChild);
         });
     }
 
-    /* --- Right-hand "On this page" outline + scroll-spy ------------------- */
-    function setupPageToc() {
-        const aside = document.getElementById('glide-page-toc');
-        const main = document.querySelector('#mdbook-content main');
-        if (!aside || !main) return;
+    function copyIcon() {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('viewBox', '0 0 16 16');
+        svg.setAttribute('fill', 'currentColor');
+        svg.innerHTML = '<path d="M5.5 3.5a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h6a.5.5 0 0 0 .5-.5V7.707L9.293 4.5H5.5Z"/><path d="M3 1h6.586a1 1 0 0 1 .707.293l3 3A1 1 0 0 1 13.7 5H8.5A1.5 1.5 0 0 1 7 3.5V1Z"/><path d="M5 1.5A1.5 1.5 0 0 1 6.5 0h.5v3.5H3.5v-.5A1.5 1.5 0 0 1 5 1.5Z"/>';
+        return svg;
+    }
 
-        const headings = Array.from(main.querySelectorAll('h2[id], h3[id]'));
-        if (headings.length < 2) {
-            aside.style.display = 'none';
-            return;
+    document.addEventListener('click', function (e) {
+        const btn = e.target.closest('.crussty-copy-btn');
+        if (!btn) return;
+        const pre = btn.closest('pre');
+        if (!pre) return;
+        const code = pre.querySelector('code');
+        if (!code) return;
+        const text = code.innerText;
+        const done = function () {
+            btn.classList.add('copied');
+            setTimeout(function () { btn.classList.remove('copied'); }, 1200);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done).catch(function () {});
+        } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); } catch (err) { /* ignore */ }
+            document.body.removeChild(ta);
         }
+    });
 
-        const title = document.createElement('div');
-        title.className = 'glide-toc-title';
-        title.textContent = 'On this page';
-
-        const list = document.createElement('ul');
-        const links = [];
-        headings.forEach(function (h) {
-            const li = document.createElement('li');
-            const a = document.createElement('a');
-            a.href = '#' + h.id;
-            a.textContent = h.textContent.replace(/[#¶]+$/, '').trim();
-            if (h.tagName === 'H3') a.classList.add('glide-toc-h3');
-            li.appendChild(a);
-            list.appendChild(li);
-            links.push(a);
+    /* --- Code highlighting after in-place navigation --------------------- */
+    function highlightNewBlocks(container) {
+        if (!window.hljs) return;
+        container.querySelectorAll('pre code').forEach(function (code) {
+            if (!code.classList.contains('hljs')) {
+                window.hljs.highlightBlock(code);
+            }
         });
-
-        aside.appendChild(title);
-        aside.appendChild(list);
-
-        let current = null;
-        function setActive(id) {
-            if (current === id) return;
-            current = id;
-            links.forEach(a => a.classList.toggle('active', a.getAttribute('href').slice(1) === id));
-        }
-
-        const observer = new IntersectionObserver(function (entries) {
-            if (atBottom()) {
-                setActive(headings[headings.length - 1].id);
-                return;
-            }
-            const visible = entries
-                .filter(e => e.isIntersecting)
-                .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-            if (visible.length) {
-                setActive(visible[0].target.id);
-            }
-        }, { rootMargin: '-72px 0px -70% 0px', threshold: 0 });
-
-        function atBottom() {
-            const scrollEl = document.documentElement;
-            return window.innerHeight + window.scrollY >= scrollEl.scrollHeight - 2;
-        }
-
-        function onScroll() {
-            if (atBottom()) setActive(headings[headings.length - 1].id);
-        }
-        window.addEventListener('scroll', onScroll, { passive: true });
-
-        headings.forEach(h => observer.observe(h));
-        setActive(headings[0].id);
     }
 
-    /* --- Breadcrumb ------------------------------------------------------- */
-    function setupBreadcrumb() {
-        const main = document.querySelector('#mdbook-content main');
-        const active = document.querySelector('#mdbook-sidebar a.active');
-        if (!main || !active) return;
-
-        const chapter = active.textContent.trim();
-        let section = null;
-
-        let li = active.closest('li');
-        while (li) {
-            let sib = li.previousElementSibling;
-            while (sib) {
-                if (sib.classList && sib.classList.contains('part-title')) {
-                    section = sib.textContent.trim();
-                    break;
-                }
-                sib = sib.previousElementSibling;
-            }
-            if (section) break;
-            li = li.parentElement ? li.parentElement.closest('li') : null;
-        }
-
-        if (!section && !chapter) return;
-
-        const crumb = document.createElement('div');
-        crumb.className = 'glide-breadcrumb';
-        if (section) {
-            const s = document.createElement('span');
-            s.textContent = section;
-            crumb.appendChild(s);
-            const sep = document.createElement('span');
-            sep.className = 'glide-sep';
-            sep.textContent = '/';
-            crumb.appendChild(sep);
-        }
-        const c = document.createElement('span');
-        c.className = 'glide-crumb-current';
-        c.textContent = chapter;
-        crumb.appendChild(c);
-
-        main.insertBefore(crumb, main.firstChild);
+    /* --- Active sidebar item --------------------------------------------- */
+    function setActiveLink() {
+        const target = currentPath();
+        document.querySelectorAll('#mdbook-sidebar a').forEach(function (a) {
+            a.classList.toggle('active', pagePath(a.href) === target);
+        });
     }
 
-    /* --- Front-page ASCII boot sequence ----------------------------------- */
-    function setupBoot() {
-        const boot = document.getElementById('boot');
-        if (!boot) return;
-        const terminal = boot.querySelector('pre');
-        if (!terminal) return;
+    /* --- Apply a fetched page in place ------------------------------------ */
+    function applyPage(doc, path) {
+        const newContent = doc.querySelector('#mdbook-content');
+        const newWide = doc.querySelector('.nav-wide-wrapper');
+        const cur = document.querySelector('#mdbook-content');
+        if (!newContent || !cur) return false;
+
+        cur.innerHTML = newContent.innerHTML;
+        const wide = document.querySelector('.nav-wide-wrapper');
+        if (wide && newWide) wide.innerHTML = newWide.innerHTML;
+
+        const title = doc.querySelector('title');
+        if (title) document.title = title.textContent;
+
+        const edit = doc.querySelector('a[rel="edit"]');
+        const curEdit = document.querySelector('a[rel="edit"]');
+        if (edit && curEdit) curEdit.href = edit.href;
+
+        setActiveLink();
+        ensureCopyButtons();
+        highlightNewBlocks(cur);
+
+        if (path !== currentPath()) {
+            history.pushState({ path: path }, '', path);
+        }
+        window.scrollTo(0, 0);
+        return true;
+    }
+
+    async function navigate(path, push) {
+        try {
+            const resp = await fetch(path, { headers: { Accept: 'text/html' } });
+            if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
+            const html = await resp.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const swap = function () { return applyPage(doc, push ? path : null); };
+            if (document.startViewTransition) {
+                document.startViewTransition(swap);
+            } else {
+                swap();
+            }
+        } catch (err) {
+            location.href = path;
+        }
+    }
+
+    document.addEventListener('click', function (e) {
+        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const a = e.target.closest('a[href]');
+        if (!a) return;
+        if (a.target && a.target !== '_self') return;
+        const path = pagePath(a.href);
+        if (!path) return;
+        e.preventDefault();
+        if (path === currentPath()) return;
+        navigate(path, true);
+    });
+
+    window.addEventListener('popstate', function () {
+        const path = currentPath();
+        if (path) navigate(path, false);
+    });
+
+    /* --- Boot sequence (once per session) --------------------------------- */
+    function boot() {
+        if (sessionStorage.getItem('crussty-boot') === '1') return;
+        const bootEl = document.getElementById('boot');
+        if (!bootEl) return;
+
+        sessionStorage.setItem('crussty-boot', '1');
 
         const LINES = [
             { t: "crussty-runtime v2.0.0 (native, JVMTI)", c: "dim" },
@@ -328,24 +191,32 @@
             { t: "welcome to crussty — press any key to enter", c: "warn" }
         ];
 
-        const TYPE_MS = 12;
-        const LINE_PAUSE = 40;
-        const END_PAUSE = 550;
+        const overlay = document.createElement('div');
+        overlay.id = 'crussty-boot';
+        const pre = document.createElement('pre');
+        overlay.appendChild(pre);
+        document.body.appendChild(overlay);
 
-        document.body.classList.add('boot');
-
-        const cursor = document.createElement('span');
-        cursor.className = 'cursor';
+        const TYPE_MS = 11;
+        const LINE_PAUSE = 35;
+        const END_PAUSE = 450;
 
         let i = 0;
         function nextLine() {
             if (i >= LINES.length) {
-                finish();
+                const cursor = document.createElement('span');
+                cursor.className = 'cursor';
+                pre.appendChild(cursor);
+                setTimeout(function () {
+                    overlay.remove();
+                    document.getElementById('boot')?.classList.add('active');
+                    document.querySelector('#mdbook-content main')?.classList.add('boot-reveal');
+                }, END_PAUSE);
                 return;
             }
             const line = LINES[i];
             const div = document.createElement('div');
-            terminal.appendChild(div);
+            pre.appendChild(div);
             let pos = 0;
             (function typeChar() {
                 if (pos < line.t.length) {
@@ -359,34 +230,14 @@
                 }
             })();
         }
-
-        function finish() {
-            terminal.appendChild(cursor);
-            setTimeout(function () {
-                document.body.classList.remove('boot');
-                if (terminal.contains(cursor)) terminal.removeChild(cursor);
-                // Re-run the page reveal animation after the boot clears.
-                const main = document.querySelector('#mdbook-content main');
-                if (main) {
-                    main.style.animation = 'none';
-                    void main.offsetWidth;
-                    main.style.animation = 'glideUp 0.3s ease';
-                }
-            }, END_PAUSE);
-        }
-
         nextLine();
     }
 
     /* --- Init ------------------------------------------------------------- */
     function init() {
-        setupBranding();
-        setupThemeToggle();
-        setupSearchTrigger();
-        setupCodeBlocks();
-        setupPageToc();
-        setupBreadcrumb();
-        setupBoot();
+        ensureCopyButtons();
+        setActiveLink();
+        boot();
     }
 
     if (document.readyState === 'loading') {
