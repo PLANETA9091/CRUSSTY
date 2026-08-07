@@ -1,8 +1,11 @@
 target/
+build/
 *.so
 *.dylib
 *.dll
 *.jar
+*.class
+!modules/*/tests/**
 versions/
 world/
 logs/
