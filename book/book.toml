@@ -5,13 +5,17 @@ language = "en"
 description = "Crussty — native Rust plugin platform for Paper-family Minecraft kernels"
 
 [output.html]
-default-theme = "coal"
-preferred-dark-theme = "coal"
+default-theme = "navy"
+preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/PLANETA9091/CRUSSTY"
 edit-url-template = "https://github.com/PLANETA9091/CRUSSTY/edit/master/book/{path}"
-additional-css = ["css/oled.css"]
-additional-js = ["js/ascii.js"]
+additional-css = ["theme/crussty.css"]
+additional-js = ["theme/crussty.js"]
+no-section-label = true
 
+[output.html.fold]
+enable = true
+level = 1
 
 [output.html.search]
 enable = true

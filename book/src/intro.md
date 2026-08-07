@@ -3,6 +3,18 @@
   <pre></pre>
 </div>
 
+<div class="glide-banner">
+  <img class="glide-banner-logo" src="./assets/crussty-logo.png" alt="Crussty logo" />
+  <div class="glide-banner-text">
+    <h1 class="glide-banner-title">Crussty Platform</h1>
+    <p class="glide-banner-subtitle">Native Rust plugin platform for Paper-family Minecraft kernels</p>
+    <div class="glide-banner-actions">
+      <a class="glide-btn glide-btn-primary" href="./quickstart.html">Get started</a>
+      <a class="glide-btn" href="./architecture.html">Architecture</a>
+    </div>
+  </div>
+</div>
+
 ```text
   ____ ____  _   _ ____ ____ _______   __
  / ___|  _ \| | | / ___/ ___|_   _\ \ / /
