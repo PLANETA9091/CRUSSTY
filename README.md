@@ -12,7 +12,7 @@ with a ClassFileLoadHook hot-patch pipeline. A module is a plugin: a directory
 - `launcher/` — launcher (spawns the kernel with `-agentpath`)
 - `modules/` — plugins live in their own `c-<name>` repos; clone them here
 - `docs/V2-DESIGN.md` — platform design
-- `book/` — user documentation (mdBook, published to GitHub Pages)
+- `book/` — user documentation: https://planeta9091.github.io/CRUSSTY/
 
 ## Build
 
