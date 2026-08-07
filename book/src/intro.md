@@ -1,3 +1,16 @@
+<div id="boot" aria-hidden="true">
+  <div class="boot-logo"><img src="./assets/crussty-logo.png" alt="Crussty logo" /></div>
+  <pre></pre>
+</div>
+
+```text
+  ____ ____  _   _ ____ ____ _______   __
+ / ___|  _ \| | | / ___/ ___|_   _\ \ / /
+| |   | |_) | | | \___ \___ \ | |  \ V /
+| |___|  _ <| |_| |___) |__) || |   | |
+ \____|_| \_\\___/|____/____/ |_|   |_|
+```
+
 # Introduction
 
 Crussty is a native plugin platform for Paper-family Minecraft kernels
@@ -5,9 +18,11 @@ Crussty is a native plugin platform for Paper-family Minecraft kernels
 written in **Rust** and loaded into the server process as native shared
 libraries.
 
+<img class="logo" src="./assets/crussty-logo.png" alt="Crussty logo" />
+
 ## What it does
 
-The Crussty Runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
+A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
 `-agentpath`. It:
 
 - scans a `modules/` directory for plugins,
