@@ -6,50 +6,38 @@ nav_order: 1
 
 # Crussty Platform
 
-Crussty is a native plugin platform for Paper-family Minecraft kernels
-(Purpur, Paper, etc.). Plugins — called **c-plugins** or **modules** — are
-written in **Rust** and loaded into the server process as native shared
-libraries.
+Crussty is a **native injection platform** for Paper-family Minecraft kernels
+(Purpur, Paper, etc.). It attaches a JVMTI runtime to the kernel JVM and uses
+it to load **Rust modules** — shared libraries written entirely in Rust —
+directly into the server process, where they can intercept class loading,
+patch kernel bytecode, and replace hot paths with native code.
+
+Call it what you like: an injector, a hot-patch engine, a native module
+platform. The distinguishing property is that Crussty does not fork the
+kernel and does not rebuild it — it injects itself into a stock jar and
+changes behavior at class-load time.
+
+<img class="logo" src="/CRUSSTY/assets/images/crussty-logo.png" alt="Crussty logo" />
 
 ## What it does
 
 A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
-`-agentpath`. It:
+`-agentpath` (or loaded via `JNI_OnLoad` in the single-jar distribution). It:
 
-- scans a `modules/` directory for plugins,
-- loads each plugin (`dlopen`, `RTLD_LOCAL`) in dependency order,
-- forwards every class load through the plugin hook pipeline
-  (`CLASS_FILE_LOAD_HOOK`), so plugins can patch kernel bytecode on the fly
+- scans a `modules/` directory for modules,
+- loads each module (`dlopen`, `` `RTLD_LOCAL` ``) in dependency order,
+- forwards every class load through the module hook pipeline
+  (`CLASS_FILE_LOAD_HOOK`), so modules can patch kernel bytecode on the fly
   (hot-patching),
-- lets plugins retransform already-loaded classes.
+- lets modules retransform already-loaded classes.
 
-Plugins get a `JavaVM*` and can do anything JNI/JVMTI allows: resolve classes
-across loaders, run code on the server main thread, call Bukkit APIs, rewrite
-bytecode with ASM.
+Modules get a `JavaVM*` and can do anything JNI/JVMTI allows: resolve classes,
+run code on the server main thread, call Bukkit APIs, rewrite bytecode with
+ASM.
 
 ## Why native
 
-Rust plugins run without the JVM in the hot path: no garbage collection, no
+Rust modules run without the JVM in the hot path: no garbage collection, no
 interpreter, no classloading — just compiled code. This is what makes
 hot-path replacements (worldgen noise, chunk encoding, block collisions)
 thousands of times faster than Java equivalents.
-
-## Repository layout
-
-| Path | Purpose |
-|------|---------|
-| `cplug-abi/` | The only contract between the runtime and modules |
-| `cplug-sdk/` | SDK for module authors (hooks, JNI, main thread, ASM) |
-| `runtime/` | The JVMTI runtime (scan, loading, hook pipeline) |
-| `launcher/` | Java launcher that spawns the kernel with the runtime |
-| `modules/` | Plugin drop-in directory (see the `c-<name>` repos) |
-| `book/` | Legacy mdBook documentation |
-
-Example plugins live in separate repositories: `c-hello`, `c-dist`,
-`c-crussty`.
-
-## Get started
-
-- [Quick Start](quickstart.html) — build the platform and run a kernel
-- [Architecture](architecture.html) — how the runtime, launcher and modules fit
-- [Module SDK](sdk.html) — write your first module

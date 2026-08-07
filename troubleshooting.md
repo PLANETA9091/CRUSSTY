@@ -1,11 +1,6 @@
 ---
 title: Troubleshooting
-nav_order: 7
----
-
----
-title: Troubleshooting
-nav_order: 7
+nav_order: 8
 ---
 
 # Troubleshooting
@@ -20,17 +15,17 @@ nav_order: 7
 - After a crash, `hs_err_*.log` files appear next to the kernel; the
   runtime's `[crussty-runtime]` lines are at the top of the stack section.
 
-## Plugin not loaded
+## Module not loaded
 
 - Does `cplugin.json` exist? Does `modules/` contain a `cplugin.json` in the
-  plugin directory or a `*.zip` with a manifest inside?
+  module directory or a `*.zip` with a manifest inside?
 - Is it named `*.disabled`? That is honored.
 - Entry library missing → `lib<id>.so` not found next to the manifest, or
   `main` points at a missing file.
 - A malformed `main` (absolute path, `..` escape) invalidates the whole
-  plugin silently — check the runtime's diagnostic line.
+  module silently — check the runtime's diagnostic line.
 
-## Zip plugin never appears
+## Zip module never appears
 
 - The zip must contain `cplugin.json` at the top level — not inside a
   folder. Peek check: archives without a manifest are ignored entirely.
@@ -51,8 +46,8 @@ wait for kernel classes to load first (`wait_class`).
 
 The pipeline is not delivering to the main thread. Check in order:
 
-1. `[crussty-runtime] plugin hello -> init rc=0` — module loaded?
-2. `[crussty-runtime] pipeline ready: N plugin hook(s)` — hook registered?
+1. `[crussty-runtime] module hello -> init rc=0` — module loaded?
+2. `[crussty-runtime] pipeline ready: N module hook(s)` — hook registered?
 3. Server log for `hello from native c-plugin` — main-thread bridge alive?
 
 ## JVM flags

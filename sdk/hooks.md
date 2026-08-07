@@ -34,9 +34,9 @@ deciding to allocate and patch.
 
 ## Hook chain
 
-Hooks fire in plugin load order (topological). All modules share one
+Hooks fire in module load order (topological). All modules share one
 pipeline: each class load visits every hook until one returns replacement
-bytes. The runtime keeps the first plugin's replacement — later plugins see
+bytes. The runtime keeps the first module's replacement — later modules see
 the *original* bytes, not the patched ones.
 
 ## The SDK's single hook

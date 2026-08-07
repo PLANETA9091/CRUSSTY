@@ -3,11 +3,6 @@ title: Quick Start
 nav_order: 2
 ---
 
----
-title: Quick Start
-nav_order: 2
----
-
 # Quick Start
 
 ## Requirements
@@ -23,44 +18,46 @@ nav_order: 2
 cargo build --manifest-path runtime/Cargo.toml
 cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 
-# launcher
-javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java
-jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
+# single-jar distribution (recommended) -> dist/crussty-<ver>.jar
+./scripts/build-single-jar.sh
 ```
 
-## Install plugins
+## Install modules
 
-Clone example plugins into `modules/`:
+Clone example modules into `modules/`:
 
 ```bash
 git clone https://github.com/PLANETA9091/c-hello modules/hello
 cd modules/hello && cargo build && cp target/debug/libhello.so libhello.so
 ```
 
-Or drop a plugin zip (see [Distribution](./plugins/zip.html)) into `modules/` — the
-runtime extracts and loads it.
+Or drop a module zip (see [Distribution](./modules/zip.html)) into `modules/`
+— the runtime extracts and loads it.
 
-## Run
+## Run — single-jar (recommended)
 
 ```bash
-mkdir -p versions
-cp /path/to/purpur-1.21.10.jar versions/
-# accept the EULA on first boot
 echo "eula=true" > eula.txt
-
-./run.sh
+cp dist/crussty-1.21.10.jar server.jar
+java -Xmx2G -jar server.jar --nogui
 ```
 
-Verify in the server log:
+The jar boots the kernel itself: no `-agentpath`, no launcher process.
+
+## Verify
+
+Check the server log:
 
 ```
-[crussty-runtime] plugin hello -> init rc=0
+[crussty-runtime] module hello -> init rc=0
 [hello-plugin] cplugin_init (native, before kernel boot)
+[crussty-runtime] pipeline ready: 3 module hook(s)
 [13:36:26 INFO]: hello from native c-plugin (v2 pipeline alive)
 ```
 
 ## Env options
 
-The runtime reads its options from the launcher: `modules=<dir>`,
-`versions=<dir>`, `kernel=<jar name>`. Plugins read their own config from env
-variables (e.g. `CRUSSTY_NATIVE_IMPROVED_NOISE=1`).
+Single-jar runs read `crussty/options.txt` (written by the bootstrapper) or
+`CRUSSTY_RUNTIME_OPTIONS`. Modules read their own config from env variables
+(e.g. `CRUSSTY_NATIVE_IMPROVED_NOISE=1`). `CRUSSTY_NO_SIGNALS=1` disables the
+platform's crash handlers — use it for diagnostics.

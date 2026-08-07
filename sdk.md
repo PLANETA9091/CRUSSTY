@@ -1,11 +1,6 @@
 ---
 title: Module SDK
-nav_order: 5
----
-
----
-title: Module SDK
-nav_order: 5
+nav_order: 6
 ---
 
 # Module SDK
@@ -41,10 +36,10 @@ hooks::register("org/bukkit/Bukkit", |ctx, bytes, len| {
 
 ## Modules
 
-- [Hooks](./sdk/hooks.html) — register_class_hook, byte hooks
-- [Classes & JNI](./sdk/classes.html) — find_class, wait_class, retransform
-- [Main thread](./sdk/main-thread.html) — run_on_main_thread
-- [ASM weaving](./sdk/asm.html) — replace_body, ArgSpec
+- [Hooks](./sdk-hooks.md) — register_class_hook, byte hooks
+- [Classes & JNI](./sdk-classes.md) — find_class, wait_class, retransform
+- [Main thread](./sdk-main-thread.md) — run_on_main_thread
+- [ASM weaving](./sdk-asm.md) — replace_body, ArgSpec
 
 All SDK entry points are safe to call from any thread that has an attached
 JNI env (`with_attached` handles attach/detach for the main thread; kernel
