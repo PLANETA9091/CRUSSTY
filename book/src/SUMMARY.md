@@ -13,4 +13,5 @@
   - [Main thread](./sdk-main-thread.md)
   - [ASM weaving](./sdk-asm.md)
 - [Example modules](./examples.md)
+- [Other languages](./other-languages.md)
 - [Troubleshooting](./troubleshooting.md)
