@@ -10,6 +10,8 @@
 //!
 //! Plugins are deliberately handed raw JavaVM*: no Java API, no limits.
 
+#[allow(dead_code)] // platform bricks are a public API surface; used by modules
+mod platform;
 mod scan;
 
 use std::ffi::{c_char, c_void, CString};
@@ -86,8 +88,13 @@ fn with_attached<R>(f: impl FnOnce() -> R) -> Option<R> {
 #[derive(Default)]
 struct CrusstyRuntime;
 
-impl Agent for CrusstyRuntime {
-    fn on_load(&self, vm: *mut jni::JavaVM, options: &str) -> jni::jint {
+impl CrusstyRuntime {
+    /// Shared engine bring-up. Called either from `Agent_OnLoad` (the
+    /// `-agentpath:` path) or from `JNI_OnLoad` (the single-jar path, where
+    /// the Java bootstrapper loads this library with `System.load` before
+    /// the kernel classloader starts). JVMTI's `GetEnv` is legal on a Java
+    /// thread in the live phase, so both entry points get a working env.
+    fn init(&self, vm: *mut jni::JavaVM, options: &str) -> jni::jint {
         eprintln!("[crussty-runtime] v2.0.0 loaded (options: {})", options);
 
         let jvmti = match Jvmti::new(vm) {
@@ -126,9 +133,62 @@ impl Agent for CrusstyRuntime {
             hooks().lock().unwrap().len()
         );
 
+        // Platform bricks: crash handlers first (any fault from here on must
+        // produce a report, not a silent death), then telemetry + events.
+        // CRUSSTY_NO_SIGNALS=1 disables the handlers (diagnostics/troubleshooting).
+        if std::env::var_os("CRUSSTY_NO_SIGNALS").is_none() {
+            let _ = platform::signals::install_handlers();
+        }
+        if let Some(sock) = &opts.telemetry {
+            match platform::telemetry::init(&sock.display().to_string()) {
+                Ok(()) => eprintln!("[crussty-runtime] telemetry on {}", sock.display()),
+                Err(e) => eprintln!("[crussty-runtime] telemetry disabled: {e}"),
+            }
+        }
+        platform::telemetry::set_uptime(0);
+        platform::events::global().publish(
+            platform::events::lifecycle::PLUGIN_LOADED,
+            &serde_json::json!({ "runtime": "crussty", "phase": "ready" }),
+        );
+
         jni::JNI_OK
     }
+}
 
+/// Single-jar entry point: the Java bootstrapper loads this library with
+/// `System.load` (JNI path, no `-agentpath:` needed), so hosting panels can
+/// run the kernel as a plain `java -jar server.jar`. Options come from the
+/// `CRUSSTY_RUNTIME_OPTIONS` env var, falling back to `crussty/options.txt`
+/// written by the bootstrapper next to the working directory.
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(vm: *mut jni::JavaVM, _reserved: *mut c_void) -> jni::jint {
+    if JVMTI_ENV.get().is_some() {
+        // Already brought up as a JVMTI agent earlier; JNI_OnLoad is a no-op.
+        return jni::JNI_VERSION_1_6;
+    }
+    let options = std::env::var("CRUSSTY_RUNTIME_OPTIONS")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("crussty/options.txt")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_default();
+    let rc = CrusstyRuntime.init(vm, &options);
+    if rc != jni::JNI_OK {
+        return rc;
+    }
+    jni::JNI_VERSION_1_6
+}
+
+/// The JVM calls this after JNI_OnLoad when the library is unloaded — no-op.
+#[no_mangle]
+pub extern "system" fn JNI_OnUnload(_vm: *mut jni::JavaVM, _reserved: *mut c_void) {}
+
+impl Agent for CrusstyRuntime {
+    fn on_load(&self, vm: *mut jni::JavaVM, options: &str) -> jni::jint {
+        self.init(vm, options)
+    }
     fn class_file_load_hook(
         &self,
         _jni: *mut jni::JNIEnv,
@@ -295,6 +355,8 @@ struct AgentOptions {
     versions: Option<PathBuf>,
     #[allow(dead_code)]
     kernel: Option<String>,
+    /// Unix socket path for the telemetry channel ("telemetry=/run/crussty.sock")
+    telemetry: Option<PathBuf>,
 }
 
 /// options format: "modules=<dir>;versions=<dir>;kernel=<jar>"
@@ -308,6 +370,7 @@ fn parse_options(options: &str) -> AgentOptions {
             "modules" => o.modules = Some(PathBuf::from(v.trim())),
             "versions" => o.versions = Some(PathBuf::from(v.trim())),
             "kernel" => o.kernel = Some(v.trim().to_string()),
+            "telemetry" => o.telemetry = Some(PathBuf::from(v.trim())),
             _ => {}
         }
     }
