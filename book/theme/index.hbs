@@ -11,12 +11,13 @@
         <base href="{{ base_url }}">
         {{/if}}
 
+
         <!-- Custom HTML head -->
         {{> head}}
 
         <meta name="description" content="{{ description }}">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="theme-color" content="#0f1011">
+        <meta name="theme-color" content="#ffffff">
 
         {{#if favicon_svg}}
         <link rel="icon" href="{{ resource "favicon.svg" }}">
@@ -145,56 +146,45 @@
                         <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
                             {{fa "solid" "bars"}}
                         </label>
-                        <a class="glide-logo" href="{{ path_to_root }}index.html" aria-label="{{ book_title }} home">
-                            <img class="glide-logo-img" src="{{ path_to_root }}logo.svg" alt="" hidden>
-                            <span class="glide-logo-badge" aria-hidden="true"></span>
-                            <span class="glide-logo-name">{{ book_title }}</span>
-                            <span class="glide-version" hidden></span>
-                        </a>
+                        <img src="{{ path_to_root }}logo.svg" class="logo" alt="{{ title }}">
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            {{fa "solid" "paintbrush"}}
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        {{#if search_enabled}}
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            {{fa "solid" "magnifying-glass"}}
+                        </button>
+                        {{/if}}
                     </div>
 
-                    {{#if search_enabled}}
-                    <div class="glide-header-center">
-                        <button type="button" class="glide-search-btn" id="glide-search-btn" aria-label="Search">
-                            <svg class="glide-search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                                <circle cx="7" cy="7" r="5"></circle>
-                                <line x1="11" y1="11" x2="14.5" y2="14.5" stroke-linecap="round"></line>
-                            </svg>
-                            <span class="glide-search-label">Search documentation…</span>
-                            <kbd>/</kbd>
-                        </button>
-                    </div>
-                    {{else}}
-                    <div class="glide-header-center"></div>
-                    {{/if}}
+                    <h1 class="menu-title">{{ book_title }}</h1>
 
                     <div class="right-buttons">
-                        {{#if git_repository_url}}
-                        <a href="{{git_repository_url}}" title="Git repository" aria-label="Git repository">
-                            {{fa git_repository_icon_class git_repository_icon}}
-                        </a>
-                        {{/if}}
                         {{#if print_enable}}
                         <a href="{{ path_to_root }}print.html" title="Print this book" aria-label="Print this book">
                             {{fa "solid" "print" "print-button"}}
                         </a>
                         {{/if}}
-                        <button id="glide-theme-btn" type="button" title="Toggle light / dark" aria-label="Toggle light / dark theme">
-                            <span class="glide-theme-icon" aria-hidden="true"></span>
-                        </button>
-                    </div>
+                        {{#if git_repository_url}}
+                        <a href="{{git_repository_url}}" title="Git repository" aria-label="Git repository">
+                            {{fa git_repository_icon_class git_repository_icon}}
+                        </a>
+                        {{/if}}
+                        {{#if git_repository_edit_url}}
+                        <a href="{{git_repository_edit_url}}" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            {{fa "solid" "pencil" "git-edit-button"}}
+                        </a>
+                        {{/if}}
 
-                    <!-- mdBook controls book.js relies on; driven programmatically, kept off-screen. -->
-                    <h1 class="menu-title">{{ book_title }}</h1>
-                    <button id="mdbook-theme-toggle" class="glide-hidden" type="button" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">theme</button>
-                    <ul id="mdbook-theme-list" class="theme-popup glide-hidden" aria-label="Themes" role="menu">
-                        <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
-                        <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
-                        <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Dark</button></li>
-                    </ul>
-                    {{#if search_enabled}}
-                    <button id="mdbook-search-toggle" class="glide-hidden" type="button" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">search</button>
-                    {{/if}}
+                    </div>
                 </div>
 
                 {{#if search_enabled}}
@@ -227,38 +217,56 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         {{{ content }}}
-
-                        <nav class="glide-page-nav" aria-label="Chapter navigation">
-                            {{#if previous}}
-                            <a class="glide-nav-prev" rel="prev" href="{{ path_to_root }}{{previous.link}}">
-                                <span class="glide-nav-label">← Previous</span>
-                                <span class="glide-nav-title">{{ previous.title }}</span>
-                            </a>
-                            {{/if}}
-                            {{#if next}}
-                            <a class="glide-nav-next" rel="next prefetch" href="{{ path_to_root }}{{next.link}}">
-                                <span class="glide-nav-label">Next →</span>
-                                <span class="glide-nav-title">{{ next.title }}</span>
-                            </a>
-                            {{/if}}
-                        </nav>
-
-                        {{#if git_repository_edit_url}}
-                        <div class="glide-page-footer">
-                            <a href="{{ git_repository_edit_url }}" rel="edit">Edit this page on GitHub</a>
-                        </div>
-                        {{/if}}
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                        {{#if previous}}
+                            <a rel="prev" href="{{ path_to_root }}{{previous.link}}" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                {{#if (eq ../text_direction "rtl")}}
+                                {{fa "solid" "angle-right"}}
+                                {{else}}
+                                {{fa "solid" "angle-left"}}
+                                {{/if}}
+                            </a>
+                        {{/if}}
+
+                        {{#if next}}
+                            <a rel="next prefetch" href="{{ path_to_root }}{{next.link}}" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                {{#if (eq ../text_direction "rtl")}}
+                                {{fa "solid" "angle-left"}}
+                                {{else}}
+                                {{fa "solid" "angle-right"}}
+                                {{/if}}
+                            </a>
+                        {{/if}}
+
                         <div style="clear: both"></div>
                     </nav>
                 </div>
             </div>
 
-            <aside id="glide-page-toc" aria-label="On this page"></aside>
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                {{#if previous}}
+                    <a rel="prev" href="{{ path_to_root }}{{previous.link}}" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        {{#if (eq ../text_direction "rtl")}}
+                        {{fa "solid" "angle-right"}}
+                        {{else}}
+                        {{fa "solid" "angle-left"}}
+                        {{/if}}
+                    </a>
+                {{/if}}
 
-            <nav class="nav-wide-wrapper" aria-label="Page navigation"></nav>
+                {{#if next}}
+                    <a rel="next prefetch" href="{{ path_to_root }}{{next.link}}" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        {{#if (eq text_direction "rtl")}}
+                        {{fa "solid" "angle-left"}}
+                        {{else}}
+                        {{fa "solid" "angle-right"}}
+                        {{/if}}
+                    </a>
+                {{/if}}
+            </nav>
 
         </div>
 
