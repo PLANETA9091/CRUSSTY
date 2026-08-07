@@ -1,0 +1,14 @@
+[package]
+name = "cplug-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Convenience layer for module authors: heavy JNI/JVMTI patterns, zero limits removed"
+
+[workspace]
+
+[dependencies]
+cplug-abi = { path = "../cplug-abi" }
+jvmti-bindings = "2"
+
+[dev-dependencies]
+flate2 = "1"

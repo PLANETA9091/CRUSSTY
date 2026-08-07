@@ -1,67 +1,25 @@
-# Build artifacts and large binaries
-artifacts/*.jar
-artifacts/*.json
-artifacts/optimized-runtime/
-artifacts/optimized-runtime/bundler/
-artifacts/optimized-runtime/native/*.so
-
-# Rust build cache
-native/target/
-
-# Upstream Paper source (clone separately)
-upstream/
-
-# Server logs
+target/
+*.so
+*.dylib
+*.dll
+*.jar
+versions/
+world/
 logs/
-
-# Test run outputs
-runs/
-
-# Benchmark results
-bench/
-
-# Reports (validation gates, stress test results)
-reports/
-
-# Git worktrees
-worktrees/
-
-# Third-party plugin JARs
-plugins/matrix/*.jar
-plugins/stress/*.jar
-plugins/matrix-libraries/
-
-# Test datapacks
-datapacks/stress/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Node modules
-scripts/node_modules/
-scripts/target/
-
-# Temporary / working files
-.tmp/
-.codex-p500/
-*.init.gradle
-*.swp
-*.swo
-*~
-
-# JVM crash logs
+crash-reports/
+cache/
+config/
+launcher/out/
+libdist_agent.so
 hs_err_pid*.log
-javac.*.args
-
-# Server runtime files
-server.properties
 eula.txt
-ops.json
-whitelist.json
 banned-ips.json
 banned-players.json
-
-# OS files
-.DS_Store
-Thumbs.db
+ops.json
+usercache.json
+whitelist.json
+help.yml
+commands.yml
+bukkit.yml
+permissions.yml
+server.properties
