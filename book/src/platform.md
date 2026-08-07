@@ -2,7 +2,7 @@
 
 The runtime ships twelve native primitives under `runtime/src/platform/`.
 They are the building blocks every module builds on: instead of reinventing
-event buses, tick routing or persistence in each plugin, a module uses the
+event buses, tick routing or persistence in each module, a module uses the
 brick's public API (re-exported from `platform/mod.rs`). Each file is owned
 by exactly one concern; bricks do not depend on each other's internals.
 

@@ -1,7 +1,7 @@
 # Distribution as zip archives
 
-Plugins can be distributed as a single zip (or jar) file. The scan treats
-any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive plugin.
+Modules can be distributed as a single zip (or jar) file. The scan treats
+any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 
 ## How extraction works
 
@@ -15,9 +15,9 @@ any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive plugin.
    ```
 
    The hash is the FNV-1a of the archive file contents. Re-extraction only
-   happens when the archive changed — after that the plugin is loaded from
+   happens when the archive changed — after that the module is loaded from
    the cache, so boot time stays constant.
-3. The cache entry is loaded exactly like a directory plugin (manifest,
+3. The cache entry is loaded exactly like a directory module (manifest,
    entry library, dependency ordering).
 
 ## Security
@@ -33,11 +33,11 @@ Archive extraction is deliberately conservative:
 | Entry size | `> 256 MiB` → entry rejected |
 | Total size | `> 1 GiB` → archive rejected |
 
-An offending entry fails the whole extraction; the plugin is skipped with a
+An offending entry fails the whole extraction; the module is skipped with a
 diagnostic.
 
 ## Why zip
 
-A single-file plugin is trivial to hand around, download, and version-lock:
+A single-file module is trivial to hand around, download, and version-lock:
 `hello-0.1.0.zip` instead of a directory tree. Everything else (manifest
-schema, entry resolution, hooks) is identical to directory plugins.
+schema, entry resolution, hooks) is identical to directory modules.
