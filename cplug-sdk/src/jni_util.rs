@@ -9,7 +9,7 @@ use std::ffi::c_char;
 /// Standard idiom (Oracle JNI spec): probe with `GetEnv` first; only call
 /// `AttachCurrentThread` when detached, and only `DetachCurrentThread` if we
 /// attached ourselves. Attaching/detaching an already-attached thread
-/// (e.g. the agent's OnLoad thread, or a class-load hook thread) is fatal.
+/// (e.g. the runtime's OnLoad thread, or a class-load hook thread) is fatal.
 /// Returns None if the VM is gone or attach fails.
 pub fn with_attached<R>(f: impl FnOnce(&JniEnv) -> R) -> Option<R> {
     unsafe {

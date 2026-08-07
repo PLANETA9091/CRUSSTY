@@ -1,4 +1,4 @@
-//! cplug-abi — the ONLY contract between the dist-agent and modules.
+//! cplug-abi — the ONLY contract between the crussty-runtime and modules.
 //!
 //! Modules are native shared libraries in `modules/` (recursive scan). Each
 //! must export:
@@ -40,7 +40,7 @@ pub type ClassHookFn = unsafe extern "C" fn(
 #[repr(C)]
 pub struct CPluginApi {
     pub version: u32,
-    /// Register `hook` (with plugin-owned `ctx`) in the agent's patch pipeline.
+    /// Register `hook` (with plugin-owned `ctx`) in the runtime's patch pipeline.
     pub register_class_hook:
         Option<unsafe extern "C" fn(ctx: *mut c_void, hook: ClassHookFn) -> i32>,
     /// Allocate a buffer via JVMTI (freed by the VM with Deallocate).
@@ -55,6 +55,6 @@ pub struct CPluginApi {
 pub type JavaVmPtr = *mut c_void;
 
 /// `cplugin_init(api, vm, options) -> i32` — the single required export.
-/// options carries agent info, e.g. "modules=<dir>;versions=<dir>;kernel=<jar>".
+/// options carries runtime info, e.g. "modules=<dir>;versions=<dir>;kernel=<jar>".
 pub type CPluginInit =
     unsafe extern "C" fn(api: *const CPluginApi, vm: JavaVmPtr, options: *const c_char) -> i32;

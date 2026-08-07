@@ -2,7 +2,7 @@
 name = "cplug-abi"
 version = "2.0.0"
 edition = "2021"
-description = "The only contract between dist-agent and modules"
+description = "The only contract between crussty-runtime and modules"
 
 [workspace]
 

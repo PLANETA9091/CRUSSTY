@@ -1,4 +1,4 @@
-//! dist-agent — the native injection engine (libdist_agent.so).
+//! crussty-runtime — the native injection engine (libcrussty_runtime.so).
 //!
 //! Loaded via `-agentpath:` by the launcher BEFORE any kernel class loads.
 //! Jobs:
@@ -18,6 +18,8 @@ use std::sync::{Mutex, OnceLock};
 
 use cplug_abi::{CPluginApi, ClassHookFn, JavaVmPtr, CPAPI_VERSION};
 use jvmti_bindings::prelude::*;
+#[allow(unused_imports)]
+use jvmti_bindings::export_agent as export_runtime;
 use libloading::Library;
 
 /// (ctx, hook) pairs registered by plugins, in registration order.
@@ -82,16 +84,16 @@ fn with_attached<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 #[derive(Default)]
-struct DistAgent;
+struct CrusstyRuntime;
 
-impl Agent for DistAgent {
+impl Agent for CrusstyRuntime {
     fn on_load(&self, vm: *mut jni::JavaVM, options: &str) -> jni::jint {
-        eprintln!("[dist-agent] v2.0.0 loaded (options: {})", options);
+        eprintln!("[crussty-runtime] v2.0.0 loaded (options: {})", options);
 
         let jvmti = match Jvmti::new(vm) {
             Ok(env) => env,
             Err(e) => {
-                eprintln!("[dist-agent] no jvmti env: {e}");
+                eprintln!("[crussty-runtime] no jvmti env: {e}");
                 return jni::JNI_ERR;
             }
         };
@@ -99,15 +101,15 @@ impl Agent for DistAgent {
             caps.set_can_generate_all_class_hook_events(true);
             caps.set_can_retransform_classes(true);
         }) {
-            eprintln!("[dist-agent] add capabilities failed: {e:?}");
+            eprintln!("[crussty-runtime] add capabilities failed: {e:?}");
             return jni::JNI_ERR;
         }
         if let Err(e) = jvmti.set_event_callbacks(get_default_callbacks()) {
-            eprintln!("[dist-agent] set callbacks failed: {e:?}");
+            eprintln!("[crussty-runtime] set callbacks failed: {e:?}");
             return jni::JNI_ERR;
         }
         if let Err(e) = jvmti.enable_events_global(&[jvmti::JVMTI_EVENT_CLASS_FILE_LOAD_HOOK]) {
-            eprintln!("[dist-agent] enable event failed: {e:?}");
+            eprintln!("[crussty-runtime] enable event failed: {e:?}");
             return jni::JNI_ERR;
         }
         let _ = JVMTI_ENV.set(jvmti.raw() as usize);
@@ -117,10 +119,10 @@ impl Agent for DistAgent {
         if let Some(dir) = &opts.modules {
             load_plugins(dir, vm as JavaVmPtr, options);
         } else {
-            eprintln!("[dist-agent] no modules= in options; nothing injected");
+            eprintln!("[crussty-runtime] no modules= in options; nothing injected");
         }
         eprintln!(
-            "[dist-agent] pipeline ready: {} plugin hook(s)",
+            "[crussty-runtime] pipeline ready: {} plugin hook(s)",
             hooks().lock().unwrap().len()
         );
 
@@ -209,7 +211,7 @@ impl Agent for DistAgent {
     }
 }
 
-export_agent!(DistAgent);
+export_runtime!(CrusstyRuntime);
 
 /// Trampolines handed to plugins through CPluginApi.
 unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn) -> i32 {
@@ -251,7 +253,7 @@ unsafe extern "C" fn api_retransform_class(name: *const c_char) -> i32 {
     let classes = match env.get_loaded_classes() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[dist-agent] retransform {nm}: get_loaded_classes failed: {e:?}");
+            eprintln!("[crussty-runtime] retransform {nm}: get_loaded_classes failed: {e:?}");
             return -2;
         }
     };
@@ -268,17 +270,17 @@ unsafe extern "C" fn api_retransform_class(name: *const c_char) -> i32 {
         return -1;
     };
     match env.is_modifiable_class(cls) {
-        Ok(m) => eprintln!("[dist-agent] retransform {nm}: is_modifiable_class={m}"),
-        Err(e) => eprintln!("[dist-agent] retransform {nm}: is_modifiable_class err {e:?}"),
+        Ok(m) => eprintln!("[crussty-runtime] retransform {nm}: is_modifiable_class={m}"),
+        Err(e) => eprintln!("[crussty-runtime] retransform {nm}: is_modifiable_class err {e:?}"),
     }
     match env.get_class_status(cls) {
-        Ok(s) => eprintln!("[dist-agent] retransform {nm}: class_status=0x{s:x}"),
-        Err(e) => eprintln!("[dist-agent] retransform {nm}: class_status err {e:?}"),
+        Ok(s) => eprintln!("[crussty-runtime] retransform {nm}: class_status=0x{s:x}"),
+        Err(e) => eprintln!("[crussty-runtime] retransform {nm}: class_status err {e:?}"),
     }
     if let Err(e) = env.retransform_classes(&[cls]) {
         let code: i32 = e as i32;
         let name = env.get_error_name(e).unwrap_or_default();
-        eprintln!("[dist-agent] retransform {nm}: RetransformClasses failed: {e:?} (code {code}, name {name})");
+        eprintln!("[crussty-runtime] retransform {nm}: RetransformClasses failed: {e:?} (code {code}, name {name})");
         return -5;
     }
     0
@@ -323,7 +325,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
     if found.is_empty() {
-        eprintln!("[dist-agent] no plugins found under {}", root.display());
+        eprintln!("[crussty-runtime] no plugins found under {}", root.display());
     }
     for plugin in found {
         // RTLD_LOCAL: one plugin cannot shadow another's symbols (the Java
@@ -332,7 +334,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!(
-                    "[dist-agent] dlopen {} failed: {e}",
+                    "[crussty-runtime] dlopen {} failed: {e}",
                     plugin.lib_path.display()
                 );
                 continue;
@@ -342,12 +344,12 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
             match unsafe { lib.get(b"cplugin_init\0") } {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[dist-agent] {} has no cplugin_init export: {e}", plugin.id);
+                    eprintln!("[crussty-runtime] {} has no cplugin_init export: {e}", plugin.id);
                     continue;
                 }
             };
         let rc = unsafe { init(&api, vm, c_options.as_ptr()) };
-        eprintln!("[dist-agent] plugin {} -> init rc={rc}", plugin.id);
+        eprintln!("[crussty-runtime] plugin {} -> init rc={rc}", plugin.id);
         libs().lock().unwrap().push(lib);
     }
 }

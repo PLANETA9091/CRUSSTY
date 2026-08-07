@@ -145,7 +145,7 @@ pub fn retransform(name: &str) -> bool {
     with_attached(|env| {
         let jvmti = Jvmti::new(crate::vm() as *mut jni::JavaVM).ok()?;
         // Capabilities are PER-ENVIRONMENT: GetEnv hands out a fresh env
-        // each call, so the agent's can_retransform_classes does not apply
+        // each call, so the runtime's can_retransform_classes does not apply
         // here — this env must add it itself (legal in the live phase).
         if let Err(e) = jvmti.add_capabilities_with(|caps| {
             caps.set_can_retransform_classes(true);

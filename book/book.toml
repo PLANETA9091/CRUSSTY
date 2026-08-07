@@ -1,0 +1,8 @@
+[book]
+title = "Crussty Platform"
+authors = ["PLANETA9091"]
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/PLANETA9091/crussty"
+edit-url-template = "https://github.com/PLANETA9091/crussty/edit/master/book/{path}"

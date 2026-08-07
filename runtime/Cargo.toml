@@ -1,5 +1,5 @@
 [package]
-name = "dist-agent"
+name = "crussty-runtime"
 version = "2.0.0"
 edition = "2021"
 description = "Native injection engine: loads modules into the kernel JVM"

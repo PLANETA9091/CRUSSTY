@@ -1,5 +1,5 @@
 @echo off
-rem v2 on Windows: boot the kernel from versions\ with the native agent + modules.
+rem v2 on Windows: boot the kernel from versions\ with the native runtime + modules.
 rem Usage: run.bat [extra kernel args]. DIST_JAVA_OPTS overrides JVM flags.
 setlocal
 cd /d "%~dp0"

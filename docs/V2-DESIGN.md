@@ -6,7 +6,7 @@ the user drops into `versions/`, and **injects Rust modules from `modules/`**
 
 ## Status
 
-VERIFIED live: `launcher.jar -> child JVM (-agentpath) -> libdist_agent.so ->
+VERIFIED live: `launcher.jar -> child JVM (-agentpath) -> libcrussty_runtime.so ->
 dlopen(libhello.so) -> ClassFileLoadHook pipeline -> JNI attach ->
 Bukkit.getLogger().info()` — message appears in the server log. This is the
 "no API" proof: a native plugin talking to a live Purpur kernel via raw JVM.
@@ -16,14 +16,14 @@ Bukkit.getLogger().info()` — message appears in the server log. This is the
 ```
 v2/
 ├── launcher.jar          # what users download — Java control plane
-│                          #   scan versions/ -> spawn child JVM with agent
-├── libdist_agent.so      # native injection engine (Rust cdylib) — dlopen()s plugins
+│                          #   scan versions/ -> spawn child JVM with runtime
+├── libcrussty_runtime.so      # native injection engine (Rust cdylib) — dlopen()s plugins
 ├── versions/             # user drops the kernel jar here (e.g. purpur-1.21.10.jar)
 ├── modules/            # Rust modules — recursive scan, subfolders = free grouping
 │   ├── hello/            # e2e proof plugin (source lives here; artifact = .so + cplugin.json)
 │   └── dist/             # v1 engine as a plugin — NEXT MILESTONE
 ├── cplug-abi/            # the ONLY ABI crate
-├── agent/                # the JVMTI agent crate (dist-agent, cdylib)
+├── runtime/                # the JVMTI runtime crate (crussty-runtime, cdylib)
 ├── launcher/src/main/java/dev/dist/launcher/Main.java
 ├── config/
 └── logs/                 # server.log (tee) + the kernel's own latest.log
@@ -32,9 +32,9 @@ v2/
 ## Launcher (Main.java)
 
 - `findKernel`: `versions/*.jar`, sorted by name desc (deterministic).
-- `findAgent`: `libdist_agent.so` / `libdist_agent.dylib` / `dist_agent.dll` at root.
+- `findAgent`: `libcrussty_runtime.so` / `libcrussty_runtime.dylib` / `crussty_runtime.dll` at root.
 - spawns child JVM (NOT in-process bootstrap — see Sources): `java
-  -agentpath:<abs>/libdist_agent.so=modules=<abs>;versions=<abs>;kernel=<name>
+  -agentpath:<abs>/libcrussty_runtime.so=modules=<abs>;versions=<abs>;kernel=<name>
   -Xms512M -Xmx2G -XX:+UseG1GC -Dfile.encoding=UTF-8 -jar versions/<kernel> --nogui`
 - `DIST_JAVA_OPTS` env overrides JVM flags; extra args forwarded to the kernel.
 - tee child stdout+stderr to `logs/server.log` AND console; forwards launcher
@@ -45,9 +45,9 @@ v2/
 
 `cplugin_init(api: *const CPluginApi, vm: JavaVmPtr, options: *const c_char) -> i32`
 must be exported (`#[unsafe(no_mangle)]`). `CPluginApi { version=1, register_class_hook,
-jvmti_allocate }` — trampolines into the agent, so plugins never link the agent.
+jvmti_allocate }` — trampolines into the runtime, so plugins never link the runtime.
 A `ClassHookFn(name, data, len, out, out_len)` returns `rc==0` to patch: buffer must
-come from `jvmti_allocate`, agent deallocates after copying (no leaks in chains).
+come from `jvmti_allocate`, runtime deallocates after copying (no leaks in chains).
 
 Manifest sidecar `cplugin.json`: `{ "id": ..., "version": ..., "main": ... }`.
 
@@ -83,16 +83,16 @@ never dlopened as plugins. This replaced the earlier `.so`-keyed scan and the
 - Agent `Agent_OnLoad` runs before ANY class loads (even JDK bootstrap) —
   plugins see the whole class lifecycle, from `jdk/internal/vm/...` up.
 - Agent capabilities: can_generate_early_class_hook_or_events, can_retransform_classes
-  (OnLoad-only), CANNOT use GetInstrumentation (native agents don't get one) —
+  (OnLoad-only), CANNOT use GetInstrumentation (native JVMTI agents (spec term) do not get one) —
   `ClassFileLoadHook` IS the hot-patch pipeline.
 - The kernel (purpur jar) is itself a clip: it extracts `versions/`+`libraries/`
   into its cwd and boots the real server **in the same process** (verified) —
-  the agent survives the clip phase and sees the actual server classes.
+  the runtime survives the clip phase and sees the actual server classes.
 
 ## Hot-patch pipeline (user requirement: automatic, available to all plugins)
 
-Every class load runs through the agent's hook chain (plugins registered via
-`register_class_hook`). rc==0 + new bytes -> the agent feeds them to JVMTI
+Every class load runs through the runtime's hook chain (plugins registered via
+`register_class_hook`). rc==0 + new bytes -> the runtime feeds them to JVMTI
 (chained: plugin A's output feeds plugin B). This is the single mechanism that
 will carry BOTH the v1 optimizations (as an automatic patch pipeline) and any
 plugin's bytecode work. Bytecode rewriting for Java 21+ (major 65) needs frame
@@ -170,16 +170,16 @@ recomputation — ASM via an injected Java helper class (can't live in pure Rust
      class definition`. Weave call sites must use
      `main_thread::runnable_class_name()`, not a hardcoded FQCN.
 3. ASM-based Java helper for retransform-class rewrites (optimizations).
-4. Windows: `dist_agent.dll` + `-Ddist.root` wiring (DB path already handled).
+4. Windows: `crussty_runtime.dll` + `-Ddist.root` wiring (DB path already handled).
    - **DONE**: launcher passes `-Ddist.root=<root>` to the child JVM (so the
      module/kernel resolution matches regardless of cwd); `run.bat` boots the
-     same launcher.jar; agent default plugin entry is now platform-derived
+     same launcher.jar; runtime default plugin entry is now platform-derived
      (`std::env::consts::{DLL_PREFIX,DLL_SUFFIX}`: `lib<id>.so` / `lib<id>.dylib`
      / `<id>.dll`), covering Windows cdylib names without a `lib` prefix;
      manifest `main` rejects absolute paths on every OS (POSIX `/`, Windows
      `C:\`, UNC `\\`, and `\..\` escapes); crussty's bundled natives glue
      (`MAIN_LIB`/`CHUNK_LIB`) use the same platform naming; `scripts/build-win.sh`
-     cross-compiles agent + all modules to `x86_64-pc-windows-msvc` and stages
+     cross-compiles runtime + all modules to `x86_64-pc-windows-msvc` and stages
      the `.dll`s next to their manifests.
 
 ## Sources
