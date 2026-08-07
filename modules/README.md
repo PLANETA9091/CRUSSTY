@@ -1,11 +1,11 @@
-# Плагины
+# Plugins
 
-Плагины (модули) живут в отдельных репозиториях `c-<имя>`:
+Plugins (modules) live in their own `c-<name>` repositories:
 
-- [c-hello](https://github.com/PLANETA9091/c-hello) — минимальный proof-модуль (хук + GetLoadedClasses + JNI)
-- [c-dist](https://github.com/PLANETA9091/c-dist) — движок dist (UDP-аренды, fencing) как модуль
-- [c-crussty](https://github.com/PLANETA9091/c-crussty) — Crussty CE native surface как модуль
+- [c-hello](https://github.com/PLANETA9091/c-hello) — minimal proof module (hook + GetLoadedClasses + JNI)
+- [c-dist](https://github.com/PLANETA9091/c-dist) — the dist engine (UDP leases, fencing) as a module
+- [c-crussty](https://github.com/PLANETA9091/c-crussty) — Crussty CE native surface as a module
 
-Установка: клонируй в `modules/<имя>` и собери (`cargo build && cp target/debug/lib<имя>.so .`),
-либо упакуй директорию плагина в `.zip` и положи рядом — агент сам распакует
-и загрузит.
+Install: clone into `modules/<name>` and build (`cargo build && cp target/debug/lib<name>.so .`),
+or pack the plugin directory into a `.zip` and drop it next to the others — the
+runtime extracts and loads it automatically.

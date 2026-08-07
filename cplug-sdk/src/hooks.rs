@@ -1,6 +1,6 @@
 //! Pattern hook registry + kernel-ready notifications.
 //!
-//! The SDK registers a single hook in the agent pipeline; every class load is
+//! The SDK registers a single hook in the runtime pipeline; every class load is
 //! dispatched here and passed to registered pattern closures. Callbacks run on
 //! the class-loading thread — keep them cheap (spawn if heavy).
 //!
@@ -49,7 +49,7 @@ pub fn dispatch(name: &str) {
 
 /// Register a byte-level hook: `cb(name, bytes)` fires on every class load
 /// matching `pattern` and may return patched bytes (the SDK allocates the
-/// replacement via the agent's JVMTI allocator and hands it to the JVM).
+/// replacement via the runtime's JVMTI allocator and hands it to the JVM).
 /// Hooks chain in registration order: each gets the previous output.
 pub fn register_bytes(
     pattern: &str,

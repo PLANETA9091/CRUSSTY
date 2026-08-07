@@ -1,26 +1,27 @@
-# CRUSSTY — native c-plugin платформа (v2)
+# CRUSSTY — native c-plugin platform (v2)
 
-Инжектит нативные Rust-модули в любой Paper-совместимый ядро: JVMTI-агент с
-ClassFileLoadHook hot-patch конвейером. Модуль = плагин: директория (или
-`.zip`/`.jar` архив) с `cplugin.json` и entry library.
+Injects native Rust modules into any Paper-compatible kernel: a JVMTI runtime
+with a ClassFileLoadHook hot-patch pipeline. A module is a plugin: a directory
+(or `.zip`/`.jar` archive) with a `cplugin.json` manifest and an entry library.
 
-## Структура
+## Layout
 
-- `cplug-abi/` — единственный контракт агент ↔ модуль
-- `cplug-sdk/` — SDK для авторов модулей (хуки, JNI, главный поток, ASM-вейвинг)
-- `agent/` — JVMTI-агент: рекурсивный скан, топологическая загрузка, хук-конвейер
-- `launcher/` — лаунчер (спавн ядра с `-agentpath`)
-- `modules/` — плагины живут в своих репозиториях `c-<имя>`; клонируй их сюда
-- `docs/V2-DESIGN.md` — дизайн платформы
+- `cplug-abi/` — the only contract between runtime and modules
+- `cplug-sdk/` — SDK for module authors (hooks, JNI, main thread, ASM weaving)
+- `runtime/` — JVMTI runtime: recursive scan, topological loading, hook pipeline
+- `launcher/` — launcher (spawns the kernel with `-agentpath`)
+- `modules/` — plugins live in their own `c-<name>` repos; clone them here
+- `docs/V2-DESIGN.md` — platform design
+- `book/` — user documentation (mdBook, published to GitHub Pages)
 
-## Сборка
+## Build
 
 ```bash
-cargo build --manifest-path agent/Cargo.toml
-cp agent/target/debug/libdist_agent.so libdist_agent.so
+cargo build --manifest-path runtime/Cargo.toml
+cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java && \
   jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
 ./run.sh
 ```
 
-Нужен `versions/purpur-1.21.10.jar` (в репозиторий не входит).
+Requires `versions/purpur-1.21.10.jar` (not committed).

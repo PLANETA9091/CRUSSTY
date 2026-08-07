@@ -14,7 +14,7 @@ import java.util.stream.Stream;
 /**
  * v2 launcher (the artifact users download). Jobs:
  *  1. find the kernel jar in versions/ (any Paper-family jar);
- *  2. spawn a child JVM with our native agent (-agentpath:libdist_agent.so),
+ *  2. spawn a child JVM with our native agent (-agentpath:libcrussty_runtime.so),
  *     so Rust modules load BEFORE the kernel boots (JVMTI ClassFileLoadHook
  *     window, full capabilities — OnLoad-only hooks are available);
  *  3. forward console stdin and tee stdout/stderr into logs/.
@@ -91,9 +91,9 @@ public final class Main {
 
     static Path findAgent(Path root) {
         String os = System.getProperty("os.name", "").toLowerCase();
-        String name = os.contains("win") ? "dist_agent.dll"
-                : os.contains("mac") ? "libdist_agent.dylib"
-                : "libdist_agent.so";
+        String name = os.contains("win") ? "crussty_runtime.dll"
+                : os.contains("mac") ? "libcrussty_runtime.dylib"
+                : "libcrussty_runtime.so";
         Path agent = root.resolve(name);
         if (!Files.exists(agent)) {
             System.err.println("[launcher] native agent missing: " + agent);

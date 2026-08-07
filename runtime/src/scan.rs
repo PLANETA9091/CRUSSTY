@@ -54,7 +54,7 @@ pub fn scan(root: &Path) -> Vec<CPlugin> {
                 }
             }
             None => eprintln!(
-                "[dist-agent] archive {} is not a plugin (no top-level cplugin.json or rejected)",
+                "[crussty-runtime] archive {} is not a plugin (no top-level cplugin.json or rejected)",
                 zip_path.display()
             ),
         }
@@ -189,7 +189,7 @@ fn default_entry(id: &str) -> String {
 
 /// Absolute paths in a manifest `main` must be rejected on every platform:
 /// POSIX `/foo`, Windows drive `C:\foo`, UNC `\\host\share\foo`. This runs on
-/// the host the agent is built for; `\`-led paths are absolute on Windows and
+/// the host the runtime is built for; `\`-led paths are absolute on Windows and
 /// rejected there, and a `\` is not a path separator on POSIX (a lone `\`
 /// component is harmless), but rejecting both separators is the safe call.
 fn is_absolute_path(m: &str) -> bool {
@@ -234,13 +234,13 @@ fn extract_zip_plugin(zip_path: &Path) -> Option<PathBuf> {
             Ok(()) => {
                 if let Err(e) = fs::rename(&tmp, &dir) {
                     let _ = fs::remove_dir_all(&tmp);
-                    eprintln!("[dist-agent] cache {}: {e}", dir.display());
+                    eprintln!("[crussty-runtime] cache {}: {e}", dir.display());
                     return None;
                 }
             }
             Err(reason) => {
                 let _ = fs::remove_dir_all(&tmp);
-                eprintln!("[dist-agent] reject {}: {reason}", zip_path.display());
+                eprintln!("[crussty-runtime] reject {}: {reason}", zip_path.display());
                 return None;
             }
         }

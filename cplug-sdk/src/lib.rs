@@ -38,8 +38,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// The JavaVM* passed to cplugin_init (raw).
 static VM: AtomicUsize = AtomicUsize::new(0);
 
-/// The agent's jvmti_allocate fn pointer (for handing replacement class bytes
-/// to the JVM — freed by the agent with JVMTI Deallocate).
+/// The runtime's jvmti_allocate fn pointer (for handing replacement class bytes
+/// to the JVM — freed by the runtime with JVMTI Deallocate).
 static ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 /// Agent's retransform_class fn pointer (retroactive class patching).
@@ -63,11 +63,11 @@ pub fn retransform_class(name: &str) -> i32 {
 }
 
 /// Must be called first, from `cplugin_init` (attached thread). Stores the vm
-/// and registers the SDK's single pipeline hook (the agent's automatic
+/// and registers the SDK's single pipeline hook (the runtime's automatic
 /// class-load dispatch used by all SDK-level pattern hooks).
 ///
 /// # Safety
-/// `api` must be the CPluginApi from the agent, `vm` the live JavaVM* passed
+/// `api` must be the CPluginApi from the runtime, `vm` the live JavaVM* passed
 /// to cplugin_init.
 pub unsafe fn init(api: *const CPluginApi, vm: JavaVmPtr) {
     if let Some(api_ref) = unsafe { api.as_ref() } {
@@ -91,7 +91,7 @@ pub fn vm() -> JavaVmPtr {
     VM.load(Ordering::Relaxed) as JavaVmPtr
 }
 
-/// Single entry into the agent pipeline: forwards every class load to the
+/// Single entry into the runtime pipeline: forwards every class load to the
 /// SDK's pattern-matching hook registries (names and bytes). Returns a
 /// patched class only when a byte hook replaced it.
 unsafe extern "C" fn sdk_dispatch_hook(

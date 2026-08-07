@@ -10,7 +10,7 @@ crash-reports/
 cache/
 config/
 launcher/out/
-libdist_agent.so
+libcrussty_runtime.so
 hs_err_pid*.log
 eula.txt
 banned-ips.json
@@ -23,3 +23,4 @@ commands.yml
 bukkit.yml
 permissions.yml
 server.properties
+/book/book

@@ -1,0 +1,15 @@
+# Summary
+
+- [Introduction](./intro.md)
+- [Quick Start](./quickstart.md)
+- [Plugins](./plugins.md)
+  - [Manifest (cplugin.json)](./manifest.md)
+  - [Distribution as zip archives](./zip.md)
+- [Architecture](./architecture.md)
+- [Module SDK](./sdk.md)
+  - [Hooks](./sdk-hooks.md)
+  - [Classes & JNI](./sdk-classes.md)
+  - [Main thread](./sdk-main-thread.md)
+  - [ASM weaving](./sdk-asm.md)
+- [Example plugins](./examples.md)
+- [Troubleshooting](./troubleshooting.md)
