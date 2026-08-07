@@ -1,4 +1,4 @@
-# Example plugins
+# Example modules
 
 All examples are standalone repositories; each demonstrates one layer of the
 platform.

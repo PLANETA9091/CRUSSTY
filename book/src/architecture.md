@@ -12,7 +12,7 @@
                         │ -agentpath / JNI_OnLoad
 ┌───────────────────────▼────────────────────────────┐
 │ Crussty Runtime (libcrussty_runtime.so, JVMTI)     │
-│   - scans modules/, topologically loads plugins    │
+│   - scans modules/, topologically loads modules    │
 │   - owns the ClassFileLoadHook pipeline            │
 │   - owns the JVMTI byte allocator + retransform    │
 │   - platform bricks (src/platform/*)               │
@@ -36,19 +36,19 @@ kernel modification; the single-jar path requires none at all (it replaces
 
 The runtime enables `CAN_GENERATE_ALL_CLASS_HOOK_EVENTS` and
 `CAN_RETRANSFORM_CLASSES`, then registers `CLASS_FILE_LOAD_HOOK`. On every
-class load it walks its hook chain — one slot per plugin — in topological
-(load) order. A plugin may:
+class load it walks its hook chain — one slot per module — in topological
+(load) order. A module may:
 
 - return `rc == 0` with replacement bytes → the runtime hands them to the
   JVM through its own `jvmti_allocate` buffer (freed by the JVM), or
 - return `rc > 0` → skip, keep the original bytes.
 
-Because hooks run on the class-load thread, plugins must not block there
+Because hooks run on the class-load thread, modules must not block there
 (see [SDK: main thread](./sdk-main-thread.md) for deferred work).
 
 ## ABI contract
 
-Plugins never link against the runtime. The only contract is `cplug-abi`, a
+Modules never link against the runtime. The only contract is `cplug-abi`, a
 plain C struct of function pointers (`CPluginApi`) passed into
 `cplugin_init(api, vm, options)`:
 
@@ -57,7 +57,7 @@ plain C struct of function pointers (`CPluginApi`) passed into
 - `retransform_class(class_bytes, len) -> i32` (class name is embedded in the
   bytes; JVMTI reads it)
 
-`CPAPI_VERSION` guards ABI drift: the runtime rejects plugins compiled
+`CPAPI_VERSION` guards ABI drift: the runtime rejects modules compiled
 against a different ABI version.
 
 ## Module loading
@@ -72,7 +72,7 @@ the kernel's loader namespace.
 The scanner reads each manifest's `dependencies` and loads in topological
 order (Kahn's algorithm; unknown ids fall back to sorted path order, cycles
 keep their sorted position). Hooks then fire in load order, which is the
-order plugins expect their patches applied.
+order modules expect their patches applied.
 
 ## Platform bricks
 
@@ -86,9 +86,9 @@ routing (`scheduler`), persistence (`storage`), an O(1) side table
 (`network`), telemetry export (`telemetry`) and save-lifecycle hooks
 (`save_events`).
 
-Bricks are compiled into the runtime, not into plugins: a module links
+Bricks are compiled into the runtime, not into modules: a module links
 `cplug-abi` only, and calls brick APIs through the runtime's exported
-surface. They are what let a plugin be a few hundred lines instead of a
+surface. They are what let a module be a few hundred lines instead of a
 reinvention of the platform.
 
 ## Signal handling
