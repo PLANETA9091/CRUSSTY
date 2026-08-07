@@ -4,17 +4,18 @@
 
 ```
 ┌────────────────────────────────────────────────────┐
-│ launcher.jar (Java)                                │
-│   - resolves the kernel jar from versions/         │
-│   - spawns the child JVM with -agentpath           │
-│   - tees logs, forwards stdin                      │
+│ launcher.jar / server.jar (single-jar, Boot.class) │
+│   - single-jar: extracts runtime + modules,        │
+│     System.load -> JNI_OnLoad                      │
+│   - launcher: spawns child JVM with -agentpath     │
 └───────────────────────┬────────────────────────────┘
-                        │ -agentpath:libcrussty_runtime.so=...
+                        │ -agentpath / JNI_OnLoad
 ┌───────────────────────▼────────────────────────────┐
 │ Crussty Runtime (libcrussty_runtime.so, JVMTI)     │
 │   - scans modules/, topologically loads plugins    │
 │   - owns the ClassFileLoadHook pipeline            │
 │   - owns the JVMTI byte allocator + retransform    │
+│   - platform bricks (src/platform/*)               │
 └───────┬──────────────────────────┬─────────────────┘
         │ dlopen (RTLD_LOCAL)      │ CLASS_FILE_LOAD_HOOK
 ┌───────▼──────────┐      ┌────────▼─────────────────────────┐
@@ -23,14 +24,13 @@
 └──────────────────┘      └──────────────────────────────────┘
 ```
 
-The **runtime** is a classic JVMTI native agent: the JVM calls its
-`AgentMain`/`OnLoad` with a `jvmtiEnv*` and a `JavaVM*`. It is attached with
-`-agentpath` before the kernel boots, so it observes every kernel class load
-from the very first one.
-
-The word "agent" is JVMTI's own term for this kind of library; in this
-project the component is called the **runtime** to avoid confusion with
-AI/LLM agents.
+Two entry points reach the same runtime: the launcher passes `-agentpath`
+so the runtime is a classic JVMTI agent before the kernel boots; the
+single-jar bootstrapper (`Boot.java`) extracts the runtime and modules,
+writes `crussty/options.txt`, and `System.load`s the runtime, whose
+`JNI_OnLoad` brings up the same pipeline. The launcher path requires no
+kernel modification; the single-jar path requires none at all (it replaces
+`server.jar`).
 
 ## Class file hook pipeline
 
@@ -73,3 +73,31 @@ The scanner reads each manifest's `dependencies` and loads in topological
 order (Kahn's algorithm; unknown ids fall back to sorted path order, cycles
 keep their sorted position). Hooks then fire in load order, which is the
 order plugins expect their patches applied.
+
+## Platform bricks
+
+Below the ABI layer, the runtime itself ships twelve reusable primitives in
+`src/platform/` (see [Platform bricks](./platform.md) for the API surface):
+an event bus (`events`), a class-patch pipeline (`transform`), crash
+isolation that chains the JVM's own signal handlers (`signals`), tick
+routing (`scheduler`), persistence (`storage`), an O(1) side table
+(`side_table`), live module swapping (`hot_reload`), managed threads
+(`threads`), multi-phase barriers (`barriers`), connection tracking
+(`network`), telemetry export (`telemetry`) and save-lifecycle hooks
+(`save_events`).
+
+Bricks are compiled into the runtime, not into plugins: a module links
+`cplug-abi` only, and calls brick APIs through the runtime's exported
+surface. They are what let a plugin be a few hundred lines instead of a
+reinvention of the platform.
+
+## Signal handling
+
+The crash-isolation brick installs `sigaction` handlers with `SA_SIGINFO`
+and *chains* to the previous disposition. The JVM installs its own handlers
+for SIGSEGV and friends (hs_err reporting, JIT null-checks, stack banging);
+a platform that overwrites them breaks the JVM. On a fault the platform
+therefore either records counters and forwards the fault to the previous
+handler, or — when there was no previous handler — dumps a native
+backtrace itself and re-raises the default disposition so the JVM's
+fatal-error machinery still runs. `CRUSSTY_NO_SIGNALS=1` disables this.
