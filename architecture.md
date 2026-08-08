@@ -9,46 +9,46 @@ nav_order: 4
 
 <div class="arch-diagram">
 
-  <div class="arch-layer arch-top">
-    <div class="arch-title">launcher.jar · server.jar</div>
-    <ul>
-      <li><b>single-jar</b> — extracts runtime + modules → <code>System.load</code> → <code>JNI_OnLoad</code></li>
-      <li><b>launcher</b> — spawns a child JVM with <code>-agentpath</code></li>
-    </ul>
-  </div>
+<div class="arch-layer arch-top">
+<div class="arch-title">launcher.jar · server.jar</div>
+<ul>
+<li><b>single-jar</b> — extracts runtime + modules → <code>System.load</code> → <code>JNI_OnLoad</code></li>
+<li><b>launcher</b> — spawns a child JVM with <code>-agentpath</code></li>
+</ul>
+</div>
 
-  <div class="arch-arrow">-agentpath / JNI_OnLoad</div>
+<div class="arch-arrow">-agentpath / JNI_OnLoad</div>
 
-  <div class="arch-layer arch-core">
-    <div class="arch-title">Crussty Runtime <span class="arch-file">libcrussty_runtime.so · JVMTI</span></div>
-    <ul>
-      <li>scans <code>modules/</code> and loads modules in topological order</li>
-      <li>owns the <code>ClassFileLoadHook</code> pipeline</li>
-      <li>owns the JVMTI byte allocator + retransform</li>
-      <li>platform bricks in <code>src/platform/*</code></li>
-    </ul>
-  </div>
+<div class="arch-layer arch-core">
+<div class="arch-title">Crussty Runtime <span class="arch-file">libcrussty_runtime.so · JVMTI</span></div>
+<ul>
+<li>scans <code>modules/</code> and loads modules in topological order</li>
+<li>owns the <code>ClassFileLoadHook</code> pipeline</li>
+<li>owns the JVMTI byte allocator + retransform</li>
+<li>platform bricks in <code>src/platform/*</code></li>
+</ul>
+</div>
 
-  <div class="arch-split">
-    <div class="arch-layer arch-mod">
-      <div class="arch-title">modules/*.so</div>
-      <div class="arch-note">cplug-abi only · dlopen (RTLD_LOCAL) · patching</div>
-    </div>
-    <div class="arch-layer arch-jvm">
-      <div class="arch-title">kernel JVM</div>
-      <div class="arch-note">Purpur/Paper · every class load, pre-JIT</div>
-    </div>
-  </div>
+<div class="arch-split">
+<div class="arch-layer arch-mod">
+<div class="arch-title">modules/*.so</div>
+<div class="arch-note">cplug-abi only · dlopen (RTLD_LOCAL) · patching</div>
+</div>
+<div class="arch-layer arch-jvm">
+<div class="arch-title">kernel JVM</div>
+<div class="arch-note">Purpur/Paper · every class load, pre-JIT</div>
+</div>
+</div>
 
-  <div class="arch-flow">
-    <div class="arch-step">class load</div>
-    <div class="arch-flow-arrow">→</div>
-    <div class="arch-step">hook chain<br><i>topological order</i></div>
-    <div class="arch-flow-arrow">→</div>
-    <div class="arch-step">rc &gt; 0 → skip</div>
-    <div class="arch-flow-arrow">→</div>
-    <div class="arch-step arch-step-ok">replacement bytes<br><i>jvmti_allocate</i></div>
-  </div>
+<div class="arch-flow">
+<div class="arch-step">class load</div>
+<div class="arch-flow-arrow">→</div>
+<div class="arch-step">hook chain<br><i>topological order</i></div>
+<div class="arch-flow-arrow">→</div>
+<div class="arch-step">rc &gt; 0 → skip</div>
+<div class="arch-flow-arrow">→</div>
+<div class="arch-step arch-step-ok">replacement bytes<br><i>jvmti_allocate</i></div>
+</div>
 
 </div>
 Two entry points reach the same runtime: the launcher passes `-agentpath`
@@ -126,5 +126,6 @@ either records counters and forwards the fault to the previous handler, or —
 when there was no previous handler — dumps a native backtrace itself and
 re-raises the default disposition so the JVM's fatal-error machinery still
 runs. `CRUSSTY_NO_SIGNALS=1` disables this.
+
 
 
