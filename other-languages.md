@@ -32,12 +32,12 @@ and **JNI bindings** for your language.
 | Language | Ease | Notes |
 |---|---|---|
 | **Rust** | Native | `cplug-sdk` — hooks, classes, main thread, ASM. Reference path. |
-| **C** | ✅ Verified | `modules/examples-multilang/c` — raw JNI headers; `CPluginApi` is already plain C. |
-| **C++** | ✅ Verified | `modules/examples-multilang/cpp` — same as C; RAII wrapper. |
+| **C** | ✅ Verified | `cplug-sdk-c` C binding + `modules/examples-multilang/c` — raw JNI headers; `CPluginApi` is already plain C. |
+| **C++** | ✅ Verified | Same as C; RAII wrapper. |
 | **Go (cgo)** | ⚠️ Harness-only | `modules/examples-multilang/go` works in a test harness, but the Go runtime hijacks signal handlers and **crashes the JVM** (SIGABRT) — see [golang/go#13042]. Ship as a separate process, not a JVM in-process module. |
-| **Python** | ✅ Verified | `modules/examples-multilang/python` — C shim embeds CPython; module body is `.py`. |
-| **JavaScript** | ✅ Verified | `modules/examples-multilang/js` — C shim embeds QuickJS; module body is `.js`. |
-| **Zig** | Straightforward | `@cImport` the JNI headers; export `cplugin_init`. |
+| **Python** | ✅ Verified | `cplug-sdk-c` + `ctypes` — module body is `.py`, no JNI code (example: `cplug-sdk-c/examples/python`). |
+| **JavaScript** | ✅ Verified | `cplug-sdk-c` from a C shim embedding QuickJS; module body is `.js`. |
+| **Zig** | Straightforward | `@cImport` the C headers (`cplug-abi.h`, `cplug-sdk.h`); export `cplugin_init`. |
 | **Nim / D / Odin** | Possible | Compile a `dylib`/`cdylib` and export the symbol. |
 
 [golang/go#13042]: https://github.com/golang/go/issues/13042
@@ -63,16 +63,55 @@ Shared mechanics every shim needs:
 
 `cplug-sdk` (hooks, classes, main thread, ASM) is a **Rust** crate. The
 platform API it wraps (`cplug-abi`) is pure C, but the SDK's convenience
-helpers are Rust-only. There are two ways to use them from another language:
+helpers are Rust-only. There are three ways to use them from another
+language:
 
-1. **Raw ABI** — talk to `CPluginApi` + `JavaVM` directly, write your own
+1. **`cplug-sdk-c` (recommended)** — a ready-made C binding of the SDK
+   (one header, one library): pattern hooks, byte hooks, cross-loader class
+   lookup, kernel-ready notification, main-thread dispatch and logging,
+   exported as plain `extern "C"` functions. C, C++ and Zig link it
+   directly; Python drives it through `ctypes` (no JNI code at all); a JS
+   module calls it from its QuickJS C shim.
+2. **Raw ABI** — talk to `CPluginApi` + `JavaVM` directly, write your own
    bindings for the three `cplug-abi` entry points. No extra runtime.
-2. **SDK re-export** — export the SDK's helper functions (hooks, main-thread
+3. **SDK re-export** — export the SDK's helper functions (hooks, main-thread
    dispatch) through your own `extern "C"` wrapper in a small Rust shim.
 
 The platform's other bricks (events, telemetry, scheduler) are Rust-runtime
 APIs today; they are reachable from other languages only through a C wrapper
 if/when one is published.
+
+## Using the SDK from C (or Python/JS)
+
+Build `cplug-sdk-c` (from the c-cells repo) to get `libcplug_sdk_c` and
+include `cplug-sdk.h` next to `cplug-abi.h`:
+
+```c
+#include "cplug-sdk.h"
+
+static void on_class(void* ctx, const char* name) { /* ... */ }
+
+int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
+    cplug_sdk_init(api, vm);
+    cplug_sdk_hook_register("org/bukkit/**", NULL, on_class);
+    cplug_sdk_on_kernel_ready("org/bukkit/Bukkit", NULL, on_ready);
+    return 0;
+}
+```
+
+Python needs no shim logic beyond the embedding trampoline — the whole hook
+registry, main-thread dispatch and logging are called through `ctypes`:
+
+```python
+import ctypes
+sdk = ctypes.CDLL("libcplug_sdk_c.so")
+hook = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_char_p)(on_class)
+sdk.cplug_sdk_hook_register(b"org/bukkit/**", None, hook)
+```
+
+Byte hooks returning patched class bytes follow the same contract as the
+Rust SDK: return a replacement buffer (the SDK copies it and frees it) or
+NULL to keep the original class.
 
 ## Example: minimal C hook
 
@@ -119,5 +158,6 @@ and the hook callback shape. Signature details are versioned in the SDK.
   lifetime).
 
 The Rust SDK remains the most ergonomic path with the deepest coverage of
-Crussty's own bricks; C, C++, Python (via shim) and JS (via shim) are
-verified working, and Zig is straightforward for direct ABI work.
+Crussty's own bricks; `cplug-sdk-c` now brings the shared convenience
+layer to C, C++, Python (ctypes), JS (via shim) and Zig, and the raw
+multilang examples are all verified working on a live kernel.

@@ -36,11 +36,22 @@ hooks::register("org/bukkit/Bukkit", |ctx, bytes, len| {
 
 ## Modules
 
-- [Hooks](./sdk-hooks.md) — register_class_hook, byte hooks
-- [Classes & JNI](./sdk-classes.md) — find_class, wait_class, retransform
-- [Main thread](./sdk-main-thread.md) — run_on_main_thread
-- [ASM weaving](./sdk-asm.md) — replace_body, ArgSpec
+- **Hooks** — register_class_hook, byte hooks
+- **Classes & JNI** — find_class, wait_class, retransform
+- **Main thread** — run_on_main_thread
+- **ASM weaving** — replace_body, ArgSpec
 
 All SDK entry points are safe to call from any thread that has an attached
 JNI env (`with_attached` handles attach/detach for the main thread; kernel
 threads are already attached).
+
+## Not writing Rust?
+
+The same convenience layer is available to C, C++, Python, JavaScript and
+Zig modules through **`cplug-sdk-c`** — a thin C binding of the SDK
+(pattern hooks, byte hooks, class lookup, main-thread dispatch, kernel
+logging) with one header and one library. Python modules drive it straight
+from `hello_sdk.py` via `ctypes`; C, C++ and Zig link it directly. You
+only write Rust if you need the bytecode weaving (`insert_call_at_start` /
+`redirect_calls`) or the profiler — see [Other languages](other-languages.html)
+for the full matrix.
