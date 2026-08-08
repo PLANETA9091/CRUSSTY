@@ -1143,8 +1143,41 @@ fn vti_size(d: &[u8], off: usize, end: usize, ctx: &str) -> Result<usize, String
                 Ok(3)
             }
         }
-        t => Err(format!("{ctx}: unknown verification_type_info tag {t}")),
+        t => {
+            let from = off.saturating_sub(24).min(off);
+            let hex: Vec<String> = d[from..off.min(d.len())]
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect();
+            Err(format!(
+                "{ctx}: unknown verification_type_info tag {t} (near [{}] at abs {} )",
+                hex.join(" "),
+                off
+            ))
+        }
     }
+}
+
+/// The Uninitialized (tag 8) verification_type_info carries the bytecode
+/// offset of the `new` it refers to (JVMS 4.7.4). When a patch inserts
+/// `ins_len` bytes at `pc`, every such offset at/after `pc` must grow too,
+/// or the JVM rejects the class with "bad offset for Uninitialized".
+fn vti_bump_uninit(
+    sub: &SubAttr,
+    d: &[u8],
+    p: usize,
+    pc: usize,
+    ins_len: i32,
+    plan: &mut Plan,
+    ctx: &str,
+) -> Result<(), String> {
+    if d.get(p).copied() == Some(8) {
+        let v = u16_at(d, p + 1, ctx)?;
+        if v as usize >= pc {
+            plan.bump_u2(sub.off + p + 1, v, i64::from(ins_len));
+        }
+    }
+    Ok(())
 }
 
 /// StackMapTable frames are delta-encoded (JVMS 4.7.4): only the first frame
@@ -1165,14 +1198,25 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
             .get(pos)
             .copied()
             .ok_or_else(|| format!("StackMapTable entry #{k}: truncated frame_type"))?;
-        let ctx = |what: &str| format!("StackMapTable entry #{k} ({what})");
+        let ctx = |what: &str| format!("StackMapTable entry #{k} ({what}) [head {}]", {
+            let n = payload.len().min(56);
+            payload[..n].iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+        });
         let (delta, entry_len): (u16, usize) = match ft {
-            0..=63 => (u16::from(ft), 1),
-            64..=127 => (u16::from(ft - 64), 1 + vti_size(payload, pos + 1, end, &ctx("same_locals_1_stack_item"))?),
-            247 => (
-                u16_at(payload, pos + 1, &ctx("offset_delta"))?,
-                3 + vti_size(payload, pos + 3, end, &ctx("same_locals_1_stack_item_extended"))?,
-            ),
+0..=63 => (u16::from(ft), 1),
+             64..=127 => {
+                let v = vti_size(payload, pos + 1, end, &ctx("same_locals_1_stack_item"))?;
+                vti_bump_uninit(sub, payload, pos + 1, pc, ins_len, plan, &ctx("same_locals_1_stack_item"))?;
+                (u16::from(ft - 64), 1 + v)
+            }
+             247 => {
+                let v = vti_size(payload, pos + 3, end, &ctx("same_locals_1_stack_item_extended"))?;
+                vti_bump_uninit(sub, payload, pos + 3, pc, ins_len, plan, &ctx("same_locals_1_stack_item_extended"))?;
+                (
+                    u16_at(payload, pos + 1, &ctx("offset_delta"))?,
+                    3 + v,
+                )
+            }
             248..=250 => (u16_at(payload, pos + 1, &ctx("offset_delta"))?, 3),
             251 => (u16_at(payload, pos + 1, &ctx("offset_delta"))?, 3),
             252..=254 => {
@@ -1180,23 +1224,40 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
                 let mut size = 3usize;
                 let mut p = pos + 3;
                 for _ in 0..n {
-                    size += vti_size(payload, p, end, &ctx("append_frame local"))?;
-                    p += 3;
+                    let v = vti_size(payload, p, end, &ctx("append_frame local"))?;
+                    if std::env::var_os("CRUSSTY_TRACE_SMT").is_some() {
+                        eprintln!("[smt] append#{k} vti@{p} size={v}");
+                    }
+                    vti_bump_uninit(sub, payload, p, pc, ins_len, plan, &ctx("append_frame local"))?;
+                    size += v;
+                    p += v; // vti is 1 byte for scalars, 3 for object/uninit
                 }
                 (u16_at(payload, pos + 1, &ctx("offset_delta"))?, size)
             }
             255 => {
                 let locals = u16_at(payload, pos + 3, &ctx("number_of_locals"))? as usize;
-                let stack = u16_at(payload, pos + 5, &ctx("number_of_stack_items"))? as usize;
                 let mut size = 7usize;
                 let mut p = pos + 7;
                 for _ in 0..locals {
-                    size += vti_size(payload, p, end, &ctx("full_frame local"))?;
-                    p += 3;
+                    let v = vti_size(payload, p, end, &ctx("full_frame local"))?;
+                    if std::env::var_os("CRUSSTY_TRACE_SMT").is_some() {
+                        eprintln!("[smt] full#{k} local vti@{p} size={v}");
+                    }
+                    vti_bump_uninit(sub, payload, p, pc, ins_len, plan, &ctx("full_frame local"))?;
+                    size += v;
+                    p += v;
                 }
+                let stack = u16_at(payload, p, &ctx("number_of_stack_items"))? as usize;
+                if std::env::var_os("CRUSSTY_TRACE_SMT").is_some() {
+                    eprintln!("[smt] entry#{k} full_frame pos={pos} locals={locals} stack={stack} ts@{}", p + 2);
+                }
+                p += 2;
+                size += 2;
                 for _ in 0..stack {
-                    size += vti_size(payload, p, end, &ctx("full_frame stack item"))?;
-                    p += 3;
+                    let v = vti_size(payload, p, end, &ctx("full_frame stack item"))?;
+                    vti_bump_uninit(sub, payload, p, pc, ins_len, plan, &ctx("full_frame stack item"))?;
+                    size += v;
+                    p += v;
                 }
                 (u16_at(payload, pos + 1, &ctx("offset_delta"))?, size)
             }
