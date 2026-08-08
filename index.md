@@ -41,3 +41,10 @@ Rust modules run without the JVM in the hot path: no garbage collection, no
 interpreter, no classloading — just compiled code. This is what makes
 hot-path replacements (worldgen noise, chunk encoding, block collisions)
 thousands of times faster than Java equivalents.
+
+## Build your own module
+
+Want to write a module? Follow the step-by-step
+[Building an example module](building.html) guide — it takes a module from
+zero to a running server in seven steps. Or grab a ready-made module from the
+[example repos](examples.html).

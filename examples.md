@@ -1,6 +1,6 @@
 ---
 title: Example modules
-nav_order: 7
+nav_order: 8
 ---
 
 # Example modules
