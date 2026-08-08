@@ -1,8 +1,8 @@
 // hello_py — a Crussty module whose hook logic is written in Python,
 // embedded via a thin C shim.
 //
-// Build:  cc -shared -fPIC -O2 $(python3-config --cflags) \
-//             -o libhello_py.so shim.c $(python3-config --ldflags)
+// Build:  cc -shared -fPIC -O2 $(python3-config --cflags)
+//         -o libhello_py.so shim.c $(python3-config --embed --ldflags)
 // Deploy: libhello_py.so  +  cplugin.json { "id": "hello_py" }  in modules/
 //
 // The runtime dlopens this .so and calls cplugin_init. The shim embeds a
@@ -10,6 +10,9 @@
 // module body is written in Python while the JVM-facing ABI stays C. This is
 // the "script-backed module needs a C shim" pattern.
 #define _GNU_SOURCE
+#include <Python.h> /* must come before any glibc header (pyconfig defines
+                     * _POSIX_C_SOURCE itself; a prior <stdio.h> triggers
+                     * the "redefined" warning) */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>

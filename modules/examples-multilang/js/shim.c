@@ -1,7 +1,7 @@
 // hello_js — a Crussty module whose hook logic is written in JavaScript,
 // embedded via a QuickJS shim (quickjs-ng).
-// Build:  cc -shared -fPIC -O2 -I/usr/include $(pkg-config --cflags --libs qjs) \
-//             -o libhello_js.so shim.c
+// Build:  cc -shared -fPIC -O2 -I/usr/include $(pkg-config --cflags)
+//         -o libhello_js.so shim.c $(pkg-config --libs qjs)
 // Deploy: libhello_js.so + cplugin.json { "id": "hello_js" } in modules/
 //
 // The runtime dlopens this .so and calls cplugin_init. The shim embeds

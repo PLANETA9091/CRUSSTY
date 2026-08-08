@@ -42,7 +42,7 @@ typedef void* JavaVmPtr;
  * Contract:
  * - `out_data`/`out_len` must be set only when replacing the class; the
  *   replacement buffer must come from `api->jvmti_allocate`.
- * - return 0  -> patched: use *out_data/*out_len as the new class bytes;
+ * - return 0  -> patched: use [out_data]/[out_len] as the new class bytes;
  *   return nonzero -> keep original bytes (plugin error or no-op).
  */
 typedef int32_t (*cpapi_class_hook_fn)(
