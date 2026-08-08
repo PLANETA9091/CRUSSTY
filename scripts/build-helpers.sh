@@ -13,9 +13,17 @@ cd "$REPO_ROOT"
 
 JAVAC_FLAGS=(-encoding UTF-8 --release 8 -g -nowarn)
 
+ASM_JAR="cplug-sdk/asm-lib/asm-9.7.1.jar"
+if [[ ! -f "$ASM_JAR" ]]; then
+    echo "== downloading ASM (SdkAsmHelper dependency) =="
+    mkdir -p cplug-sdk/asm-lib
+    curl -fsSL -o "$ASM_JAR" \
+      https://repo1.maven.org/maven2/org/ow2/asm/asm/9.7.1/asm-9.7.1.jar
+fi
+
 echo "== cplug-sdk SdkAsmHelper (asm-build/) =="
 mkdir -p cplug-sdk/asm-build
-javac "${JAVAC_FLAGS[@]}" -cp cplug-sdk/asm-lib/asm-9.7.1.jar -d cplug-sdk/asm-build \
+javac "${JAVAC_FLAGS[@]}" -cp "$ASM_JAR" -d cplug-sdk/asm-build \
   cplug-sdk/asm-src/dev/dist/SdkAsmHelper.java
 
 echo "== modules/crussty area-map helpers (area-map/build/) =="
