@@ -7,7 +7,7 @@ nav_order: 4
 
 ## Layers
 
-<div class="arch-diagram">
+<div class="arch-diagram" markdown="0">
 
 <div class="arch-layer arch-top">
 <div class="arch-title">launcher.jar · server.jar</div>
