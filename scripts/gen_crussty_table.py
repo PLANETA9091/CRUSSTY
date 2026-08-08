@@ -1,142 +1,232 @@
 #!/usr/bin/env python3
-"""Generate v2/modules/crussty/src/jni_table.rs from Crussty CE native exports.
+"""Generate modules/crussty/src/jni_table.rs from the published manifest
+modules/crussty/native/JNI_EXPORTS.manifest (single source of truth).
 
-Parses `pub extern "system" fn Java_<fqcn>_<method>(...)` signatures in the
-paper-native-jni / paper-native-chunk-encode-jni crates and emits:
-  - MAIN_JNI_TABLE / CHUNK_JNI_TABLE: (class internal name, method, JNI sig, symbol)
-  - MAIN_BRIDGE_CLASSES / CHUNK_BRIDGE_CLASSES: unique class names per library
+The manifest lists the 283 `Java_*` JNI exports of the two Crussty CE native
+libraries that this platform publishes (see modules/crussty/native/MANIFEST.md).
+It replaces the closed paper-native-jni / paper-native-chunk-encode-jni crate
+sources the original generator parsed. One line per export:
 
-JNI symbol -> method signature rule: the VM derives the native method
-signature from the JNI function name; our bridge classes declare
-`public static native <ret> <method>(<params>)` exactly as emitted here.
+    class|method|JNI signature|Java_symbol
+
+  - class: JVM internal class name (slashes), e.g. net/minecraft/.../PaperNativeX
+  - method: the native method name (the bridge declares `public static native`)
+  - JNI signature: JVM method signature "([params)ret"
+  - Java_symbol: the ELF export name as it appears in `nm -D` of the shipped .so
+
+Commands:
+
+  python3 scripts/gen_crussty_table.py render              # manifest -> jni_table.rs
+  python3 scripts/gen_crussty_table.py render --check      # fail if output != committed
+  python3 scripts/gen_crussty_table.py dump                # jni_table.rs -> manifest
+  python3 scripts/gen_crussty_table.py verify [SO ...]     # cross-check shipped libs
+
+The emitted `pub static ..._JNI_TABLE` is used by the crussty module to define
+bridge classes and RegisterNatives every export against the dlopen'd library.
 """
+import argparse
+import pathlib
 import re
+import subprocess
 import sys
 
-ROOT = "/home/btw/crussty-dist/crussty/native"
-OUT = "/home/btw/crussty-dist/v2/modules/crussty/src/jni_table.rs"
+REPO = pathlib.Path(__file__).resolve().parent.parent
+MANIFEST = REPO / "modules" / "crussty" / "native" / "JNI_EXPORTS.manifest"
+TABLE = REPO / "modules" / "crussty" / "src" / "jni_table.rs"
 
-TYPE_MAP = {
-    "jboolean": "Z", "jbyte": "B", "jchar": "C", "jshort": "S", "jint": "I",
-    "jlong": "J", "jfloat": "F", "jdouble": "D", "jsize": "I", "void": "V",
-    "jbooleanArray": "[Z", "jbyteArray": "[B", "jcharArray": "[C",
-    "jshortArray": "[S", "jintArray": "[I", "jlongArray": "[J",
-    "jfloatArray": "[F", "jdoubleArray": "[D",
-    "jobjectArray": "[Ljava/lang/Object;",
-    "jstring": "Ljava/lang/String;", "jobject": "Ljava/lang/Object;",
-    "jclass": "Ljava/lang/Class;",
-    "JString": "Ljava/lang/String;",
-}
+SECTION_MAIN = "paper-native-jni"
+SECTION_CHUNK = "paper-native-chunk-encode-jni"
+EXPECTED_TOTAL = 283  # dual-checked against the shipped .so by `verify`
 
-# env/class params every JNI method has; never part of the Java signature
-SKIP = {"JNIEnv", "JClass", "JavaVM"}
+Entry = tuple[str, str, str, str]  # class, method, sig, symbol
 
 
-def clean(t):
-    t = t.strip()
-    t = t.replace("jni::sys::", "").replace("jni::objects::", "").replace("jni::", "")
-    return t
+def load_manifest(path: pathlib.Path) -> tuple[list[Entry], list[Entry]]:
+    """Parse the manifest into (main_entries, chunk_entries)."""
+    sections: dict[str, list[Entry]] = {}
+    current: str | None = None
+    seen: set[str] = set()
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            m = re.match(r"# lib: (\S+)", line)
+            if m:
+                current = m.group(1)
+                sections.setdefault(current, [])
+            continue
+        if current is None:
+            sys.exit(f"{path}:{lineno}: entry before any '# lib:' section header")
+        cls, method, sig, symbol = line.split("|", 3)
+        if not all((cls, method, sig, symbol)):
+            sys.exit(f"{path}:{lineno}: empty field in {line!r}")
+        if symbol in seen:
+            sys.exit(f"{path}:{lineno}: DUPLICATE EXPORT {symbol}")
+        seen.add(symbol)
+        sections[current].append((cls, method, sig, symbol))
+    if SECTION_MAIN not in sections or SECTION_CHUNK not in sections:
+        sys.exit(
+            f"{path}: missing '# lib: {SECTION_MAIN}' and/or '# lib: {SECTION_CHUNK}' sections"
+        )
+    return sections[SECTION_MAIN], sections[SECTION_CHUNK]
 
 
-def parse_file(path, out):
-    src = open(path).read()
-    for m in re.finditer(r'pub extern "system" fn (Java_[A-Za-z0-9_]+)\(', src):
-        start = m.end()
-        depth = 1
-        i = start
-        while depth:
-            if src[i] == "(":
-                depth += 1
-            elif src[i] == ")":
-                depth -= 1
-            i += 1
-        body = src[start : i - 1]
-        rest = src[i:]
-        rm = re.match(r"\s*->\s*([^\s{]+)", rest)
-        ret = clean(rm.group(1)) if rm else "void"
-
-        params = []
-        cur = ""
-        depth = 0
-        for ch in body:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            if ch == "," and depth == 0:
-                params.append(cur)
-                cur = ""
-            else:
-                cur += ch
-        if cur.strip():
-            params.append(cur)
-
-        jni = []
-        for p in params:
-            p = p.strip()
-            if not p:
-                continue
-            ty = clean(p.split(":")[-1])
-            if ty in SKIP:
-                continue
-            if ty not in TYPE_MAP:
-                sys.exit(f"UNKNOWN PARAM TYPE {ty!r} in {m.group(1)} ({path})")
-            jni.append(TYPE_MAP[ty])
-        if ret not in TYPE_MAP:
-            sys.exit(f"UNKNOWN RETURN TYPE {ret!r} in {m.group(1)} ({path})")
-
-        symbol = m.group(1)
-        parts = symbol[len("Java_") :].split("_")
-        method = parts[-1]
-        cls = "/".join(parts[:-1])
-        sig = "(" + "".join(jni) + ")" + TYPE_MAP[ret]
-        out.append((cls, method, sig, symbol))
+def bridge_block(name: str, classes: list[str]) -> list[str]:
+    """Bridge-classes static, formatted like the committed artifact (rustfmt)."""
+    if len(classes) == 1:
+        return [f"pub static {name}: &[&str] =", f'    &["{classes[0]}"];']
+    out = [f"pub static {name}: &[&str] = &["]
+    out += [f'    "{c}",' for c in classes]
+    out += ["];"]
+    return out
 
 
-def emit(out, statics):
-    lines = []
-    lines.append("// Generated by scripts/gen_crussty_table.py -- DO NOT EDIT.")
-    lines.append("// JNI bridge table for the Crussty CE native surface (283 natives).")
-    lines.append("pub struct JniEntry {")
-    lines.append("    pub class: &'static str,")
-    lines.append("    pub method: &'static str,")
-    lines.append("    pub sig: &'static str,")
-    lines.append("    pub symbol: &'static str,")
-    lines.append("}")
-    lines.append("")
-    for name, entries in statics:
-        lines.append(f"#[rustfmt::skip]")
-        lines.append(f"pub static {name}: &[JniEntry] = &[")
+def render(main: list[Entry], chunk: list[Entry]) -> str:
+    """Render jni_table.rs byte-compatible with the committed artifact."""
+    lines: list[str] = [
+        "// Generated by scripts/gen_crussty_table.py -- DO NOT EDIT.",
+        f"// JNI bridge table for the Crussty CE native surface ({len(main) + len(chunk)} natives).",
+        "pub struct JniEntry {",
+        "    pub class: &'static str,",
+        "    pub method: &'static str,",
+        "    pub sig: &'static str,",
+        "    pub symbol: &'static str,",
+        "}",
+        "",
+    ]
+    for table_name, entries in [("MAIN_JNI_TABLE", main), ("CHUNK_JNI_TABLE", chunk)]:
+        lines += ["#[rustfmt::skip]", f"pub static {table_name}: &[JniEntry] = &["]
         for cls, method, sig, symbol in entries:
             lines.append(
                 f'    JniEntry {{ class: "{cls}", method: "{method}", '
                 f'sig: "{sig}", symbol: "{symbol}" }},'
             )
-        lines.append("];")
-        lines.append("")
+        lines += ["];", ""]
         classes = sorted({c for c, _, _, _ in entries})
-        clsname = name.replace("_JNI_TABLE", "_BRIDGE_CLASSES")
-        lines.append(f"pub static {clsname}: &[&str] = &[")
-        for c in classes:
-            lines.append(f'    "{c}",')
-        lines.append("];")
-        lines.append("")
-    with open(out, "w") as f:
-        f.write("\n".join(lines))
+        lines += bridge_block(table_name.replace("_JNI_TABLE", "_BRIDGE_CLASSES"), classes)
+        lines += [""]
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
-main = []
-chunk = []
-parse_file(f"{ROOT}/paper-native-jni/src/lib.rs", main)
-parse_file(f"{ROOT}/paper-native-chunk-encode-jni/src/lib.rs", chunk)
+def render_manifest(main: list[Entry], chunk: list[Entry]) -> str:
+    """Render the JNI_EXPORTS.manifest (used by `dump`)."""
+    header = [
+        "# Crussty CE JNI export surface -- single source of truth for the",
+        "# crussty module: modules/crussty/src/jni_table.rs is GENERATED from",
+        "# this file (scripts/gen_crussty_table.py render) and must not be edited",
+        "# by hand. Same data the old generator parsed out of the closed",
+        "# paper-native-jni / paper-native-chunk-encode-jni crates.",
+        "#",
+        "# one export per line: class|method|JNIsig|Java_symbol",
+        "#   class   JVM internal class name (slashes)",
+        "#   method  native method name the bridge class must declare",
+        "#   JNIsig  JVM method signature \"([params)ret\"",
+        "#   symbol  ELF export name as shown by: nm -D libpaper_native_jni.so",
+        "",
+        f"# lib: {SECTION_MAIN}",
+    ]
+    lines = header + ["|".join(e) for e in main]
+    lines += ["", f"# lib: {SECTION_CHUNK}"] + ["|".join(e) for e in chunk]
+    return "\n".join(lines) + "\n"
 
-seen = set()
-for c, m, s, sym in main + chunk:
-    if sym in seen:
-        sys.exit(f"DUPLICATE EXPORT {sym}")
-    seen.add(sym)
 
-print(f"main: {len(main)} exports, {len({c for c,_,_,_ in main})} classes")
-print(f"chunk: {len(chunk)} exports, {len({c for c,_,_,_ in chunk})} classes")
-emit(OUT, [("MAIN_JNI_TABLE", main), ("CHUNK_JNI_TABLE", chunk)])
-print(f"wrote {OUT}")
+def cmd_render(args: argparse.Namespace) -> int:
+    main, chunk = load_manifest(args.manifest)
+    total = len(main) + len(chunk)
+    if total != EXPECTED_TOTAL:
+        sys.exit(f"manifest has {total} exports, expected {EXPECTED_TOTAL}")
+    out = render(main, chunk)
+    if args.check:
+        if args.out.exists() and args.out.read_text() == out:
+            print(f"OK: {args.out} is in sync with {args.manifest}")
+            return 0
+        sys.exit(f"{args.out} differs from regenerated output; run scripts/gen_crussty_table.py render")
+    args.out.write_text(out)
+    print(f"main: {len(main)} exports, {len({c for c, _, _, _ in main})} classes")
+    print(f"chunk: {len(chunk)} exports, {len({c for c, _, _, _ in chunk})} classes")
+    print(f"wrote {args.out}")
+    return 0
+
+
+def cmd_dump(args: argparse.Namespace) -> None:
+    """Rebuild the manifest from a checked-in jni_table.rs (migration / audit)."""
+    src = args.input.read_text()
+    entries: list[Entry] = []
+    for m in re.finditer(
+        r'JniEntry \{ class: "([^"]+)", method: "([^"]+)", sig: "([^"]+)", symbol: "(Java_[A-Za-z0-9_]+)" \},',
+        src,
+    ):
+        entries.append(m.groups())  # type: ignore[arg-type]
+    main_table = src.split("pub static MAIN_JNI_TABLE", 1)[1].split("];", 1)[0]
+    main_syms = set(re.findall(r'symbol: "(Java_[A-Za-z0-9_]+)"', main_table))
+    main = [e for e in entries if e[3] in main_syms]
+    chunk = [e for e in entries if e[3] not in main_syms]
+    if len(main) + len(chunk) != len(entries):
+        sys.exit("could not split exports into main/chunk libraries")
+    args.out.write_text(render_manifest(main, chunk))
+    print(f"{len(main)} main + {len(chunk)} chunk exports -> {args.out}")
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Cross-check the manifest's Java_* symbols against real binaries (nm -D)."""
+    main, chunk = load_manifest(MANIFEST)
+    expected = {e[3] for e in main} | {e[3] for e in chunk}
+    if len(expected) != EXPECTED_TOTAL:
+        sys.exit(f"manifest has {len(expected)} symbols, expected {EXPECTED_TOTAL}")
+    actual: set[str] = set()
+    if not args.libraries:
+        args.libraries = [
+            pathlib.Path("libpaper_native_jni.so"),
+            pathlib.Path("libpaper_native_chunk_encode_jni.so"),
+        ]
+    for so in args.libraries:
+        if not so.exists():
+            continue
+        out = subprocess.run(
+            ["nm", "-D", "--defined-only", str(so)], capture_output=True, text=True
+        )
+        if out.returncode != 0:
+            sys.exit(f"nm failed on {so}: {out.stderr.strip()}")
+        syms = {
+            line.split()[-1]
+            for line in out.stdout.splitlines()
+            if "T Java_" in line or "D Java_" in line
+        }
+        print(f"{so.name}: {len(syms)} Java_* exports")
+        actual |= syms
+    if not actual:
+        print("no libraries given/found; skipping binary check")
+        return 0
+    missing = expected - actual
+    if missing:
+        sys.exit(f"manifest symbols missing from shipped libs: {sorted(missing)}")
+    print(f"OK: manifest {len(expected)} symbols all present in shipped libraries")
+    return 0
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="gen_crussty_table.py", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("render", help="manifest -> modules/crussty/src/jni_table.rs")
+    r.add_argument("--manifest", default=MANIFEST, type=pathlib.Path)
+    r.add_argument("--out", default=TABLE, type=pathlib.Path)
+    r.add_argument("--check", action="store_true", help="exit 1 if output differs")
+    r.set_defaults(func=cmd_render)
+
+    d = sub.add_parser("dump", help="jni_table.rs -> manifest (migration/audit)")
+    d.add_argument("--input", default=TABLE, type=pathlib.Path)
+    d.add_argument("--out", default=MANIFEST, type=pathlib.Path)
+    d.set_defaults(func=cmd_dump)
+
+    v = sub.add_parser("verify", help="cross-check manifest symbols against .so exports")
+    v.add_argument("libraries", nargs="*", type=pathlib.Path)
+    v.set_defaults(func=cmd_verify)
+
+    args = p.parse_args()
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()
