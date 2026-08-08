@@ -152,6 +152,18 @@ impl CrusstyRuntime {
             platform::transform::global_engine().rules().len()
         );
 
+        // Define the transform hook classes (SchedulerHooks/StorageHooks/
+        // NetHooks/TickHook) into the system class loader and register their
+        // natives — the injected ()V probes must resolve at first execution
+        // of a patched kernel method.
+        match platform::hooks::install() {
+            Ok(()) => eprintln!("[crussty-runtime] transform hook classes installed (4)"),
+            Err(e) => eprintln!(
+                "[crussty-runtime] !!! transform hook classes NOT installed: {e} \
+                 (patched kernel classes will fail with NoClassDefFoundError)"
+            ),
+        }
+
         // Platform bricks: crash handlers first (any fault from here on must
         // produce a report, not a silent death), then telemetry + events.
         // CRUSSTY_NO_SIGNALS=1 disables the handlers (diagnostics/troubleshooting).

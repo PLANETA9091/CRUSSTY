@@ -45,3 +45,7 @@ server.properties
 !modules/crussty/noise/build/net/minecraft/world/level/levelgen/synth/ImprovedNoiseNativeOps*.class
 !modules/dist/build/
 !modules/dist/build/dev/dist/DistKernel.class
+!runtime/build/hooks/dev/crussty/hooks/SchedulerHooks.class
+!runtime/build/hooks/dev/crussty/hooks/NetHooks.class
+!runtime/build/hooks/dev/crussty/hooks/TickHook.class
+!runtime/build/hooks/dev/crusty/hooks/StorageHooks.class

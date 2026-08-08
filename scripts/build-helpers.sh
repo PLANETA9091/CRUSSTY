@@ -49,6 +49,14 @@ javac "${JAVAC_FLAGS[@]}" -d modules/dist/build \
   modules/dist/helper/stubs/org/bukkit/World.java \
   modules/dist/helper/DistKernel.java
 
+echo "== runtime transform hook classes (runtime/build/hooks/) =="
+rm -rf runtime/build/hooks
+javac "${JAVAC_FLAGS[@]}" -d runtime/build/hooks \
+  runtime/hook-src/dev/crussty/hooks/SchedulerHooks.java \
+  runtime/hook-src/dev/crussty/hooks/NetHooks.java \
+  runtime/hook-src/dev/crussty/hooks/TickHook.java \
+  runtime/hook-src/dev/crusty/hooks/StorageHooks.java
+
 echo
 echo "Generated artifacts:"
-find cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build -name "*.class" | sort
+find cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build runtime/build/hooks -name "*.class" | sort
