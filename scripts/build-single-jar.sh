@@ -33,6 +33,8 @@ for m in modules/*/; do
     for lib in "$m"lib*.so; do
         [ -f "$lib" ] && cp "$lib" "$stage/modules/$id/"
     done
+    # bundled native deps (e.g. modules/crussty/native) are part of the module
+    [ -d "$m/native" ] && cp -r "$m/native" "$stage/modules/$id/"
 done
 
 manifest=$(mktemp)
