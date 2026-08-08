@@ -45,6 +45,31 @@ static ALLOC: AtomicUsize = AtomicUsize::new(0);
 /// Agent's retransform_class fn pointer (retroactive class patching).
 static RETRANSFORM: AtomicUsize = AtomicUsize::new(0);
 
+/// Agent's claim fn pointer + this module's owner handle (the CPluginApi
+/// pointer seen by the runtime), used to reserve unique JVM-visible names
+/// (bridge classes, native name/sig pairs) so modules never collide.
+static CLAIM: AtomicUsize = AtomicUsize::new(0);
+static CLAIM_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+/// Claim a unique global resource key ("class:a/b/C", "native:a/b/C#m:sig")
+/// before registering it with the JVM. Returns true when the key is free or
+/// already owned by this module; false when another module owns it — the
+/// caller must then skip the registration (the runtime logs the conflict).
+/// When the runtime predates the claim API this is a no-op returning true.
+pub fn claim(key: &str) -> bool {
+    let addr = CLAIM.load(Ordering::Relaxed);
+    if addr == 0 {
+        return true;
+    }
+    let f: unsafe extern "C" fn(usize, *const std::ffi::c_char) -> i32 =
+        unsafe { std::mem::transmute(addr) };
+    let c = match std::ffi::CString::new(key) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    unsafe { f(CLAIM_OWNER.load(Ordering::Relaxed), c.as_ptr()) == 0 }
+}
+
 /// Retransform a loaded class by internal name ("a/b/C"). Re-enters the agent
 /// pipeline: registered byte hooks see the class again and may patch it.
 /// Returns 0 on success, negative on failure.
@@ -79,6 +104,8 @@ pub unsafe fn init(api: *const CPluginApi, vm: JavaVmPtr) {
             api_ref.retransform_class.map(|f| f as usize).unwrap_or(0),
             Ordering::Relaxed,
         );
+        CLAIM.store(api_ref.claim.map(|f| f as usize).unwrap_or(0), Ordering::Relaxed);
+        CLAIM_OWNER.store(api as usize, Ordering::Relaxed);
         // register the SDK dispatch hook once (idempotent per process)
         if let Some(register) = api_ref.register_class_hook {
             unsafe { register(std::ptr::null_mut(), sdk_dispatch_hook) };

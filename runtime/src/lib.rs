@@ -14,6 +14,7 @@
 mod platform;
 mod scan;
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -372,6 +373,40 @@ unsafe extern "C" fn api_jvmti_allocate(size: usize) -> *mut u8 {
 /// they were ready. Returns 0 on success, -1 if the class is not loaded, -2 if
 /// GetLoadedClasses failed, -3 if arguments were bad, -5 if RetransformClasses
 /// failed, -6 if the calling thread could not be attached.
+/// Global claim registry: keys modules must take before registering a
+/// JVM-visible resource (class names, native (name,sig) pairs). A key is
+/// free, or owned by the module that claimed it first — a second owner gets
+/// -1 and must skip its registration, so two modules can never silently
+/// redefine the same class or overwrite each other's natives.
+static CLAIMS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+unsafe extern "C" fn api_claim(owner: usize, key: *const c_char) -> i32 {
+    let key = if key.is_null() {
+        return -2;
+    } else {
+        let mut end = 0usize;
+        while end < 4096 && *key.add(end) != 0 {
+            end += 1;
+        }
+        std::str::from_utf8(std::slice::from_raw_parts(key.cast::<u8>(), end))
+            .unwrap_or("<bad-utf8>")
+            .to_string()
+    };
+    let mut m = CLAIMS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    match m.get(&key).copied() {
+        Some(claimed) if claimed != owner => {
+            eprintln!(
+                "[crussty-runtime] claim conflict on '{key}': already owned by another module; refusing duplicate"
+            );
+            -1
+        }
+        _ => {
+            m.insert(key, owner);
+            0
+        }
+    }
+}
+
 unsafe extern "C" fn api_retransform_class(name: *const c_char) -> i32 {
     with_attached(|| {
         let Some(env) = jvmti_env() else {
@@ -466,6 +501,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
         register_class_hook: Some(api_register_class_hook),
         jvmti_allocate: Some(api_jvmti_allocate),
         retransform_class: Some(api_retransform_class),
+        claim: Some(api_claim),
     });
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
@@ -565,5 +601,27 @@ mod tests {
         publish_class_loaded("x/y", 7);
         assert_eq!(count.load(Ordering::SeqCst), 1, "no subscriber, no dispatch");
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn key(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    fn claim(owner: usize, k: &str) -> i32 {
+        let k = key(k);
+        unsafe { api_claim(owner, k.as_ptr() as *const c_char) }
+    }
+
+    #[test]
+    fn claim_first_wins_second_owner_rejected() {
+        assert_eq!(claim(0x11, "class:a/b/C"), 0);
+        assert_eq!(claim(0x11, "class:a/b/C"), 0); // idempotent, same owner
+        assert_eq!(claim(0x22, "class:a/b/C"), -1); // other module: refused
+        assert_eq!(claim(0x22, "class:a/b/D"), 0); // different key: fine
     }
 }

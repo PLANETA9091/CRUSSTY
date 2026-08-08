@@ -73,7 +73,7 @@ pub enum Injection {
 }
 
 /// One transformation rule.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     /// Class internal name pattern, e.g. "net/minecraft/server/level/ServerLevel" or "a/b/*"
     pub class_pattern: String,
@@ -123,7 +123,19 @@ impl TransformEngine {
     }
 
     pub fn register(&self, rule: Rule) {
-        self.rules.lock().unwrap().push(Arc::new(rule));
+        let mut rules = self.rules.lock().unwrap();
+        // Conflict guard: two modules (or a module + a platform brick)
+        // registering the same rule on the same point would fire the probe
+        // twice per hit. Exact duplicates are rejected instead of silently
+        // double-instrumenting.
+        if rules.iter().any(|r| **r == rule) {
+            eprintln!(
+                "[crussty-runtime] transform: duplicate rule ignored: {} {} {}{:?} -> {}",
+                rule.class_pattern, rule.method, rule.descriptor, rule.injection, rule.helper
+            );
+            return;
+        }
+        rules.push(Arc::new(rule));
     }
 
     pub fn rules(&self) -> Vec<Arc<Rule>> {
@@ -1528,7 +1540,7 @@ mod tests {
         }
     }
 
-    fn hook() -> Rule {
+    pub(super) fn hook() -> Rule {
         Rule::new("Test", "run", "()V", Injection::MethodEntry, "dev.crussty.hooks.TickHook.onEntry")
     }
 
@@ -2048,5 +2060,29 @@ mod tests {
             }
         }
         panic!("no suitable class found in jar");
+    }
+}
+
+#[cfg(test)]
+mod conflict_guard_tests {
+    use super::*;
+    use super::tests::hook;
+
+    #[test]
+    fn register_dedups_exact_rules() {
+        let e = TransformEngine::new();
+        e.register(hook());
+        e.register(hook());
+        assert_eq!(e.rules().len(), 1);
+    }
+
+    #[test]
+    fn register_keeps_distinct_rules() {
+        let e = TransformEngine::new();
+        e.register(hook());
+        let mut other = hook();
+        other.helper = "dev.crussty.hooks.TickHook.onOther".to_string();
+        e.register(other);
+        assert_eq!(e.rules().len(), 2);
     }
 }

@@ -205,6 +205,11 @@ fn define_and_register(
     class: &str,
     methods: &[(&str, &str, &str)],
 ) -> Result<(usize, usize, usize), String> {
+    // Conflict guard: never define a bridge class another module owns.
+    if !cplug_sdk::claim(&format!("class:{class}")) {
+        eprintln!("[crussty-plugin] class '{class}' claimed by another module; skipping");
+        return Err(format!("class {class} already claimed"));
+    }
     let pairs: Vec<(&str, &str)> = methods.iter().map(|(m, s, _)| (*m, *s)).collect();
     let bytes = bridge_class::bridge_class_bytes(class, &pairs);
     let Some(cls) = env.define_class(class, std::ptr::null_mut(), &bytes) else {
@@ -217,6 +222,14 @@ fn define_and_register(
     let mut natives: Vec<jni::JNINativeMethod> = Vec::with_capacity(methods.len());
     let mut missing = 0usize;
     for (m, s, sym) in methods {
+        // Conflict guard: skip natives another module already registered
+        // under the same (class, name, signature) — registering twice would
+        // silently repoint the existing native.
+        if !cplug_sdk::claim(&format!("native:{class}#{m}:{s}")) {
+            eprintln!("[crussty-plugin] native {class}#{m}{s} claimed by another module; skipping");
+            missing += 1;
+            continue;
+        }
         let Some(ptr) = lib.symbol(sym) else {
             missing += 1;
             continue;
