@@ -1,7 +1,7 @@
 ---
 title: SDK in C (cplug-sdk-c)
 parent: Module SDK
-nav_order: 1
+nav_order: 5
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> SDK in C, Python, JavaScript, Zig
