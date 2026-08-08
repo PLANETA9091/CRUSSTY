@@ -67,6 +67,35 @@
     });
   }
 
+  var NAV_ICONS = {
+    "/CRUSSTY/": "datapacks",
+    "/CRUSSTY/index.html": "datapacks",
+    "/CRUSSTY/quickstart.html": "bolt",
+    "/CRUSSTY/building.html": "c",
+    "/CRUSSTY/modules.html": "archive",
+    "/CRUSSTY/modules/manifest.html": "json",
+    "/CRUSSTY/modules/zip.html": "jar",
+    "/CRUSSTY/architecture.html": "mcf_load",
+    "/CRUSSTY/platform.html": "mcf",
+    "/CRUSSTY/sdk.html": "src",
+    "/CRUSSTY/sdk/hooks.html": "function",
+    "/CRUSSTY/sdk/classes.html": "java",
+    "/CRUSSTY/sdk/main-thread.html": "mcf_tick",
+    "/CRUSSTY/sdk/asm.html": "assembly",
+    "/CRUSSTY/examples.html": "rust",
+    "/CRUSSTY/other-languages.html": "python",
+    "/CRUSSTY/troubleshooting.html": "log"
+  };
+
+  function setActiveNavIcon() {
+    var active = document.querySelector(".site-nav .nav-list-link.active");
+    if (!active) return;
+    var icon = NAV_ICONS[location.pathname];
+    if (icon) {
+      active.style.setProperty("--nav-icon", "url(\"/CRUSSTY/assets/images/icons/" + icon + ".svg\")");
+    }
+  }
+
   function ready(fn) {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", fn);
@@ -78,5 +107,6 @@
   ready(function () {
     addCopyButtons();
     initTabs();
+    setActiveNavIcon();
   });
 })();
