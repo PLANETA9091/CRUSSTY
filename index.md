@@ -5,7 +5,6 @@ nav_order: 1
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/datapacks.svg" alt=""> Crussty Platform
-<img class="logo" src="/CRUSSTY/assets/images/crussty-logo.png" alt="Crussty logo" />
 
 
 Crussty is a **native injection platform** for Paper-family Minecraft kernels
