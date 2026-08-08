@@ -16,7 +16,7 @@
 
 use std::ffi::{c_char, c_void};
 
-pub const CPAPI_VERSION: u32 = 2;
+pub const CPAPI_VERSION: u32 = 3;
 
 /// Optional plugin hook, invoked for every class load before the class is
 /// defined (JVMTI CLASS_FILE_LOAD_HOOK). The hot-patch pipeline: plugins get
@@ -49,6 +49,13 @@ pub struct CPluginApi {
     /// pipeline with its current bytes so a hook may patch it post-load.
     /// Returns 0 on success, negative on failure (class not loaded, etc.).
     pub retransform_class: Option<unsafe extern "C" fn(name: *const c_char) -> i32>,
+    /// Claim a unique global resource key before registering it with the
+    /// JVM — e.g. "class:a/b/C" for DefineClass and "native:a/b/C#name:sig"
+    /// for RegisterNatives. Guarantees two modules never collide: returns 0
+    /// when the key is free (or already owned by the same `owner`) and -1
+    /// when another module owns it (the caller must skip the registration).
+    /// `owner` is the caller's plugin handle (e.g. the CPluginApi pointer).
+    pub claim: Option<unsafe extern "C" fn(owner: usize, key: *const c_char) -> i32>,
 }
 
 /// Opaque JavaVM* (cast to your JNI bindings' JavaVM type on either side).
