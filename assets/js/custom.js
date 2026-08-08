@@ -114,7 +114,8 @@
   ready(function () {
     addCopyButtons();
     initTabs();
-    setActiveNavIcon();
-    setTimeout(setActiveNavIcon, 300);
   });
+
+  setActiveNavIcon();
+  setTimeout(setActiveNavIcon, 100);
 })();
