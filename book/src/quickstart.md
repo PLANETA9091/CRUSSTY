@@ -3,10 +3,21 @@
 ## Requirements
 
 - Rust (stable toolchain, tested on 1.8x+)
-- Java 21+ (JDK for `javac`/`jar`)
-- A Paper-family kernel jar, e.g. Purpur 1.21.10
+- Java 21+ (JDK for `javac`/`jar`) — the kernel needs 21+, but the platform's
+  committed Java helper classes are compiled with `--release 8` (class-file
+  target 52), so any modern JDK can rebuild them
 
 ## Build the platform
+
+The Rust crates embed pre-built Java helper classes (committed); a fresh
+clone builds with zero Java toolchain. After editing a helper source, or for
+CI parity, regenerate and commit the artifacts:
+
+```bash
+# cplug-sdk SdkAsmHelper, modules/crussty area-map + improved-noise bridges,
+# modules/dist DistKernel -> .class into build dirs (ASM jar auto-downloaded)
+bash scripts/build-helpers.sh
+```
 
 ```bash
 # JVMTI runtime
