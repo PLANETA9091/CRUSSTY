@@ -12,7 +12,7 @@ layer — pattern hooks, byte hooks, cross-loader class lookup, kernel-ready
 notification, main-thread dispatch and logging — without any JNI/JVMTI
 boilerplate.
 
-It lives in the [c-cells](https://github.com/PLANETA9091/c-cells) repository
+It lives in the [CRUSSTY](https://github.com/PLANETA9091/CRUSSTY) repository
 under `cplug-sdk-c/` (build: `cargo build --release -p cplug-sdk-c` →
 `target/release/libcplug_sdk_c.a`).
 
