@@ -52,3 +52,16 @@ improved worldgen noise pipeline (hot-path replacement via ASM weaving).
 The `modules/` directory in the platform repo documents the convention:
 clone one of these into `modules/<name>`, build, copy `lib<name>.so`
 next to the manifest, and the runtime picks it up on the next boot.
+
+## examples-multilang — module written in C, C++, Python, JS
+
+The `examples-multilang/` tree (in the platform repo) demonstrates the
+**non-Rust** module path: `c`, `cpp`, `python` and `js` each contain a
+`shim.c` exporting the C-ABI `cplugin_init`, a `build.sh`, a `cplugin.json`
+and a module body (Python/JS shims embed CPython/QuickJS). Go builds and
+passes a harness but crashes the JVM in-process — see
+[other-languages.md](other-languages.md).
+
+All four verified modules boot together on a live Purpur 1.21.10 server; each
+fires its class hook on every class load. Checked-in build scripts and
+module sources live at `examples-multilang/`.
