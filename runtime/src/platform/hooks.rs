@@ -61,8 +61,22 @@ fn define_and_register(
     bytes: &[u8],
     natives: &[(&JNIStr, &JNIStr, *const c_void)],
 ) -> Result<(), jni::errors::Error> {
-    let loader = JClassLoader::get_system_class_loader(env)?;
+    // Define into the BOOTSTRAP loader (null loader): the kernel classes
+    // that carry the injected probes are defined by Purpur's Reobf/Paperclip
+    // URLClassLoader chains, which never consult the application (system)
+    // class loader — bootstrap-definition is the only class table every
+    // load delegation chain walks.
+    let loader = JClassLoader::null();
     let class = env.define_class(Some(name), &loader, bytes)?;
+    // Probe: find_class walks bootstrap too; a miss here means the define
+    // did not land where the kernel's loaders can reach it.
+    let probe = env.find_class(name);
+    match probe {
+        Ok(_) => eprintln!("[crussty-runtime] hook class in visible table: {name:?}"),
+        Err(e) => {
+            eprintln!("[crussty-runtime] HOOK PROBE FAILED for {name:?}: {e:?}")
+        }
+    }
 
     let methods = natives
         .iter()
