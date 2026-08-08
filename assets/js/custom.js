@@ -159,6 +159,7 @@
       if (url.origin !== location.origin) return;
       var path = url.pathname;
       if (path === location.pathname) {
+        e.preventDefault();
         if (url.hash) {
           var t = document.querySelector(url.hash);
           if (t) t.scrollIntoView();
