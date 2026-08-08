@@ -55,7 +55,7 @@ javac "${JAVAC_FLAGS[@]}" -d runtime/build/hooks \
   runtime/hook-src/dev/crussty/hooks/SchedulerHooks.java \
   runtime/hook-src/dev/crussty/hooks/NetHooks.java \
   runtime/hook-src/dev/crussty/hooks/TickHook.java \
-  runtime/hook-src/dev/crusty/hooks/StorageHooks.java
+  runtime/hook-src/dev/crussty/hooks/StorageHooks.java
 
 echo
 echo "Generated artifacts:"

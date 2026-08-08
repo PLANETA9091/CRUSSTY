@@ -70,6 +70,9 @@ struct DriverState {
     tick: u64,
     last_heartbeat_tick: u64,
     last_commit_tick: u64,
+    /// Announced "oracle unreachable" once; reset when a pong shows up so a
+    /// fresh outage still voices itself.
+    oracle_unreachable_announced: bool,
 }
 
 /// Start the engine and the periodic main-thread driver loop.
@@ -161,7 +164,14 @@ fn main_loop_iteration(state: &Arc<Mutex<DriverState>>, cfg: &Config, env: &JniE
         let load = kernel_api::load(env);
         engine::heartbeat(load, PING_MS);
         if s.tick.is_multiple_of(HEARTBEAT_TICKS * 60) {
-            eprintln!("[dist] tick-sync oracleTick={}", engine::oracle_tick(ORACLE_TICK_MS));
+            let ot = engine::oracle_tick(ORACLE_TICK_MS);
+            if ot >= 0 {
+                s.oracle_unreachable_announced = false;
+                eprintln!("[dist] tick-sync oracleTick={ot}");
+            } else if !s.oracle_unreachable_announced {
+                s.oracle_unreachable_announced = true;
+                eprintln!("[dist] tick-sync: oracle unreachable (no pong)");
+            }
         }
     }
 

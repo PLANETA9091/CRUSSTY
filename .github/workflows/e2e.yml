@@ -1,0 +1,42 @@
+name: e2e
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: e2e (purpur, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless curl unzip
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Unit tests (all crates)
+        run: |
+          for crate in runtime cplug-abi cplug-sdk modules/hello modules/dist modules/crussty modules/cells; do
+            echo "== $crate =="
+            cargo test --manifest-path "$crate/Cargo.toml"
+          done
+
+      - name: E2E (boot purpur, markers, hot-reload, stop)
+        run: bash scripts/e2e.sh
+
+      - name: Upload e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            logs/
+            hs_err_pid*.log
+          retention-days: 7

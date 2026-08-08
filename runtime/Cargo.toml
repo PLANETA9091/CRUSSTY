@@ -7,7 +7,7 @@ description = "Native injection engine: loads modules into the kernel JVM"
 [workspace]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 cplug-abi = { path = "../cplug-abi" }

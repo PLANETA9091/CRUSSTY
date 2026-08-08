@@ -1,4 +1,4 @@
-package dev.crusty.hooks;
+package dev.crussty.hooks;
 
 /**
  * Native bridge required by the storage-interception transform rules

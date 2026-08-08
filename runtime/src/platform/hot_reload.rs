@@ -329,6 +329,12 @@ pub fn reload_module(id: &str) -> Result<(), String> {
     // dlopen + init the replacement OUTSIDE the registry lock: module code
     // must never run under our locks (deadlock-free callbacks, no lock held
     // across user code).
+    //
+    // Class-hook ownership: the replacement's cplugin_init registers its
+    // hooks between `hook_seq` and now; the old library's, registered before
+    // `hook_seq`, are truncated right before its dlclose so the pipeline
+    // never calls into unmapped code (see crate::truncate_hooks_to).
+    let hook_seq = crate::hook_registration_seq();
     let replacement = acquire_replacement(&path, api, vm, &options);
 
     let mut reg = registry().lock().unwrap();
@@ -348,6 +354,9 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             entry.init_rc = 0;
             entry.swapping = false;
             drop(reg);
+            // The old library's hooks are stale: purge them before the
+            // dlclose so a class load cannot dispatch into unmapped code.
+            crate::truncate_hooks_to(hook_seq);
             // dlclose outside the lock. The old library is provably
             // quiescent: active was 0 at the check and swapping blocked new
             // entries until this point.
