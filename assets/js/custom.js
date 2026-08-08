@@ -150,7 +150,8 @@
       if (!a || !a.href) return;
       if (a.target && a.target !== "_self") return;
       var href = a.getAttribute("href");
-      if (!href || href.charAt(0) === "#") return;
+      if (!href) { e.preventDefault(); return; }
+      if (href.charAt(0) === "#") return;
       if (a.hasAttribute("download")) return;
       if (href.indexOf("mailto:") === 0) return;
       var url;
