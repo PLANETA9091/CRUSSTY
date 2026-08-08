@@ -1,0 +1,17 @@
+[package]
+name = "cplug-sdk-c"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI binding of cplug-sdk: hooks, classes, main-thread dispatch, logging — for C/C++/Python/JS/Zig/Go modules"
+
+[workspace]
+
+[lib]
+name = "cplug_sdk_c"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+cplug-abi = { path = "../cplug-abi" }
+cplug-sdk = { path = "../cplug-sdk" }
+jvmti-bindings = "2"
+libc = "0.2"
