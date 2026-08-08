@@ -17,7 +17,6 @@ platform. The distinguishing property is that Crussty does not fork the
 kernel and does not rebuild it — it injects itself into a stock jar and
 changes behavior at class-load time.
 
-<img class="logo" src="/CRUSSTY/assets/images/datapacks.svg" alt="Crussty logo" />
 
 ## What it does
 
