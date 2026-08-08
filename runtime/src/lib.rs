@@ -278,6 +278,12 @@ impl Agent for CrusstyRuntime {
                     eprintln!(
                         "[crussty-runtime] transform '{name}' failed; class runs untransformed: {e}"
                     );
+                    if std::env::var_os("CRUSSTY_DUMP_FAILED").is_some() {
+                        let mut p = std::env::temp_dir();
+                        p.push(format!("cflh-fail-{}.class", name.replace('/', ".")));
+                        let _ = std::fs::write(&p, bytes);
+                        eprintln!("[crussty-runtime] dumped original to {p:?}");
+                    }
                 }
             }
         }
