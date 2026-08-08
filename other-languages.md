@@ -83,7 +83,7 @@ if/when one is published.
 
 ## Using the SDK from C (or Python/JS)
 
-Build `cplug-sdk-c` (from the [c-cells](https://github.com/PLANETA9091/c-cells) repo)
+Build `cplug-sdk-c` (from the [CRUSSTY](https://github.com/PLANETA9091/CRUSSTY) repo)
 to get `libcplug_sdk_c` and include `cplug-sdk.h` next to `cplug-abi.h`.
 The full reference (all sixteen functions, callbacks, memory contract) is on
 [SDK in C](sdk-c.html).
