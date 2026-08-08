@@ -23,3 +23,15 @@ The minimal module proves the pipeline end to end:
 - Expected log: `hello from native c-plugin (v2 pipeline alive)`
 
 Clone/build anyway like any module (see [Quick Start](./quickstart.html)).
+
+## examples-multilang — modules written in C, C++, Python, JS
+
+The `modules/examples-multilang/` tree in this repo demonstrates the
+**non-Rust** module path: `c`, `cpp`, `python` and `js` each contain a
+`shim.c` exporting the C-ABI `cplugin_init`, a `build.sh`, a `cplugin.json`
+and a module body (Python/JS shims embed CPython/QuickJS). Go builds and
+passes a harness but crashes the JVM in-process — see
+[Other languages](./other-languages.html).
+
+All four verified modules boot together on a live Purpur 1.21.10 server; each
+fires its class hook on every class load.
