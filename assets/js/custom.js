@@ -125,6 +125,11 @@
       var main = document.querySelector(".main-content");
       if (!newMain || !main) { location.href = url; return; }
       main.innerHTML = newMain.innerHTML;
+      var newNav = doc.querySelector(".site-nav");
+      var nav = document.querySelector(".site-nav");
+      if (newNav && nav && newNav.innerHTML !== nav.innerHTML) {
+        nav.innerHTML = newNav.innerHTML;
+      }
       document.title = doc.title || document.title;
       var icon = doc.querySelector("style#active-nav-icon");
       var oldIcon = document.querySelector("style#active-nav-icon");
