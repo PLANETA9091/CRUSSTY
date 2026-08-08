@@ -41,6 +41,8 @@ jobs:
           java-version: "21"
       - name: Rebuild helpers
         run: bash scripts/build-helpers.sh
+      - name: JNI bridge table in sync with manifest
+        run: python3 scripts/gen_crussty_table.py render --check
       - name: Verify committed artifacts unchanged
         run: |
           if ! git diff --quiet --exit-code cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build; then
