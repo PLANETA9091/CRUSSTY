@@ -83,8 +83,10 @@ if/when one is published.
 
 ## Using the SDK from C (or Python/JS)
 
-Build `cplug-sdk-c` (from the c-cells repo) to get `libcplug_sdk_c` and
-include `cplug-sdk.h` next to `cplug-abi.h`:
+Build `cplug-sdk-c` (from the [c-cells](https://github.com/PLANETA9091/c-cells) repo)
+to get `libcplug_sdk_c` and include `cplug-sdk.h` next to `cplug-abi.h`.
+The full reference (all sixteen functions, callbacks, memory contract) is on
+[SDK in C](sdk-c.html).
 
 ```c
 #include "cplug-sdk.h"
@@ -98,6 +100,9 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     return 0;
 }
 ```
+
+Working examples: `cplug-sdk-c/examples/c` (plain C) and
+`cplug-sdk-c/examples/python` (ctypes + C shim).
 
 Python needs no shim logic beyond the embedding trampoline — the whole hook
 registry, main-thread dispatch and logging are called through `ctypes`:

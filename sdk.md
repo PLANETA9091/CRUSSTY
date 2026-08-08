@@ -41,6 +41,9 @@ hooks::register("org/bukkit/Bukkit", |ctx, bytes, len| {
 - **Main thread** — run_on_main_thread
 - **ASM weaving** — replace_body, ArgSpec
 
+See also [SDK in C](sdk-c.html) for the same modules through the
+`cplug-sdk-c` C binding.
+
 All SDK entry points are safe to call from any thread that has an attached
 JNI env (`with_attached` handles attach/detach for the main thread; kernel
 threads are already attached).
