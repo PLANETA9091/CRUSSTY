@@ -162,12 +162,23 @@ impl Registry {
     fn remove(&mut self, event: &str, token: &Subscription) -> bool {
         if let Some(list) = self.exact.get_mut(event) {
             if list.remove(token) {
+                // Drop the now-empty entry so existence checks (e.g.
+                // has_subscribers) report the truth.
+                if list.entries.is_empty() {
+                    self.exact.remove(event);
+                }
                 return true;
             }
         }
-        self.patterns
-            .iter_mut()
-            .any(|(p, list)| p == event && list.remove(token))
+        let mut removed = false;
+        self.patterns.retain_mut(|(p, list)| {
+            if p != event || !list.remove(token) {
+                return true;
+            }
+            removed = true;
+            !list.entries.is_empty()
+        });
+        removed
     }
 }
 
@@ -324,6 +335,19 @@ impl EventBus {
         token
     }
 
+    /// True when at least one handler (sync or async) is subscribed to
+    /// `event` (exact name or matching pattern). A cheap existence check —
+    /// no handler snapshot — so hot paths (e.g. the class-load hook) can
+    /// skip building a payload entirely when nobody listens.
+    pub fn has_subscribers(&self, event: &str) -> bool {
+        let any = |registry: &Mutex<Registry>| {
+            let r = lock(registry);
+            r.exact.contains_key(event)
+                || r.patterns.iter().any(|(p, _)| glob_match(p, event))
+        };
+        any(&self.handlers) || any(&self.async_handlers)
+    }
+
     /// Remove a subscription. Returns `false` if the token is unknown or
     /// stale (never emitted on this bus, already removed, or its list was
     /// mutated since).
@@ -448,6 +472,30 @@ mod tests {
         let count = bus.publish("test.evt", &serde_json::json!({"a": 1}));
         assert_eq!(count, 1);
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn has_subscribers_tracks_exact_and_pattern_subscriptions() {
+        let bus = EventBus::default();
+        assert!(!bus.has_subscribers("platform.class_loaded"), "no handlers yet");
+
+        bus.subscribe(lifecycle::CLASS_LOADED, Arc::new(|_, _| {}));
+        assert!(bus.has_subscribers(lifecycle::CLASS_LOADED));
+        assert!(!bus.has_subscribers("platform.tick_boundary"), "different event");
+
+        // Pattern subscriptions count too (the class-load path skips payload
+        // construction only when *nothing* can receive the event).
+        let bus2 = EventBus::default();
+        bus2.subscribe("platform.*", Arc::new(|_, _| {}));
+        assert!(bus2.has_subscribers(lifecycle::CLASS_LOADED));
+        assert!(!bus2.has_subscribers("other.event"));
+
+        // Unsubscribing flips the flag back.
+        let bus3 = EventBus::default();
+        let token = bus3.subscribe(lifecycle::CLASS_LOADED, Arc::new(|_, _| {}));
+        assert!(bus3.has_subscribers(lifecycle::CLASS_LOADED));
+        bus3.unsubscribe(lifecycle::CLASS_LOADED, &token);
+        assert!(!bus3.has_subscribers(lifecycle::CLASS_LOADED));
     }
 
     #[test]
