@@ -77,9 +77,10 @@ fn define_and_register(
     unsafe { env.register_native_methods(class, &methods) }
 }
 
-/// Cause the hook classes to be defined and wired. Called once from the
-/// agent init; see module docs for failure semantics.
-pub fn install() -> Result<(), String> {
+/// Define and wire the hook classes, once. Must run on an attached thread
+/// (agent init runs inside `JNI_CreateJavaVM` where `AttachCurrentThread` is
+/// a fault) — hence [`schedule_install`].
+fn install_once() -> Result<(), String> {
     INSTALLED
         .get_or_init(|| {
             let vm_ptr = *crate::VM
@@ -168,4 +169,28 @@ pub fn install() -> Result<(), String> {
             Ok(())
         })
         .clone()
+}
+
+/// Install the hook classes after the VM is fully created and this thread is
+/// genuinely attached — `AttachCurrentThread` from inside `JNI_CreateJavaVM`
+/// (agent init) SIGSEGVs the JVM (thread not yet attachable). Kernel classes
+/// (and tick boundaries, where the probes run) load many seconds later.
+pub fn schedule_install() {
+    std::thread::Builder::new()
+        .name("crussty-hook-install".into())
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Voice the outcome either way: a failed install leaves patched
+            // kernel classes with NoClassDefFoundError on first execution.
+            match install_once() {
+                Ok(()) => eprintln!(
+                    "[crussty-runtime] transform hook classes installed (4)"
+                ),
+                Err(e) => eprintln!(
+                    "[crussty-runtime] !!! transform hook classes NOT installed: {e} \
+                     (patched kernel classes will fail with NoClassDefFoundError)"
+                ),
+            }
+        })
+        .expect("spawn hook install thread");
 }
