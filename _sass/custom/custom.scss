@@ -1,6 +1,46 @@
-/* w3schools-style building guide: code boxes with copy buttons + tabs */
+/* Crussty docs — Bearded Theme OLED + Monocraft (user's VSCode look) */
 
-/* code box with copy button */
+@font-face {
+  font-family: "Monocraft";
+  src: url("/CRUSSTY/assets/fonts/Monocraft.woff2") format("woff2"),
+       url("/CRUSSTY/assets/fonts/Monocraft.ttf") format("truetype");
+  font-display: swap;
+}
+
+body {
+  font-family: "Monocraft", ui-monospace, Menlo, Consolas, monospace;
+}
+h1, h2, h3, h4, h5, h6 {
+  font-family: "Monocraft", ui-monospace, Menlo, Consolas, monospace;
+}
+code, pre, .site-title, .nav-list-link {
+  font-family: "Monocraft", ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* OLED touches: keep the pure-black feel */
+.main-content {
+  font-size: 15px;
+}
+.side-bar {
+  border-right: 1px solid #262626;
+}
+.site-header {
+  border-bottom: 1px solid #262626;
+}
+.aux-nav .site-button {
+  color: #688eff;
+}
+.site-title {
+  color: #E0CF77;
+}
+.search-input, .search-input-wrap {
+  background: #060606;
+}
+.search-input::placeholder {
+  color: #515151;
+}
+
+/* w3schools-style code boxes with copy buttons */
 .ws-code {
   position: relative;
   margin: 0.5rem 0 1.2rem;
@@ -9,50 +49,50 @@
   position: absolute;
   top: 0.4rem;
   right: 0.4rem;
-  border: 1px solid #4fd08c;
-  background: #0a120c;
-  color: #4fd08c;
+  border: 1px solid #688eff;
+  background: #060606;
+  color: #688eff;
   font-size: 0.75rem;
   padding: 0.2rem 0.7rem;
   cursor: pointer;
   opacity: 0.85;
 }
 .ws-code .copy-btn:hover {
-  background: #12230f;
+  background: #151515;
   opacity: 1;
 }
 .ws-code .copy-btn.copied {
-  color: #39ff14;
-  border-color: #39ff14;
+  color: #5CD4C3;
+  border-color: #5CD4C3;
 }
 
 /* w3schools-style tabs */
 .ws-tabs {
-  border: 1px solid var(--border-color, #444);
+  border: 1px solid #262626;
   overflow: hidden;
   margin: 1rem 0;
 }
 .ws-tabbar {
   display: flex;
   flex-wrap: wrap;
-  background: var(--sidebar-color, #222);
-  border-bottom: 1px solid var(--border-color, #444);
+  background: #000000;
+  border-bottom: 1px solid #262626;
 }
 .ws-tabbar button {
   background: transparent;
   border: none;
-  border-right: 1px solid var(--border-color, #444);
-  color: var(--body-text-color, #ccc);
+  border-right: 1px solid #262626;
+  color: #999999;
   padding: 0.5rem 1rem;
   font-size: 0.85rem;
   cursor: pointer;
 }
 .ws-tabbar button:hover {
-  background: rgba(79, 208, 140, 0.08);
+  background: rgba(104, 142, 255, 0.08);
 }
 .ws-tabbar button.active {
-  background: #0a120c;
-  color: #39ff14;
+  background: #151515;
+  color: #688eff;
 }
 .ws-tab {
   display: none;
@@ -70,39 +110,39 @@
 
 /* "try it yourself" call-to-action */
 .ws-try {
-  border: 1px solid #4fd08c;
-  border-left: 4px solid #4fd08c;
-  background: #0a120c;
+  border: 1px solid #262626;
+  border-left: 4px solid #688eff;
+  background: #060606;
   padding: 0.8rem 1rem;
   margin: 1.2rem 0;
 }
 .ws-try a.ws-btn {
   display: inline-block;
-  background: #4fd08c;
-  color: #000;
+  background: #688eff;
+  color: #000000;
   font-weight: 600;
   padding: 0.45rem 1rem;
   margin-right: 0.5rem;
   text-decoration: none;
 }
 .ws-try a.ws-btn:hover {
-  background: #39ff14;
+  background: #49c4ff;
 }
 .ws-try a.ws-btn-ghost {
   display: inline-block;
-  border: 1px solid #4fd08c;
-  color: #4fd08c;
+  border: 1px solid #688eff;
+  color: #688eff;
   padding: 0.45rem 1rem;
   margin-right: 0.5rem;
   text-decoration: none;
 }
 .ws-try a.ws-btn-ghost:hover {
-  background: rgba(79, 208, 140, 0.08);
+  background: rgba(104, 142, 255, 0.08);
 }
 .ws-try .ws-try-note {
   margin-top: 0.6rem;
   font-size: 0.85rem;
-  color: var(--nav-child-link-color, #999);
+  color: #999999;
 }
 
 /* numbered steps */
@@ -115,7 +155,7 @@
   gap: 0.6rem;
 }
 .ws-step .step-no {
-  font-family: monospace;
-  color: #39ff14;
+  font-family: "Monocraft", monospace;
+  color: #E0CF77;
   font-size: 1.4rem;
 }
