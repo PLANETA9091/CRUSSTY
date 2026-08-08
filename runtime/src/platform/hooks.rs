@@ -1,7 +1,7 @@
 //! JNI hook classes required by the platform transform rules.
 //!
 //! The transform engine injects `invokestatic` probes (`()V`) into kernel
-//! classes — `dev.crussty.hooks.SchedulerHooks`, `dev.crusty.hooks.StorageHooks`,
+//! classes — `dev.crussty.hooks.SchedulerHooks`, `dev.crussty.hooks.StorageHooks`,
 //! `dev.crussty.hooks.NetHooks`, `dev.crussty.hooks.TickHook`. The JVM
 //! resolves those classes lazily at first execution of the patched method,
 //! so the platform must ship them. We do: the `.class` files are committed
@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 
 const SCHEDULER_BYTES: &[u8] =
     include_bytes!("../../build/hooks/dev/crussty/hooks/SchedulerHooks.class");
-const STORAGE_BYTES: &[u8] = include_bytes!("../../build/hooks/dev/crusty/hooks/StorageHooks.class");
+const STORAGE_BYTES: &[u8] = include_bytes!("../../build/hooks/dev/crussty/hooks/StorageHooks.class");
 const NET_BYTES: &[u8] = include_bytes!("../../build/hooks/dev/crussty/hooks/NetHooks.class");
 const TICK_BYTES: &[u8] = include_bytes!("../../build/hooks/dev/crussty/hooks/TickHook.class");
 
@@ -121,40 +121,40 @@ fn install_once() -> Result<(), String> {
                 // array signatures — all static, all match the Java decls).
                 define_and_register(
                     env,
-                    jni::jni_str!("dev/crusty/hooks/StorageHooks"),
+                    jni::jni_str!("dev/crussty/hooks/StorageHooks"),
                     STORAGE_BYTES,
                     &[
                         (
                             jni::jni_str!("nStorageActive"), jni::jni_str!("()Z"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nStorageActive
+                            storage::Java_dev_crussty_hooks_StorageHooks_nStorageActive
                                 as *const c_void,
                         ),
                         (
                             jni::jni_str!("nBeginSave"), jni::jni_str!("()Z"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nBeginSave as *const c_void,
+                            storage::Java_dev_crussty_hooks_StorageHooks_nBeginSave as *const c_void,
                         ),
                         (
                             jni::jni_str!("nEndSave"), jni::jni_str!("()Z"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nEndSave as *const c_void,
+                            storage::Java_dev_crussty_hooks_StorageHooks_nEndSave as *const c_void,
                         ),
                         (
                             jni::jni_str!("nChunkWritten"), jni::jni_str!("()V"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nChunkWritten
+                            storage::Java_dev_crussty_hooks_StorageHooks_nChunkWritten
                                 as *const c_void,
                         ),
                         (
                             jni::jni_str!("nMarkAutosave"), jni::jni_str!("()V"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nMarkAutosave
+                            storage::Java_dev_crussty_hooks_StorageHooks_nMarkAutosave
                                 as *const c_void,
                         ),
                         (
                             jni::jni_str!("nReadChunk"), jni::jni_str!("(IIII)[B"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nReadChunk
+                            storage::Java_dev_crussty_hooks_StorageHooks_nReadChunk
                                 as *const c_void,
                         ),
                         (
                             jni::jni_str!("nWriteChunk"), jni::jni_str!("(IIII[B)Z"),
-                            storage::Java_dev_crusty_hooks_StorageHooks_nWriteChunk
+                            storage::Java_dev_crussty_hooks_StorageHooks_nWriteChunk
                                 as *const c_void,
                         ),
                     ],
@@ -197,9 +197,12 @@ pub fn schedule_install() {
             // Voice the outcome either way: a failed install leaves patched
             // kernel classes with NoClassDefFoundError on first execution.
             match install_once() {
-                Ok(()) => eprintln!(
-                    "[crussty-runtime] transform hook classes installed (4)"
-                ),
+                Ok(()) => {
+                    crate::mark_hook_classes_ready();
+                    eprintln!(
+                        "[crussty-runtime] transform hook classes installed (4); transform engine armed"
+                    );
+                }
                 Err(e) => eprintln!(
                     "[crussty-runtime] !!! transform hook classes NOT installed: {e} \
                      (patched kernel classes will fail with NoClassDefFoundError)"

@@ -11,12 +11,14 @@
 //! Plugins are deliberately handed raw JavaVM*: no Java API, no limits.
 
 #[allow(dead_code)] // platform bricks are a public API surface; used by modules
-mod platform;
+#[allow(ambiguous_glob_reexports)]
+pub mod platform;
 mod scan;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use cplug_abi::{CPluginApi, ClassHookFn, JavaVmPtr, CPAPI_VERSION};
@@ -27,6 +29,46 @@ use libloading::Library;
 
 /// (ctx, hook) pairs registered by plugins, in registration order.
 static HOOKS: OnceLock<Mutex<Vec<(usize, ClassHookFn)>>> = OnceLock::new();
+/// Set once every transform hook class (SchedulerHooks/NetHooks/TickHook/
+/// StorageHooks) is defined and its natives registered. The transform engine
+/// must not patch a class to call a hook class that does not exist yet:
+/// first execution would NoClassDefFoundError (the same crash family as the
+/// missing-hook-class bug, narrowed to a race). Rules are idle until this
+/// flips — a rule-matching class loaded in the window simply stays
+/// untransformed, which is harmless: every current target loads long after
+/// install.
+static HOOK_CLASSES_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn hook_classes_ready() -> bool {
+    HOOK_CLASSES_READY.load(Ordering::Relaxed)
+}
+
+pub fn mark_hook_classes_ready() {
+    HOOK_CLASSES_READY.store(true, Ordering::Relaxed);
+}
+
+/// Number of plugin hooks registered so far — the baseline a hot reload
+/// truncates to before it unloads the old library (see
+/// [`truncate_hooks_to`]; both live here next to the registry they guard).
+pub fn hook_registration_seq() -> usize {
+    hooks().lock().unwrap().len()
+}
+
+/// Drop every hook registered at/after `seq` (a module's `cplugin_init` ran
+/// between `seq` and the call). dlclose leaves hooks pointing into unmapped
+/// code otherwise: the next ClassFileLoadHook would SIGSEGV on a stale
+/// callback. Only the module under reload is affected: its hooks were the
+/// ones appended since `seq`.
+pub fn truncate_hooks_to(seq: usize) {
+    let mut h = hooks().lock().unwrap();
+    if h.len() > seq {
+        eprintln!(
+            "[crussty-runtime] hook purge: dropped {} stale hook(s) from unloaded module",
+            h.len() - seq
+        );
+        h.truncate(seq);
+    }
+}
 /// Raw jvmtiEnv pointer as usize (JVMTI envs are process-wide, usable from
 /// any thread — safe to share).
 static JVMTI_ENV: OnceLock<usize> = OnceLock::new();
@@ -257,6 +299,12 @@ impl Agent for CrusstyRuntime {
         // end of the hook, then freed naturally.
         let mut pending: Option<Vec<u8>> = None;
 
+        // Readiness gate: never emit a probe call into a hook class that is
+        // not installed yet (NoClassDefFoundError at first execution). The
+        // engine is elsewise unconditional; the gate is what turns the
+        // install race into a safe no-op window.
+        let engine_armed = hook_classes_ready();
+
         // 1. Platform transform engine (BEFORE plugin hooks): transform rules
         //    registered by the platform bricks (network / scheduler / storage
         //    surfaces) run on the pristine bytes; plugins then see the
@@ -266,7 +314,7 @@ impl Agent for CrusstyRuntime {
         //    registered rule pattern are parsed, everything else passes
         //    through after a string check. A failed transform logs and passes
         //    the class through untransformed (the platform never fails a load).
-        if current_len > 0 && !current.is_null() {
+        if engine_armed && current_len > 0 && !current.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(current, current_len) };
             match platform::transform::global_engine().apply(&name, bytes) {
                 Ok(Some(t)) => {

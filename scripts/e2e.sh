@@ -134,9 +134,35 @@ while :; do
     sleep "$POLL_SEC"
 done
 
-# ---------------------------------------------------------------- 5. stop
-stage "5. markers seen; graceful stop"
+# ---------------------------------------------------------------- 5. reload
+stage "5. hot-reload (SIGUSR1); assert hook purge + server stays alive"
 log "pipeline ready=$found_pipeline  hello native=$found_hello  crussty live=$found_native"
+
+JAVA_PID="$(pgrep -f "purpur-$PURPUR_VERSION.jar" | head -1 || true)"
+if [ -z "$JAVA_PID" ]; then
+    fail "no server pid for SIGUSR1 reload"
+fi
+kill -USR1 "$JAVA_PID" 2>/dev/null || fail "kill -USR1 $JAVA_PID failed"
+log "sent SIGUSR1 to $JAVA_PID; waiting for reload + stale-hook purge"
+
+found_reload=0; found_purge=0
+RDEADLINE=$(( $(date +%s) + 40 ))
+while [ "$(date +%s)" -lt "$RDEADLINE" ]; do
+    for target in "$SERVER_TEE" "$LAUNCHER_LOG"; do
+        [ -f "$target" ] || continue
+        grep -q "reloaded (dlopen'd fresh" "$target" && found_reload=1
+        grep -q "hook purge" "$target" && found_purge=1
+    done
+    if [ "$found_reload" -eq 1 ] && [ "$found_purge" -eq 1 ]; then break; fi
+    sleep 2
+done
+kill -0 "$JAVA_PID" 2>/dev/null || fail "server died during hot-reload (reload=$found_reload purge=$found_purge)"
+[ "$found_reload" -eq 1 ] || fail "hot-reload never completed (reload=$found_reload purge=$found_purge)"
+[ "$found_purge" -eq 1 ] || fail "stale hooks not purged on reload (would SIGSEGV on next class load)"
+log "hot-reload ok: reloaded=$found_reload hook-purge=$found_purge"
+
+# ---------------------------------------------------------------- 6. stop
+stage "6. graceful stop"
 
 echo "stop" >&9   # vanilla console command
 log "sent 'stop'; waiting for shutdown"

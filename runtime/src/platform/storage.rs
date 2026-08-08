@@ -36,18 +36,18 @@
 //!
 //! # Native bridge (registered natives)
 //!
-//! `dev.crusty.hooks.StorageHooks` must declare these `public static native`
+//! `dev.crussty.hooks.StorageHooks` must declare these `public static native`
 //! methods; the module registers them against the exports of this crate:
 //!
 //! | Java method | JNI signature | Rust export |
 //! |---|---|---|
-//! | `nStorageActive()` | `()Z` | `Java_dev_crusty_hooks_StorageHooks_nStorageActive` |
-//! | `nBeginSave()` | `()Z` | `Java_dev_crusty_hooks_StorageHooks_nBeginSave` |
-//! | `nEndSave()` | `()Z` | `Java_dev_crusty_hooks_StorageHooks_nEndSave` |
-//! | `nChunkWritten()` | `()V` | `Java_dev_crusty_hooks_StorageHooks_nChunkWritten` |
-//! | `nMarkAutosave()` | `()V` | `Java_dev_crusty_hooks_StorageHooks_nMarkAutosave` |
-//! | `nReadChunk(int,int,int,int)` | `(IIII)[B` | `Java_dev_crusty_hooks_StorageHooks_nReadChunk` |
-//! | `nWriteChunk(int,int,int,int,byte[])` | `(IIII[B)Z` | `Java_dev_crusty_hooks_StorageHooks_nWriteChunk` |
+//! | `nStorageActive()` | `()Z` | `Java_dev_crussty_hooks_StorageHooks_nStorageActive` |
+//! | `nBeginSave()` | `()Z` | `Java_dev_crussty_hooks_StorageHooks_nBeginSave` |
+//! | `nEndSave()` | `()Z` | `Java_dev_crussty_hooks_StorageHooks_nEndSave` |
+//! | `nChunkWritten()` | `()V` | `Java_dev_crussty_hooks_StorageHooks_nChunkWritten` |
+//! | `nMarkAutosave()` | `()V` | `Java_dev_crussty_hooks_StorageHooks_nMarkAutosave` |
+//! | `nReadChunk(int,int,int,int)` | `(IIII)[B` | `Java_dev_crussty_hooks_StorageHooks_nReadChunk` |
+//! | `nWriteChunk(int,int,int,int,byte[])` | `(IIII[B)Z` | `Java_dev_crussty_hooks_StorageHooks_nWriteChunk` |
 //!
 //! Each export returns immediately into the adapter; when no provider is
 //! installed every read returns `null`, every write returns `false`, and the
@@ -278,13 +278,13 @@ const CLASS_REGION_FILE_STORAGE: &str = "net/minecraft/world/level/chunk/storage
 const CLASS_MINECRAFT_SERVER: &str = "net/minecraft/server/MinecraftServer";
 const CLASS_MOONRISE_IO: &str = "ca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO";
 
-const HOOK_OWNER: &str = "dev.crusty.hooks.StorageHooks";
-const HELPER_ON_CHUNK_WRITE: &str = "dev.crusty.hooks.StorageHooks.onChunkWrite";
-const HELPER_ON_CHUNK_READ: &str = "dev.crusty.hooks.StorageHooks.onChunkRead";
-const HELPER_ON_CHUNK_WRITE_DONE: &str = "dev.crusty.hooks.StorageHooks.onChunkWriteDone";
-const HELPER_ON_SAVE_START: &str = "dev.crusty.hooks.StorageHooks.onSaveStart";
-const HELPER_ON_SAVE_END: &str = "dev.crusty.hooks.StorageHooks.onSaveEnd";
-const HELPER_ON_AUTOSAVE: &str = "dev.crusty.hooks.StorageHooks.onAutosave";
+const HOOK_OWNER: &str = "dev.crussty.hooks.StorageHooks";
+const HELPER_ON_CHUNK_WRITE: &str = "dev.crussty.hooks.StorageHooks.onChunkWrite";
+const HELPER_ON_CHUNK_READ: &str = "dev.crussty.hooks.StorageHooks.onChunkRead";
+const HELPER_ON_CHUNK_WRITE_DONE: &str = "dev.crussty.hooks.StorageHooks.onChunkWriteDone";
+const HELPER_ON_SAVE_START: &str = "dev.crussty.hooks.StorageHooks.onSaveStart";
+const HELPER_ON_SAVE_END: &str = "dev.crussty.hooks.StorageHooks.onSaveEnd";
+const HELPER_ON_AUTOSAVE: &str = "dev.crussty.hooks.StorageHooks.onAutosave";
 
 const DESC_MOONRISE_START_WRITE: &str = "(IILnet/minecraft/nbt/CompoundTag;)Lca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO$RegionDataController$WriteData;";
 const DESC_MOONRISE_FINISH_WRITE: &str = "(IILca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO$RegionDataController$WriteData;)V";
@@ -363,32 +363,32 @@ fn jbool(b: bool) -> jboolean {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nStorageActive(_env: *mut JNIEnv, _class: jclass) -> jboolean {
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nStorageActive(_env: *mut JNIEnv, _class: jclass) -> jboolean {
     jbool(storage_active())
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nBeginSave(_env: *mut JNIEnv, _class: jclass) -> jboolean {
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nBeginSave(_env: *mut JNIEnv, _class: jclass) -> jboolean {
     jbool(begin_save().unwrap_or(false))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nEndSave(_env: *mut JNIEnv, _class: jclass) -> jboolean {
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nEndSave(_env: *mut JNIEnv, _class: jclass) -> jboolean {
     jbool(end_save().unwrap_or(false))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nChunkWritten(_env: *mut JNIEnv, _class: jclass) {
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nChunkWritten(_env: *mut JNIEnv, _class: jclass) {
     note_chunk_written();
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nMarkAutosave(_env: *mut JNIEnv, _class: jclass) {
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nMarkAutosave(_env: *mut JNIEnv, _class: jclass) {
     mark_next_save_autosave();
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nReadChunk(
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nReadChunk(
     env: *mut JNIEnv,
     _class: jclass,
     region_x: jint,
@@ -411,7 +411,7 @@ pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nReadChunk(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_crusty_hooks_StorageHooks_nWriteChunk(
+pub extern "system" fn Java_dev_crussty_hooks_StorageHooks_nWriteChunk(
     env: *mut JNIEnv,
     _class: jclass,
     region_x: jint,
@@ -558,7 +558,7 @@ mod tests {
         let rules = global_engine().rules();
         let mine: Vec<_> = rules
             .iter()
-            .filter(|r| r.helper.starts_with("dev.crusty.hooks.StorageHooks."))
+            .filter(|r| r.helper.starts_with("dev.crussty.hooks.StorageHooks."))
             .collect();
         assert_eq!(mine.len(), default_rules().len());
     }
