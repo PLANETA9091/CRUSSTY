@@ -5,6 +5,8 @@ nav_order: 1
 ---
 
 # Crussty Platform
+<img class="logo" src="/CRUSSTY/assets/images/crussty-logo.png" alt="Crussty logo" />
+
 
 Crussty is a **native injection platform** for Paper-family Minecraft kernels
 (Purpur, Paper, etc.). It attaches a JVMTI runtime to the kernel JVM and uses
