@@ -20,7 +20,7 @@ kernel and does not rebuild it — it injects itself into a stock jar and
 changes behavior at class-load time.
 
 
-## What it does
+## What it does 
 
 A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
 `-agentpath` (or loaded via `JNI_OnLoad` in the single-jar distribution). It:
