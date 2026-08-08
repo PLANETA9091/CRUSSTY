@@ -28,6 +28,28 @@
 //! non-zero active-call counter (`Err("module busy")`), so a swap can only
 //! dlclose a library that is provably quiescent.
 //!
+//! # Honest limits (hooked class-file hooks)
+//!
+//! The regenerated module re-runs `cplugin_init` with the same handshake and
+//! re-registers its class-file hooks in the runtime pipeline. The pipeline
+//! cannot attribute hooks to a module, so hooks registered by the *old*
+//! mapping stay registered until the next class load dereferences them:
+//! after a reload, that is a dangling call into an unmapped library. The
+//! busy-counter protocol therefore does NOT make a reload safe for modules
+//! that registered hooks. Reloading a module is a development/ops tool for
+//! quiescent, hook-light modules (or runtimes whose dispatcher tracks hook
+//! ownership); it is not a crash-isolated feature until the dispatcher
+//! integrates [`enter_module`]/[`leave_module`].
+//!
+//! # Trigger
+//!
+//! [`install_reload_signal`] arms a UNIX SIGUSR1 trigger: the handler only
+//! sets an atomic flag (async-signal-safe), and a dedicated reloader thread
+//! polls the flag and reloads every registered module — dlopen/init/dlclose
+//! are far from async-signal-safe and must never run inside the handler
+//! (same flag-and-watchdog pattern as `signals.rs`). On non-Unix targets the
+//! trigger compiles to a no-op stub so the runtime still builds.
+//!
 //! # Lock discipline
 //!
 //! dlopen/init/dlclose run arbitrary module code; a host must never hold its
@@ -46,14 +68,16 @@
 
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cplug_abi::{CPluginApi, JavaVmPtr};
+
 /// The module init handshake (the only ABI, see cplug-abi):
-/// `cplugin_init(ctx, name) -> i32`; nonzero means "do not use me".
-type InitFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> i32;
+/// `cplugin_init(api, vm, options) -> i32`; nonzero means "do not use me".
+type InitFn = unsafe extern "C" fn(*const CPluginApi, JavaVmPtr, *const c_char) -> i32;
 
 /// Serializes swaps/registrations so only one happens at a time.
 static SWAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -77,10 +101,14 @@ struct LoadedModule {
     /// `None` only for test-fabricated entries (unit tests cannot dlopen).
     lib: Option<Library>,
     path: PathBuf,
-    /// The ctx registered for this module, replayed on every reload. Stored
-    /// as `usize`: raw pointers are `!Send`, and the registry lives in a
+    /// `CPluginApi*` replayed to every `cplugin_init` handshake. Stored as
+    /// `usize`: raw pointers are `!Send`, and the registry lives in a
     /// `static Mutex` (same trick as the runtime's `VM` static in lib.rs).
-    ctx: usize,
+    api: usize,
+    /// `JavaVM*` replayed to the handshake (usize, same reasoning).
+    vm: usize,
+    /// NUL-terminated options string replayed to the handshake.
+    options: CString,
     loaded_at_unix: u64,
     /// Return code of the active library's `cplugin_init` (0 = healthy).
     init_rc: i32,
@@ -138,22 +166,21 @@ fn unix_now() -> u64 {
 }
 
 /// dlopen `path`, look up `cplugin_init`, and run the init handshake with
-/// `ctx` and the path as name. `Ok` only when init returned 0. The returned
-/// `Library` is loaded with libloading's platform defaults (unix:
+/// the registered `api`/`vm`/`options`. `Ok` only when init returned 0. The
+/// returned `Library` is loaded with libloading's platform defaults (unix:
 /// RTLD_LAZY | RTLD_LOCAL — one module cannot shadow another's symbols).
 #[cfg(not(test))]
-fn acquire_replacement(path: &Path, ctx: usize) -> Result<Library, String> {
+fn acquire_replacement(path: &Path, api: usize, vm: usize, options: &CString) -> Result<Library, String> {
     // SAFETY: the library handle is owned by the returned Library; the init
     // symbol is borrowed from it and dropped before it (Symbol<'lib, T>).
     let lib = unsafe { Library::new(path) }
         .map_err(|e| format!("dlopen {}: {e}", path.display()))?;
     let init: Symbol<InitFn> = unsafe { lib.get(b"cplugin_init\0") }
         .map_err(|e| format!("{}: missing cplugin_init export: {e}", path.display()))?;
-    let name = CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|e| format!("{}: invalid name: {e}", path.display()))?;
-    // SAFETY: init is the module's exported handshake; ctx is the caller's
-    // registered context, name is a NUL-terminated buffer alive for the call.
-    let rc = unsafe { init(ctx as *mut c_void, name.as_ptr()) };
+    // SAFETY: init is the module's exported handshake (cplug-abi: api points
+    // at a live CPluginApi, vm at the JavaVM, options at a NUL-terminated
+    // buffer alive for the call).
+    let rc = unsafe { init(api as *const CPluginApi, vm as JavaVmPtr, options.as_ptr()) };
     if rc != 0 {
         return Err(format!("cplugin_init returned {rc}"));
     }
@@ -166,7 +193,7 @@ fn acquire_replacement(path: &Path, ctx: usize) -> Result<Library, String> {
 /// is not representable — tests have no real `Library` to install — and is
 /// rejected so tests cannot accidentally "succeed" a reload.
 #[cfg(test)]
-fn acquire_replacement(_path: &Path, _ctx: usize) -> Result<Library, String> {
+fn acquire_replacement(_path: &Path, _api: usize, _vm: usize, _options: &CString) -> Result<Library, String> {
     let hook = *acquire_stub().lock().unwrap();
     let Some(f) = hook else {
         return Err(
@@ -185,23 +212,78 @@ fn acquire_replacement(_path: &Path, _ctx: usize) -> Result<Library, String> {
     }
 }
 
-/// Register a module: dlopens `path`, runs the init handshake with `ctx`,
-/// and on success the registry takes ownership of the loaded `Library`
-/// (it will be dlclosed when the module is replaced). A module whose
-/// dlopen or init fails is not registered — the registry is untouched.
-pub fn register_module(id: &str, path: PathBuf, ctx: *mut c_void) -> Result<(), String> {
-    let lib = acquire_replacement(&path, ctx as usize)?;
+/// Register a module: dlopens `path`, runs the init handshake with
+/// `api`/`vm`/`options`, and on success the registry takes ownership of the
+/// loaded `Library` (it will be dlclosed when the module is replaced). A
+/// module whose dlopen or init fails is not registered — the registry is
+/// untouched.
+pub fn register_module(
+    id: &str,
+    path: PathBuf,
+    api: *const CPluginApi,
+    vm: JavaVmPtr,
+    options: &str,
+) -> Result<(), String> {
+    let options = CString::new(options)
+        .map_err(|_| format!("module '{id}': options contain an interior NUL"))?;
+    let lib = acquire_replacement(&path, api as usize, vm as usize, &options)?;
+    insert_entry(id, path, lib, api as usize, vm as usize, options)
+        .map_err(|(e, _)| e)
+}
+
+/// Admit a module the caller already dlopened and initialized — the
+/// runtime's startup path (`load_plugins`) performs the first `cplugin_init`
+/// itself, so admitting avoids a second dlopen/init of the same file. Takes
+/// ownership of the loaded `Library` (dlclose on replace) and captures the
+/// handshake so a later [`reload_module`] can re-init the replacement.
+///
+/// On failure the caller gets the `Library` back (`Err((reason, lib))`) so
+/// it can decide how to keep the mapping alive.
+pub fn admit_module(
+    id: &str,
+    path: PathBuf,
+    lib: Library,
+    api: *const CPluginApi,
+    vm: JavaVmPtr,
+    options: &str,
+) -> Result<(), (String, Library)> {
+    let options = match CString::new(options) {
+        Ok(o) => o,
+        Err(_) => {
+            return Err((
+                format!("module '{id}': options contain an interior NUL"),
+                lib,
+            ))
+        }
+    };
+    insert_entry(id, path, lib, api as usize, vm as usize, options)
+}
+
+/// Insert an already-acquired, already-initialized library into the
+/// registry. The `Library` must be live: the registry owns it from here on
+/// (dlclose on reload/replace). Refuses duplicate ids; on failure the
+/// library is returned so the caller can keep the mapping alive itself.
+fn insert_entry(
+    id: &str,
+    path: PathBuf,
+    lib: Library,
+    api: usize,
+    vm: usize,
+    options: CString,
+) -> Result<(), (String, Library)> {
     let _swap = swap_lock().lock().unwrap();
     let mut reg = registry().lock().unwrap();
     if reg.contains_key(id) {
-        return Err(format!("module '{id}' is already registered"));
+        return Err((format!("module '{id}' is already registered"), lib));
     }
     reg.insert(
         id.to_string(),
         LoadedModule {
             lib: Some(lib),
             path,
-            ctx: ctx as usize,
+            api,
+            vm,
+            options,
             loaded_at_unix: unix_now(),
             init_rc: 0,
             active: 0,
@@ -212,8 +294,8 @@ pub fn register_module(id: &str, path: PathBuf, ctx: *mut c_void) -> Result<(), 
 }
 
 /// Reload a registered module: dlopen its path fresh, run `cplugin_init`
-/// with the module's registered ctx, and only if that succeeds swap the
-/// registry entry and dlclose the old library.
+/// with the module's registered api/vm/options, and only if that succeeds
+/// swap the registry entry and dlclose the old library.
 ///
 /// Fails without touching the registry when: the id is unknown, the module
 /// has in-flight calls (`Err("module busy")` — the platform dispatcher's
@@ -226,7 +308,7 @@ pub fn reload_module(id: &str) -> Result<(), String> {
     // Reserve the slot: fail fast if busy, then block new entries for the
     // rest of the swap so the old library cannot gain callers between the
     // busy check and its dlclose.
-    let (path, ctx) = {
+    let (path, api, vm, options) = {
         let mut reg = registry().lock().unwrap();
         let entry = reg
             .get_mut(id)
@@ -241,13 +323,13 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             return Err(format!("module '{id}' is already being reloaded"));
         }
         entry.swapping = true;
-        (entry.path.clone(), entry.ctx)
+        (entry.path.clone(), entry.api, entry.vm, entry.options.clone())
     };
 
     // dlopen + init the replacement OUTSIDE the registry lock: module code
     // must never run under our locks (deadlock-free callbacks, no lock held
     // across user code).
-    let replacement = acquire_replacement(&path, ctx);
+    let replacement = acquire_replacement(&path, api, vm, &options);
 
     let mut reg = registry().lock().unwrap();
     match replacement {
@@ -338,19 +420,121 @@ pub fn loaded_libraries() -> Vec<String> {
 /// `Library` with a fresh one from `new_path`. The caller must have quiesced
 /// module code beforehand — this path has no busy tracking. Prefer
 /// [`reload_module`] for registry-managed modules.
-pub fn swap_library(lib: &mut Library, new_path: &Path, ctx: *mut c_void) -> Result<(), String> {
+pub fn swap_library(
+    lib: &mut Library,
+    new_path: &Path,
+    api: *const CPluginApi,
+    vm: JavaVmPtr,
+    options: &str,
+) -> Result<(), String> {
     let _guard = swap_lock().lock().unwrap();
-    let new: Library = acquire_replacement(new_path, ctx as usize)?;
+    let options = CString::new(options)
+        .map_err(|_| "swap_library: options contain an interior NUL".to_string())?;
+    let new: Library = acquire_replacement(new_path, api as usize, vm as usize, &options)?;
     // The old library stays alive until this swap function returns, then the
     // caller's `Library` is replaced; libloading drops the old one (dlclose).
     *lib = new;
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Reload trigger: SIGUSR1 (UNIX only).
+// ---------------------------------------------------------------------------
+
+/// Set by the SIGUSR1 handler (async-signal-safe atomic store), claimed by
+/// the reloader thread. `swap`-style claim: a burst of signals coalesces
+/// into exactly one reload pass.
+#[cfg(unix)]
+static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static TRIGGER_INSTALLED: OnceLock<()> = OnceLock::new();
+
+/// Poll period of the reloader thread.
+#[cfg(unix)]
+const RELOAD_POLL_MS: u64 = 200;
+
+#[cfg(unix)]
+extern "C" fn on_reload_signal(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Arm the hot-reload trigger: SIGUSR1 requests a reload of every registered
+/// module. Mitigation of handler safety: the handler only stores an atomic
+/// flag; the actual dlopen/init/dlclose work runs on a dedicated reloader
+/// thread, so repeated signals coalesce and the handler stays
+/// async-signal-safe (the flag-and-watchdog pattern of `signals.rs`).
+/// Idempotent — only the first call arms anything.
+///
+/// On non-Unix targets (Windows) this is a no-op stub: there are no POSIX
+/// signals to arm, and the registry plumbing still works via console/API
+/// callers of [`reload_module`].
+#[cfg(unix)]
+pub fn install_reload_signal() -> Result<(), String> {
+    TRIGGER_INSTALLED.get_or_init(|| {
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = on_reload_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        // SAFETY: sa is fully zeroed + configured above; the mask is a plain
+        // libc sigset being emptied before use in sigaction.
+        unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+        let rc = unsafe { libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) };
+        if rc != 0 {
+            eprintln!(
+                "[crussty:hot-reload] sigaction(SIGUSR1) failed (rc {rc}); reload trigger disabled"
+            );
+            return;
+        }
+        match std::thread::Builder::new()
+            .name("crussty-hot-reload".to_string())
+            .spawn(reload_loop)
+        {
+            Ok(_) => eprintln!(
+                "[crussty:hot-reload] SIGUSR1 reload trigger armed ({} module(s) reloadable)",
+                loaded_libraries().len()
+            ),
+            Err(e) => eprintln!("[crussty:hot-reload] reloader thread failed to spawn: {e}"),
+        }
+    });
+    Ok(())
+}
+
+/// Non-Unix stub: no POSIX signals on Windows; `reload_module` stays
+/// callable through API/panel paths, and the runtime still builds.
+#[cfg(not(unix))]
+pub fn install_reload_signal() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reload_loop() {
+    use std::sync::atomic::Ordering;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(RELOAD_POLL_MS));
+        if !RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
+            continue;
+        }
+        let ids = loaded_libraries();
+        eprintln!(
+            "[crussty:hot-reload] reload requested: {} module(s)",
+            ids.len()
+        );
+        for id in &ids {
+            match reload_module(id) {
+                Ok(()) => {
+                    eprintln!("[crussty:hot-reload] '{id}' reloaded (dlopen'd fresh + re-init)");
+                }
+                Err(e) => {
+                    eprintln!("[crussty:hot-reload] '{id}' reload skipped: {e}");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::c_void;
 
     fn register_fake(
         id: &str,
@@ -365,7 +549,9 @@ mod tests {
             LoadedModule {
                 lib: None,
                 path,
-                ctx: 0,
+                api: 0,
+                vm: 0,
+                options: CString::new("").expect("empty CString"),
                 loaded_at_unix,
                 init_rc,
                 active,
@@ -536,7 +722,9 @@ mod tests {
         let err = register_module(
             "reg-fail",
             PathBuf::from("/m/regfail.so"),
-            std::ptr::null_mut::<c_void>(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            "modules=/m",
         )
         .unwrap_err();
         assert!(err.contains("dlopen failed"), "got: {err}");

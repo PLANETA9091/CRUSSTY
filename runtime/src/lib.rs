@@ -32,8 +32,13 @@ static JVMTI_ENV: OnceLock<usize> = OnceLock::new();
 /// Raw JavaVM* as usize, for attaching plugin threads (JVMTI calls like
 /// GetLoadedClasses/RetransformClasses need an attached thread).
 static VM: OnceLock<usize> = OnceLock::new();
-/// Loaded plugin libraries, kept alive for the whole JVM lifetime.
+/// Loaded plugin libraries, kept alive for the whole JVM lifetime (fallback
+/// keep-alive for modules the hot-reload registry could not take over; the
+/// registry itself owns the libraries of modules admitted for reload).
 static LIBS: OnceLock<Mutex<Vec<Library>>> = OnceLock::new();
+/// The CPluginApi handed to every module (built once; function pointers are
+/// process-stable, so reloads replay the same handshake).
+static RUNTIME_API: OnceLock<CPluginApi> = OnceLock::new();
 
 fn hooks() -> &'static Mutex<Vec<(usize, ClassHookFn)>> {
     HOOKS.get_or_init(|| Mutex::new(Vec::new()))
@@ -133,11 +138,29 @@ impl CrusstyRuntime {
             hooks().lock().unwrap().len()
         );
 
+        // Platform default transform rules (network / scheduler / storage
+        // surfaces). Idempotent; must be registered before kernel classes
+        // load — the agent claims class hooks before boot, so the rules
+        // fire at class load (the engine runs them in the hook pipeline).
+        platform::network::install_default_rules();
+        platform::scheduler::install_default_rules();
+        if let Err(e) = platform::storage::install_default_rules() {
+            eprintln!("[crussty-runtime] storage default rules failed: {e}");
+        }
+        eprintln!(
+            "[crussty-runtime] transform engine: {} rule(s) registered",
+            platform::transform::global_engine().rules().len()
+        );
+
         // Platform bricks: crash handlers first (any fault from here on must
         // produce a report, not a silent death), then telemetry + events.
         // CRUSSTY_NO_SIGNALS=1 disables the handlers (diagnostics/troubleshooting).
         if std::env::var_os("CRUSSTY_NO_SIGNALS").is_none() {
             let _ = platform::signals::install_handlers();
+            // SIGUSR1 = hot-reload trigger for registered modules (no-op on
+            // Windows). Kept under the same gate: a no-signal build should
+            // not arm surprise signal handlers either.
+            let _ = platform::hot_reload::install_reload_signal();
         }
         if let Some(sock) = &opts.telemetry {
             match platform::telemetry::init(&sock.display().to_string()) {
@@ -218,15 +241,41 @@ impl Agent for CrusstyRuntime {
             }
         };
         let registered = hooks().lock().unwrap().clone();
-        if registered.is_empty() {
-            return;
-        }
 
         let mut current: *const u8 = class_data;
         let mut current_len = class_data_len as usize;
         // Holds the chained replacement bytes; kept alive by binding until the
         // end of the hook, then freed naturally.
         let mut pending: Option<Vec<u8>> = None;
+
+        // 1. Platform transform engine (BEFORE plugin hooks): transform rules
+        //    registered by the platform bricks (network / scheduler / storage
+        //    surfaces) run on the pristine bytes; plugins then see the
+        //    transformed class. The engine is pure byte-level work — no JNI,
+        //    no define_class — so it is safe on the class-loading thread, and
+        //    it is cheap per class: only classes whose internal name matches a
+        //    registered rule pattern are parsed, everything else passes
+        //    through after a string check. A failed transform logs and passes
+        //    the class through untransformed (the platform never fails a load).
+        if current_len > 0 && !current.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(current, current_len) };
+            match platform::transform::global_engine().apply(&name, bytes) {
+                Ok(Some(t)) => {
+                    pending = Some(t.bytes);
+                    current = pending.as_ref().map_or(current, Vec::as_ptr);
+                    current_len = pending.as_ref().map_or(current_len, Vec::len);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[crussty-runtime] transform '{name}' failed; class runs untransformed: {e}"
+                    );
+                }
+            }
+        }
+
+        // 2. Plugin hooks chain in registration order: each sees the previous
+        //    output (the engine's included).
         for (ctx, f) in &registered {
             let mut out: *mut u8 = std::ptr::null_mut();
             let mut out_len: usize = 0;
@@ -253,6 +302,11 @@ impl Agent for CrusstyRuntime {
                 pending = Some(copy);
             }
         }
+
+        // 3. Lifecycle event: zero-weight on the load path — the payload is
+        //    only built when something actually subscribes.
+        publish_class_loaded(&name, current_len);
+
         if pending.is_some() {
             // Hand the final bytes to JVMTI via its own allocator.
             if let (Some(env), false) = (
@@ -272,6 +326,20 @@ impl Agent for CrusstyRuntime {
 }
 
 export_runtime!(CrusstyRuntime);
+
+/// Publish the `platform.class_loaded` lifecycle event for a class load.
+/// Zero-weight on the class-load path: the payload is only built when the
+/// bus actually has subscribers (the hook runs on the class-loading thread,
+/// which must stay cheap).
+fn publish_class_loaded(name: &str, bytes_len: usize) {
+    let bus = platform::events::global();
+    if bus.has_subscribers(platform::lifecycle::CLASS_LOADED) {
+        bus.publish(
+            platform::lifecycle::CLASS_LOADED,
+            &serde_json::json!({ "name": name, "bytes": bytes_len }),
+        );
+    }
+}
 
 /// Trampolines handed to plugins through CPluginApi.
 unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn) -> i32 {
@@ -379,12 +447,12 @@ fn parse_options(options: &str) -> AgentOptions {
 
 /// Discover + dlopen + init every module in the modules tree.
 fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
-    let api = CPluginApi {
+    let api = RUNTIME_API.get_or_init(|| CPluginApi {
         version: CPAPI_VERSION,
         register_class_hook: Some(api_register_class_hook),
         jvmti_allocate: Some(api_jvmti_allocate),
         retransform_class: Some(api_retransform_class),
-    };
+    });
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
     if found.is_empty() {
@@ -411,8 +479,77 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
                     continue;
                 }
             };
-        let rc = unsafe { init(&api, vm, c_options.as_ptr()) };
+        let rc = unsafe { init(api, vm, c_options.as_ptr()) };
         eprintln!("[crussty-runtime] plugin {} -> init rc={rc}", plugin.id);
-        libs().lock().unwrap().push(lib);
+        if rc == 0 {
+            // Admit the loaded library into the hot-reload registry: the
+            // registry owns the mapping (dlclose on replace), keeps it
+            // alive, and captures the handshake so the SIGUSR1 trigger (or
+            // any API caller) can re-init a fresh build on reload. On
+            // failure the registry hands the library back; keep it resident
+            // anyway.
+            match platform::hot_reload::admit_module(
+                &plugin.id,
+                plugin.lib_path.clone(),
+                lib,
+                api as *const cplug_abi::CPluginApi,
+                vm,
+                options,
+            ) {
+                Ok(()) => {}
+                Err((e, lib)) => {
+                    eprintln!(
+                        "[crussty-runtime] plugin {} not admitted to hot reload: {e}",
+                        plugin.id
+                    );
+                    // Keep the module alive and functional regardless.
+                    libs().lock().unwrap().push(lib);
+                }
+            }
+        } else {
+            // Failed init: keep the library resident (some modules log
+            // lazily from their own threads), but no registry entry.
+            libs().lock().unwrap().push(lib);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn class_loaded_event_published_only_when_subscribed() {
+        let bus = platform::events::global();
+        let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+        let s = Arc::clone(&seen);
+        let token = bus.subscribe(
+            platform::lifecycle::CLASS_LOADED,
+            Arc::new(move |_, payload| {
+                s.lock().unwrap().push((
+                    payload["name"].as_str().unwrap_or("").to_string(),
+                    payload["bytes"].as_u64().unwrap_or(0) as usize,
+                ));
+            }),
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let token2 = bus.subscribe(platform::lifecycle::CLASS_LOADED, Arc::new(move |_, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        publish_class_loaded("a/b/C", 42);
+        assert_eq!(*seen.lock().unwrap(), vec![("a/b/C".to_string(), 42)]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Publishing without subscribers is a no-op: zero-cost on the
+        // class-load path once nobody listens.
+        bus.unsubscribe(platform::lifecycle::CLASS_LOADED, &token);
+        bus.unsubscribe(platform::lifecycle::CLASS_LOADED, &token2);
+        publish_class_loaded("x/y", 7);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "no subscriber, no dispatch");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
