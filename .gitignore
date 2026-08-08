@@ -1,5 +1,5 @@
 target/
-build/
+/build/
 *.so
 *.dylib
 *.dll
@@ -7,7 +7,7 @@ build/
 *.class
 !modules/*/tests/**
 versions/
-world/
+/world/
 logs/
 crash-reports/
 cache/
@@ -30,6 +30,14 @@ server.properties
 
 # committed helper class artifacts (see scripts/build-helpers.sh)
 !cplug-sdk/asm-build/dev/dist/SdkAsmHelper*.class
+# modules/crussty noise bridge source tree (contains a "world" path segment)
+!modules/crussty/noise/net/minecraft/world/
+!modules/crussty/noise/net/minecraft/world/level/levelgen/synth/
+
+# generated helper build dirs (only specific .class artifacts tracked)
+!modules/crussty/area-map/build/
 !modules/crussty/area-map/build/ca/spottedleaf/moonrise/common/misc/SingleUserAreaMapOps*.class
+!modules/crussty/noise/build/
 !modules/crussty/noise/build/net/minecraft/world/level/levelgen/synth/ImprovedNoiseNativeOps*.class
+!modules/dist/build/
 !modules/dist/build/dev/dist/DistKernel.class
