@@ -24,3 +24,6 @@ gh_edit_view_mode: edit
 gh_edit_source: book/src
 
 footer_content: "Copyright &copy; 2026 PLANETA9091. Distributed under the MIT license."
+
+kramdown:
+  parse_block_html: true
