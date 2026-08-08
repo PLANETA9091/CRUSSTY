@@ -43,7 +43,7 @@ code, pre, .site-title, .nav-list-link {
 /* w3schools-style code boxes with copy buttons */
 .ws-code {
   position: relative;
-  margin: 0.5rem 0 1.2rem;
+  margin: 2.6rem 0 1.2rem;
 }
 /* hide the theme's built-in copy button, keep only our custom one */
 .highlighter-rouge > button[aria-label="Copy code to clipboard"] {
@@ -51,7 +51,7 @@ code, pre, .site-title, .nav-list-link {
 }
 .ws-code .copy-btn {
   position: absolute;
-  top: 0.4rem;
+  top: -2.4rem;
   right: 0.4rem;
   border: 1px solid #688eff;
   background: #060606;
