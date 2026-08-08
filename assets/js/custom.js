@@ -67,6 +67,26 @@
     });
   }
 
+  function initAnimations() {
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduce) return;
+    document.documentElement.classList.add("ws-anim");
+    var els = document.querySelectorAll(".ws-code, .ws-try, .ws-step");
+    if ("IntersectionObserver" in window) {
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("ws-in");
+            io.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.05 });
+      els.forEach(function (el) { io.observe(el); });
+    } else {
+      els.forEach(function (el) { el.classList.add("ws-in"); });
+    }
+  }
+
   function ready(fn) {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", fn);
@@ -78,6 +98,7 @@
   ready(function () {
     addCopyButtons();
     initTabs();
+    initAnimations();
   });
 
 })();
