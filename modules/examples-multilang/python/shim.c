@@ -123,5 +123,22 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
      * on a thread other than the init thread would block forever waiting for
      * the GIL. */
     PyEval_SaveThread();
+
+    /* CPlatformApi bridge demo (the same surface a pure-C module uses). */
+    if (api->platform) {
+        fprintf(stderr, "[hello-py] platform table v%u\n", (unsigned)api->platform->version);
+        int n = 0;
+        if (api->platform->telemetry_publish_metric)
+            n += (api->platform->telemetry_publish_metric("hello_py.init", 42.0, "rc", NULL) == 0);
+        if (api->platform->events_publish)
+            n += (api->platform->events_publish("hello-py.hello", "{\"phase\":\"init\"}") > 0);
+        if (api->platform->scheduler_current_tick)
+            (void)api->platform->scheduler_current_tick();
+        fprintf(stderr, "[hello-py] platform exercised %d calls, snapshot=%s\n", n,
+                api->platform->telemetry_snapshot_json
+                    ? api->platform->telemetry_snapshot_json() : "n/a");
+    } else {
+        fprintf(stderr, "[hello-py] no platform table (old runtime?)\n");
+    }
     return 0;
 }

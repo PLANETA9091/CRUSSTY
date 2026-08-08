@@ -166,5 +166,22 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     } else {
         return 1;
     }
+
+    /* CPlatformApi bridge demo (the same surface a pure-C module uses). */
+    if (api->platform) {
+        fprintf(stderr, "[hello-js] platform table v%u\n", (unsigned)api->platform->version);
+        int n = 0;
+        if (api->platform->telemetry_publish_metric)
+            n += (api->platform->telemetry_publish_metric("hello_js.init", 42.0, "rc", NULL) == 0);
+        if (api->platform->events_publish)
+            n += (api->platform->events_publish("hello-js.hello", "{\"phase\":\"init\"}") > 0);
+        if (api->platform->scheduler_current_tick)
+            (void)api->platform->scheduler_current_tick();
+        fprintf(stderr, "[hello-js] platform exercised %d calls, snapshot=%s\n", n,
+                api->platform->telemetry_snapshot_json
+                    ? api->platform->telemetry_snapshot_json() : "n/a");
+    } else {
+        fprintf(stderr, "[hello-js] no platform table (old runtime?)\n");
+    }
     return 0;
 }

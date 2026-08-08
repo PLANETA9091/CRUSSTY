@@ -3,6 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 gcc -shared -fPIC -O2 \
-    -I"$PWD/../../cplug-abi" \
+    -I"$PWD/../../../cplug-sdk-c/include" \
     -o libhello_c.so hello.c
 echo "built $(pwd)/libhello_c.so"
