@@ -80,8 +80,24 @@ static VM: OnceLock<usize> = OnceLock::new();
 /// registry itself owns the libraries of modules admitted for reload).
 static LIBS: OnceLock<Mutex<Vec<Library>>> = OnceLock::new();
 /// The CPluginApi handed to every module (built once; function pointers are
-/// process-stable, so reloads replay the same handshake).
-static RUNTIME_API: OnceLock<CPluginApi> = OnceLock::new();
+/// process-stable, so reloads replay the same handshake). Wrapped because the
+/// raw table carries a `*const CPlatformApi` (not auto Send/Sync).
+struct SafeApi(CPluginApi);
+unsafe impl Send for SafeApi {}
+unsafe impl Sync for SafeApi {}
+static RUNTIME_API: OnceLock<SafeApi> = OnceLock::new();
+
+fn cplugin_api() -> &'static CPluginApi {
+    let safe = RUNTIME_API.get_or_init(|| SafeApi(CPluginApi {
+        version: CPAPI_VERSION,
+        register_class_hook: Some(api_register_class_hook),
+        jvmti_allocate: Some(api_jvmti_allocate),
+        retransform_class: Some(api_retransform_class),
+        claim: Some(api_claim),
+        platform: &platform::c_bridge::PLATFORM_API,
+    }));
+    &safe.0
+}
 
 fn hooks() -> &'static Mutex<Vec<(usize, ClassHookFn)>> {
     HOOKS.get_or_init(|| Mutex::new(Vec::new()))
@@ -544,13 +560,7 @@ fn parse_options(options: &str) -> AgentOptions {
 
 /// Discover + dlopen + init every module in the modules tree.
 fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
-    let api = RUNTIME_API.get_or_init(|| CPluginApi {
-        version: CPAPI_VERSION,
-        register_class_hook: Some(api_register_class_hook),
-        jvmti_allocate: Some(api_jvmti_allocate),
-        retransform_class: Some(api_retransform_class),
-        claim: Some(api_claim),
-    });
+    let api = cplugin_api();
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
     if found.is_empty() {
