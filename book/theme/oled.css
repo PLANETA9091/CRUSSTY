@@ -1,0 +1,347 @@
+/* Crussty OLED theme — pure black terminal aesthetic */
+
+html,
+html.light,
+html.rust,
+html.coal,
+html.navy,
+html.ayu {
+    --bg: #000000;
+    --fg: #c9f0d1;
+
+    --sidebar-bg: #000000;
+    --sidebar-fg: #4f6b58;
+    --sidebar-active: #39ff14;
+    --sidebar-active-bg: #0a120c;
+    --sidebar-spacer: #0d140f;
+
+    --scrollbar: #12230f;
+    --icons: #2d422d;
+    --icons-hover: #39ff14;
+
+    --link: #00ff9c;
+    --link-hover: #7dffc9;
+
+    --code-bg: #060806;
+    --code-fg: #b8e6c0;
+
+    --quote-bg: #050905;
+    --quote-border: #39ff14;
+
+    --table-border-color: #12230f;
+    --table-header-bg: #060c07;
+    --table-alternate-bg: #040704;
+
+    --searchbar-border-color: #12230f;
+    --searchbar-bg: #030503;
+    --searchbar-fg: #c9f0d1;
+    --searchbar-shadow-color: #000000;
+    --searchresults-header-fg: #4f6b58;
+    --searchresults-border-color: #12230f;
+    --searchresults-li-bg: #020302;
+    --search-mark-bg: #0a2a12;
+    --search-mark-fg: #39ff14;
+
+    --btn-hover-bg: #0a120c;
+    --btn-hover-fg: #39ff14;
+
+    --menu-bg: #000000;
+    --menu-fg: #c9f0d1;
+    --menu-vertical-separator: #12230f;
+
+    --mobile-bars-bg: #000000;
+    --mobile-bars-fg: #4f6b58;
+
+    --heading-sort-color: #39ff14;
+    --copy-path-button-color: #2d422d;
+    --copy-path-button-hover-bg: #0a120c;
+    --copy-path-button-hover-fg: #39ff14;
+
+    --chip-bg: #030503;
+    --chip-fg: #c9f0d1;
+    --chip-hover-bg: #0a120c;
+    --chip-hover-fg: #39ff14;
+
+    --searchmatch-highlight-bg: #0a2a12;
+    --searchmatch-highlight-fg: #39ff14;
+
+    --mdbook-admonition-bg: #030503;
+    --mdbook-admonition-fg: #c9f0d1;
+    --mdbook-admonition-border: #12230f;
+
+    --body-font: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace,
+        SFMono-Regular, Menlo, Consolas, monospace;
+    --mono-font: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace,
+        SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Crussty OLED terminal chrome — sits on top of the oled theme */
+
+html {
+    background: #000;
+}
+
+body {
+    background: #000;
+    font-variant-ligatures: none;
+}
+
+.sidebar {
+    border-right: 1px solid #0d140f;
+}
+
+.chapter li.chapter-item a.active {
+    border-left: 2px solid #39ff14;
+}
+
+h1, h2, h3, h4 {
+    letter-spacing: 0.02em;
+}
+
+h1 {
+    color: #39ff14;
+    text-shadow: 0 0 18px rgba(57, 255, 20, 0.25);
+}
+
+h1::before {
+    content: "§ ";
+    color: #00ff9c;
+}
+
+h2 {
+    color: #00ff9c;
+}
+
+h2::before {
+    content: "▸ ";
+    color: #39ff14;
+}
+
+h3 {
+    color: #b8e6c0;
+}
+
+h3::before {
+    content: "· ";
+    color: #2d422d;
+}
+
+/* terminal window look for code blocks */
+pre {
+    border: 1px solid #12230f;
+    border-radius: 8px;
+    background: #030503;
+    box-shadow: 0 0 0 1px #000, inset 0 0 24px rgba(0, 255, 60, 0.03);
+    position: relative;
+    padding-top: 2.2em;
+}
+
+pre::before {
+    content: "crussty@platform:~/modules$";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 0.45em 1em;
+    color: #4f6b58;
+    font-size: 0.78em;
+    border-bottom: 1px solid #0d140f;
+    letter-spacing: 0.05em;
+}
+
+pre code {
+    color: #b8e6c0;
+}
+
+pre code .hljs-keyword,
+pre code.hljs .hljs-keyword { color: #39ff14; }
+pre code .hljs-string,
+pre code.hljs .hljs-string { color: #00e5ff; }
+pre code .hljs-comment,
+pre code.hljs .hljs-comment { color: #4f6b58; font-style: italic; }
+pre code .hljs-title,
+pre code.hljs .hljs-title { color: #00ff9c; }
+pre code .hljs-attr,
+pre code.hljs .hljs-attr { color: #8affc1; }
+pre code .hljs-literal,
+pre code.hljs .hljs-literal { color: #ff6b6b; }
+pre code .hljs-number,
+pre code.hljs .hljs-number { color: #ffd93d; }
+pre code .hljs-type,
+pre code.hljs .hljs-type { color: #00e5ff; }
+pre code .hljs-built_in,
+pre code.hljs .hljs-built_in { color: #7dffc9; }
+pre code .hljs-meta,
+pre code.hljs .hljs-meta { color: #4f6b58; }
+
+/* tables */
+table {
+    border-collapse: collapse;
+    border: 1px solid #12230f;
+}
+
+th {
+    background: #060c07;
+    color: #00ff9c;
+    border: 1px solid #12230f;
+}
+
+td {
+    border: 1px solid #12230f;
+}
+
+tbody tr:nth-child(2n) {
+    background: #040704;
+}
+
+/* links */
+a {
+    text-decoration: none;
+    border-bottom: 1px dotted #2d422d;
+    transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+a:hover {
+    border-bottom-color: #39ff14;
+    text-shadow: 0 0 12px rgba(57, 255, 20, 0.35);
+}
+
+/* blockquote */
+blockquote {
+    border-left: 3px solid #39ff14;
+    background: #050905;
+    color: #8affc1;
+}
+
+blockquote p::before {
+    content: "» ";
+    color: #39ff14;
+}
+
+/* admonitions */
+div.mdbook-alert-note {
+    border-color: #00ff9c;
+}
+
+/* logo */
+img.logo {
+    max-width: 220px;
+    margin: 0.5rem 0;
+}
+
+/* terminal cursor blink */
+.cursor {
+    display: inline-block;
+    width: 0.55em;
+    height: 1em;
+    background: #39ff14;
+    vertical-align: text-bottom;
+    animation: crussty-blink 1s steps(2, start) infinite;
+}
+
+@keyframes crussty-blink {
+    to {
+        visibility: hidden;
+    }
+}
+
+/* boot screen */
+#boot {
+    display: none;
+    margin: 2.5rem 0;
+}
+
+body.boot main > *:not(#boot) {
+    display: none;
+}
+
+body.boot #boot {
+    display: block;
+}
+
+.boot-logo {
+    text-align: center;
+    margin-bottom: 1.2rem;
+}
+
+.boot-logo img {
+    max-width: 170px;
+    height: auto;
+    filter: drop-shadow(0 0 24px rgba(0, 255, 60, 0.2));
+}
+
+#boot pre {
+    border: 1px solid #12230f;
+    border-radius: 8px;
+    background: #000;
+    padding: 1.2em 1.4em;
+    color: #8affc1;
+    font-size: 0.92em;
+    line-height: 1.55;
+    box-shadow: 0 0 40px rgba(0, 255, 60, 0.08);
+    overflow-x: auto;
+}
+
+#boot pre .dim {
+    color: #4f6b58;
+}
+
+#boot pre .ok {
+    color: #39ff14;
+}
+
+#boot pre .warn {
+    color: #ffd93d;
+}
+
+#boot pre .info {
+    color: #00e5ff;
+}
+
+/* subtle CRT scanline over the boot block */
+#boot pre {
+    background-image: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.35) 0px,
+        rgba(0, 0, 0, 0.35) 1px,
+        transparent 1px,
+        transparent 3px
+    );
+}
+
+/* fade-in of the page content after boot */
+body.boot main,
+body.boot main > *:not(#boot) {
+    animation: crussty-fadein 0.6s ease both;
+}
+
+@keyframes crussty-fadein {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* header / footer */
+.page-footer .previous,
+.page-footer .next {
+    border: 1px solid #12230f;
+    background: #030503;
+    color: #8affc1;
+}
+
+.page-footer .previous:hover,
+.page-footer .next:hover {
+    border-color: #39ff14;
+    color: #39ff14;
+}
+
+/* search */
+#search-wrapper {
+    border: 1px solid #12230f;
+    background: #030503;
+}
