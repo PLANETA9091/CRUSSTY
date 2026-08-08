@@ -28,9 +28,14 @@ import java.util.jar.JarFile;
  */
 public final class Boot {
     private static final String STAGE = "crussty";
-    private static final String RUNTIME_RESOURCE = "/libcrussty_runtime.so";
 
     private Boot() {}
+
+    /** Native runtime library name for the current OS (crussty_runtime.dll on Windows). */
+    private static String runtimeLibName() {
+        return System.getProperty("os.name", "").toLowerCase().contains("win")
+                ? "crussty_runtime.dll" : "libcrussty_runtime.so";
+    }
 
     public static void main(String[] args) throws Exception {
         Path stage = Paths.get(STAGE);
@@ -39,7 +44,7 @@ public final class Boot {
         List<String> modules = extractResources(stage);
         writeOptions(stage, modules);
 
-        Path runtime = stage.resolve("libcrussty_runtime.so");
+        Path runtime = stage.resolve(runtimeLibName());
         System.load(runtime.toAbsolutePath().toString());
         System.out.println("[crussty] runtime loaded from " + runtime);
 
@@ -59,8 +64,8 @@ public final class Boot {
             while (entries.hasMoreElements()) {
                 JarEntry e = entries.nextElement();
                 String name = e.getName();
-                if (name.equals("libcrussty_runtime.so")) {
-                    extract(jar, e, stage.resolve("libcrussty_runtime.so"));
+                if (name.equals(runtimeLibName())) {
+                    extract(jar, e, stage.resolve(runtimeLibName()));
                 } else if (name.startsWith("modules/") && !name.endsWith("/")) {
                     Path out = stage.resolve(name);
                     Files.createDirectories(out.getParent());
