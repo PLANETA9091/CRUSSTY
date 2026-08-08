@@ -26,6 +26,9 @@ modules/
 
 - Libraries **without** a manifest (e.g. `native/` dependencies) are never
   loaded as modules.
+- Bundled module dependencies ship under `native/` next to the entry library
+  — e.g. `modules/crussty/native/` publishes the Crussty CE JNI libraries
+  (`libpaper_native_jni.so`, required by the module; see its `MANIFEST.md`).
 - Anything named `*.disabled` (file or directory) is skipped — the Paper
   convention for disabling a module without deleting it.
 - Build output directories (`target/`, `build/`, `out/`, `node_modules/`,

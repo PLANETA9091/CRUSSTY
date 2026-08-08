@@ -53,6 +53,25 @@ The jar boots the kernel itself: no `-agentpath`, no launcher process.
 ./run.sh
 ```
 
+## E2E smoke test
+
+```bash
+./scripts/e2e.sh
+```
+
+Downloads the kernel into `versions/` (cached), builds runtime, launcher and
+the bundled modules, boots a real server via `run.sh` and waits for the
+markers instead of you watching the log:
+
+```
+[crussty-runtime] pipeline ready: N hook(s)
+[hello-plugin] ... hello from native c-plugin
+```
+
+Exit code 0 only if both appear before the timeout; stages are logged.
+Environment knobs: `PURPUR_VERSION`, `SERVER_PORT`, `TIMEOUT_SEC`,
+`MODULES` (default `hello dist crussty`).
+
 ## Verify
 
 Check the server log:
