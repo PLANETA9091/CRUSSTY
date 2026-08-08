@@ -7,6 +7,7 @@
 //! the public API of every brick lives in this `mod.rs` so cross-brick use
 //! goes through the stable surface below.
 
+pub mod c_bridge;
 pub mod barriers;
 pub mod events;
 pub mod hooks;
