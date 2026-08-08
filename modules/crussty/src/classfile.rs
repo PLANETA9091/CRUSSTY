@@ -558,8 +558,9 @@ mod tests {
         }
         assert!(found_update && found_code);
 
-        let out = std::path::Path::new("/tmp/opencode/patchcheck/patched.class");
-        std::fs::write(out, &patched).expect("dump patched class");
+        let out = std::env::temp_dir().join("crussty-patchcheck/patched.class");
+        std::fs::create_dir_all(out.parent().unwrap()).expect("create dump dir");
+        std::fs::write(&out, &patched).expect("dump patched class");
         eprintln!("wrote {} bytes to {}", patched.len(), out.display());
     }
 
