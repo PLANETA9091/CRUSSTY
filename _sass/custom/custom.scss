@@ -180,7 +180,16 @@ code, pre, .site-title, .nav-list-link {
 .highlight .no { color: #E87474; }                 /* constants */
 .highlight .nv, .highlight .vc, .highlight .vg, .highlight .vi { color: #DE8199; } /* variables */
 .highlight .nd { color: #E48CC5; }                 /* decorators */
-.highlight, .highlighter-rouge pre.highlight, .highlight .p, .highlight .ge { color: #d6d6d6; }  /* plain code text */
+.highlight, .highlighter-rouge pre.highlight, .highlight .p, .highlight .ge { color: #b3b3b3; }  /* plain code text */
+/* --- Bearded OLED: editor background is pure black; italic comments --- */
+.highlighter-rouge pre.highlight, .ws-tab pre.highlight, .ws-code pre.highlight,
+.highlight {
+  background: #000000 !important;
+}
+.highlight .c, .highlight .cm, .highlight .c1, .highlight .cs, .highlight .sd {
+  font-style: italic;
+  color: #515151;
+}
 .highlight .err { color: #E87474; }                /* errors */
 .highlight .gd { color: #E87474; }                 /* deleted */
 .highlight .gi { color: #5CD4C3; }                 /* inserted */
@@ -189,9 +198,9 @@ code, pre, .site-title, .nav-list-link {
 .highlight .gu { color: #B69EDE; }                 /* subheading */
 .highlight .w { color: #333333; }                  /* whitespace */
 
-/* --- plain text in code blocks: brighter so it is readable on #060606 --- */
+/* --- plain text in code blocks: Bearded OLED editor.foreground #b3b3b3 --- */
 .highlight, .highlight .p, .highlight .ge, .highlight .nl, .highlight .nn {
-  color: #d6d6d6;
+  color: #b3b3b3;
 }
 
 /* --- page header icon (inline img before h1) --- */
