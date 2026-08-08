@@ -27,8 +27,13 @@ MODULES_DEFAULT="hello dist crussty"
 MODULES="${MODULES:-$MODULES_DEFAULT}"
 
 SERIAL_DIR="logs/e2e.$$"
+# The launcher tees the server's stdout+stderr into logs/server.log (and
+# echoes it to its own stdout). Markers are grepped on BOTH the session
+# capture (launcher.out) and the launcher's server.log (which the e2e once
+# falsely expected at $SERIAL_DIR/server.log — it never exists).
 SERVER_LOG="$SERIAL_DIR/server.log"
 LAUNCHER_LOG="$SERIAL_DIR/launcher.out"
+SERVER_TEE="logs/server.log"
 KERNEL="versions/purpur-$PURPUR_VERSION.jar"
 
 log()  { printf '%s\n' "[e2e] $*"; }
@@ -90,7 +95,7 @@ done
 # --------------------------------------------------------------- 4. boot
 stage "4. boot server via run.sh"
 printf 'eula=true\n' > eula.txt
-rm -f "$SERVER_LOG" "$LAUNCHER_LOG"
+rm -f "$SERVER_LOG" "$LAUNCHER_LOG" "$SERVER_TEE"
 mkfifo "$SERIAL_DIR/stdin"
 exec 9<>"$SERIAL_DIR/stdin"   # keep a writer open so the fifo never blocks
 
@@ -112,11 +117,12 @@ log "launcher pid $LAUNCHER_PID; waiting up to ${TIMEOUT_SEC}s for markers"
 
 found_pipeline=0; found_hello=0; found_native=0
 while :; do
-    if [ -f "$SERVER_LOG" ]; then
-        if grep -q "pipeline ready" "$SERVER_LOG"; then found_pipeline=1; fi
-        if grep -q "hello from native c-plugin" "$SERVER_LOG"; then found_hello=1; fi
-        if grep -q "native surface live" "$SERVER_LOG"; then found_native=1; fi
-    fi
+    for target in "$SERVER_TEE" "$LAUNCHER_LOG"; do
+        [ -f "$target" ] || continue
+        if grep -q "pipeline ready" "$target"; then found_pipeline=1; fi
+        if grep -q "hello from native c-plugin" "$target"; then found_hello=1; fi
+        if grep -q "native surface live" "$target"; then found_native=1; fi
+    done
     if ! kill -0 "$LAUNCHER_PID" 2>/dev/null; then
         RC=0; wait "$LAUNCHER_PID" 2>/dev/null || RC=$?
         fail "launcher exited early (exit $RC); tail: $(tail -c 1500 "$LAUNCHER_LOG" 2>/dev/null)"
