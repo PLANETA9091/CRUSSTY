@@ -34,6 +34,10 @@ server.properties
 !modules/crussty/noise/net/minecraft/world/
 !modules/crussty/noise/net/minecraft/world/level/levelgen/synth/
 
+# published Crussty CE native binaries (see modules/crussty/native/MANIFEST.md)
+!modules/crussty/native/
+!modules/crussty/native/*.so
+
 # generated helper build dirs (only specific .class artifacts tracked)
 !modules/crussty/area-map/build/
 !modules/crussty/area-map/build/ca/spottedleaf/moonrise/common/misc/SingleUserAreaMapOps*.class
