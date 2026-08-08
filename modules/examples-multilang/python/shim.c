@@ -67,7 +67,16 @@ static int32_t on_class_hook(
 int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     (void)vm; (void)options;
 
-    Py_Initialize();
+    /* Hot-reload re-runs cplugin_init on a fresh dlopen. Py_Initialize() a
+     * second time in the same process is a hard SIGSEGV inside CPython, so
+     * boot the interpreter exactly once and reuse it on reloads. */
+    static int py_booted = 0;
+    if (!py_booted) {
+        Py_Initialize();
+        py_booted = 1;
+    }
+    PyGILState_STATE gil = PyGILState_Ensure();
+
     /* Put the module dir (the .so's dir) on sys.path so the Python half
      * imports cleanly when deployed next to the library. */
     {
@@ -95,6 +104,7 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     PyObject* m = PyImport_ImportModule("hello_hello");
     if (m == NULL) {
         PyErr_Print();
+        PyGILState_Release(gil);
         return 2;
     }
     PyObject* fn = PyObject_GetAttrString(m, "make_hook");
@@ -102,6 +112,7 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     if (fn == NULL || !PyCallable_Check(fn)) {
         PyErr_Print();
         Py_XDECREF(fn);
+        PyGILState_Release(gil);
         return 3;
     }
     PyObject* hook = PyObject_CallNoArgs(fn);
@@ -109,23 +120,23 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
     if (hook == NULL || !PyCallable_Check(hook)) {
         PyErr_Print();
         Py_XDECREF(hook);
+        PyGILState_Release(gil);
         return 4;
     }
-    g_py_hook = hook;
+    static PyObject* owner = NULL;
+    Py_XDECREF(owner);
+    owner = hook;
+    g_py_hook = owner;
 
     if (api->register_class_hook) {
         int rc = api->register_class_hook(NULL, on_class_hook);
         fprintf(stderr, "[hello-py] register_class_hook rc=%d\n", rc);
+        PyGILState_Release(gil);
         if (rc != 0) return rc;
     } else {
+        PyGILState_Release(gil);
         return 1;
     }
-    /* Py_Initialize() grabs the GIL on this (init) thread and keeps it.
-     * Release it here: hook calls from arbitrary JVM class-load threads take
-     * the GIL themselves via PyGILState_Ensure. Without this, the first hook
-     * on a thread other than the init thread would block forever waiting for
-     * the GIL. */
-    PyEval_SaveThread();
 
     /* CPlatformApi bridge demo (the same surface a pure-C module uses). */
     if (api->platform) {
