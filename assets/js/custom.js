@@ -92,7 +92,13 @@
     if (!active) return;
     var icon = NAV_ICONS[location.pathname];
     if (icon) {
-      active.style.setProperty("--nav-icon", "url(\"/CRUSSTY/assets/images/icons/" + icon + ".svg\")");
+      var st = document.getElementById("active-nav-icon");
+      if (!st) {
+        st = document.createElement("style");
+        st.id = "active-nav-icon";
+        document.head.appendChild(st);
+      }
+      st.textContent = '.site-nav .nav-list-link.active::before { background-image: url("/CRUSSTY/assets/images/icons/' + icon + '.svg"); }';
     }
   }
 
