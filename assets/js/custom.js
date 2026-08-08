@@ -98,7 +98,8 @@
         st.id = "active-nav-icon";
         document.head.appendChild(st);
       }
-      st.textContent = '.site-nav .nav-list-link.active::before { background-image: url("/CRUSSTY/assets/images/icons/' + icon + '.svg"); }';
+      var uri = icon.indexOf("data:") === 0 ? icon : "/CRUSSTY/assets/images/icons/" + icon + ".svg";
+      st.textContent = '.site-nav .nav-list-link.active::before { background-image: url("' + uri + '"); }';
     }
   }
 
