@@ -45,6 +45,10 @@ code, pre, .site-title, .nav-list-link {
   position: relative;
   margin: 0.5rem 0 1.2rem;
 }
+/* hide the theme's built-in copy button, keep only our custom one */
+.highlighter-rouge > button[aria-label="Copy code to clipboard"] {
+  display: none !important;
+}
 .ws-code .copy-btn {
   position: absolute;
   top: 0.4rem;
