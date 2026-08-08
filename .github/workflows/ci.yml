@@ -1,0 +1,51 @@
+name: CI
+on:
+  push:
+    branches: ["master", "gh-pages"]
+  pull_request:
+
+jobs:
+  crates:
+    name: build+test ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - cplug-abi
+          - cplug-sdk
+          - runtime
+          - modules/hello
+          - modules/dist
+          - modules/crussty
+          - modules/cells
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - name: Cargo build
+        run: cargo build --manifest-path ${{ matrix.crate }}/Cargo.toml
+      - name: Cargo test
+        run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
+
+  helpers:
+    name: Java helper artifacts in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Rebuild helpers
+        run: bash scripts/build-helpers.sh
+      - name: Verify committed artifacts unchanged
+        run: |
+          if ! git diff --quiet --exit-code cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build; then
+            echo "::error::Java helper .class artifacts are out of sync with sources. Run scripts/build-helpers.sh and commit the result."
+            git diff --stat cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build
+            exit 1
+          fi
+          echo "OK: committed artifacts are up to date"
