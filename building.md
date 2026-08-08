@@ -239,3 +239,5 @@ scan → load → hook → main-thread bridge → JNI.
 - [Module SDK](sdk.html) — hooks, classes, main thread, ASM
 - [Other languages](other-languages.html) — the same module in C, C++, Python, JS (Go caveat)
 - [Troubleshooting](troubleshooting.html) — common issues
+
+<script src="/CRUSSTY/assets/js/custom.js"></script>
