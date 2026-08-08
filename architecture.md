@@ -7,27 +7,50 @@ nav_order: 4
 
 ## Layers
 
-```
-┌────────────────────────────────────────────────────┐
-│ launcher.jar / server.jar (single-jar, Boot.class) │
-│   - single-jar: extracts runtime + modules,        │
-│     System.load -> JNI_OnLoad                      │
-│   - launcher: spawns child JVM with -agentpath     │
-└───────────────────────┬────────────────────────────┘
-                        │ -agentpath / JNI_OnLoad
-┌───────────────────────▼────────────────────────────┐
-│ Crussty Runtime (libcrussty_runtime.so, JVMTI)     │
-│   - scans modules/, topologically loads modules    │
-│   - owns the ClassFileLoadHook pipeline            │
-│   - owns the JVMTI byte allocator + retransform    │
-│   - platform bricks (src/platform/*)               │
-└───────┬──────────────────────────┬─────────────────┘
-        │ dlopen (RTLD_LOCAL)      │ CLASS_FILE_LOAD_HOOK
-┌───────▼──────────┐      ┌────────▼─────────────────────────┐
-│ modules/*.so     │      │ kernel JVM (Purpur/Paper)        │
-│ (cplug-abi only) │◄────►│  every class load, pre-JIT        │
-└──────────────────┘      └──────────────────────────────────┘
-```
+<div class="arch-diagram">
+
+  <div class="arch-layer arch-top">
+    <div class="arch-title">launcher.jar / server.jar</div>
+    <ul>
+      <li><b>single-jar</b> — extracts runtime + modules, then <code>System.load</code> → <code>JNI_OnLoad</code></li>
+      <li><b>launcher</b> — spawns a child JVM with <code>-agentpath</code></li>
+    </ul>
+  </div>
+
+  <div class="arch-arrow">-agentpath / JNI_OnLoad</div>
+
+  <div class="arch-layer arch-core">
+    <div class="arch-title">Crussty Runtime <span class="arch-file">libcrussty_runtime.so · JVMTI</span></div>
+    <ul>
+      <li>scans <code>modules/</code> and loads modules in topological order</li>
+      <li>owns the <code>ClassFileLoadHook</code> pipeline</li>
+      <li>owns the JVMTI byte allocator + retransform</li>
+      <li>platform bricks in <code>src/platform/*</code></li>
+    </ul>
+  </div>
+
+  <div class="arch-split">
+    <div class="arch-layer arch-mod">
+      <div class="arch-title">modules/*.so</div>
+      <div class="arch-note">cplug-abi only · dlopen (RTLD_LOCAL) · patching</div>
+    </div>
+    <div class="arch-layer arch-jvm">
+      <div class="arch-title">kernel JVM</div>
+      <div class="arch-note">Purpur/Paper · every class load, pre-JIT</div>
+    </div>
+  </div>
+
+  <div class="arch-flow">
+    <div class="arch-step">class load</div>
+    <div class="arch-flow-arrow">→</div>
+    <div class="arch-step">hook chain<br><i>topological order</i></div>
+    <div class="arch-flow-arrow">→</div>
+    <div class="arch-step">rc &gt; 0 → skip</div>
+    <div class="arch-flow-arrow">→</div>
+    <div class="arch-step arch-step-ok">replacement bytes<br><i>jvmti_allocate</i></div>
+  </div>
+
+</div>
 
 Two entry points reach the same runtime: the launcher passes `-agentpath`
 so the runtime is a classic JVMTI agent before the kernel boots; the
@@ -56,10 +79,11 @@ Modules never link against the runtime. The only contract is `cplug-abi`, a
 plain C struct of function pointers (`CPluginApi`) passed into
 `cplugin_init(api, vm, options)`:
 
-- `register_class_hook(module_ctx, ClassHookFn) -> i32`
-- `alloc_class_bytes(size) -> *mut u8` (JVMTI allocator)
-- `retransform_class(class_bytes, len) -> i32` (class name is embedded in
-  the bytes; JVMTI reads it)
+| API | Purpose |
+| --- | --- |
+| `register_class_hook(module_ctx, ClassHookFn) -> i32` | attach a hook to the class-load pipeline |
+| `alloc_class_bytes(size) -> *mut u8` | allocate replacement bytes via the JVMTI allocator |
+| `retransform_class(class_bytes, len) -> i32` | force retransformation (class name is embedded in the bytes; JVMTI reads it) |
 
 `CPAPI_VERSION` guards ABI drift: the runtime rejects modules compiled
 against a different ABI version.

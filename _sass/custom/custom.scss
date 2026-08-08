@@ -270,3 +270,96 @@ code, pre, .site-title, .nav-list-link {
     transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
   }
 }
+
+/* === architecture page diagram === */
+.arch-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 1.2rem 0 1.6rem;
+}
+.arch-layer {
+  border: 1px solid #262626;
+  border-left: 3px solid #688eff;
+  background: #0a0a0f;
+  border-radius: 10px;
+  padding: 0.7rem 1rem;
+}
+.arch-layer.arch-top { border-left-color: #E0CF77; }
+.arch-layer.arch-mod { border-left-color: #5CD4C3; }
+.arch-layer.arch-jvm { border-left-color: #B69EDE; }
+.arch-title {
+  font-family: "Monocraft", monospace;
+  color: #E0CF77;
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+.arch-title .arch-file {
+  color: #688eff;
+  font-size: 0.75rem;
+  font-weight: 400;
+  margin-left: 0.5rem;
+}
+.arch-layer ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.9rem;
+}
+.arch-layer .arch-note {
+  font-size: 0.85rem;
+  color: #b3b3b3;
+}
+.arch-arrow {
+  text-align: center;
+  color: #688eff;
+  font-size: 0.8rem;
+  padding: 0.1rem 0;
+}
+.arch-arrow::before {
+  content: "▼";
+  display: block;
+  font-size: 0.65rem;
+  color: #688eff;
+}
+.arch-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+.arch-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  flex-wrap: nowrap;
+}
+.arch-flow .arch-step {
+  border: 1px solid #262626;
+  border-radius: 8px;
+  background: #0d0d12;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.78rem;
+  text-align: center;
+  flex: 1 1 0;
+  color: #d6d6d6;
+}
+.arch-flow .arch-step i {
+  font-style: italic;
+  color: #999999;
+}
+.arch-flow .arch-step-ok {
+  border-color: #5CD4C3;
+  color: #5CD4C3;
+}
+.arch-flow-arrow {
+  align-self: center;
+  color: #688eff;
+  font-size: 0.9rem;
+  padding: 0 0.1rem;
+}
+@media (max-width: 50rem) {
+  .arch-split { grid-template-columns: 1fr; }
+  .arch-flow { flex-wrap: wrap; }
+  .arch-flow .arch-step { min-width: 130px; }
+}
