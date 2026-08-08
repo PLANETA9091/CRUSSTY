@@ -3,7 +3,7 @@ title: Example modules
 nav_order: 8
 ---
 
-# Example modules
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/rust.svg" alt=""> Example modules
 
 Example modules live in their own repositories (`c-<name>`) and are cloned
 into `modules/`:

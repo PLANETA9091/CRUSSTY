@@ -4,7 +4,7 @@ title: Crussty Platform
 nav_order: 1
 ---
 
-# Crussty Platform
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/datapacks.svg" alt=""> Crussty Platform
 <img class="logo" src="/CRUSSTY/assets/images/crussty-logo.png" alt="Crussty logo" />
 
 

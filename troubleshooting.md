@@ -3,7 +3,7 @@ title: Troubleshooting
 nav_order: 9
 ---
 
-# Troubleshooting
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/log.svg" alt=""> Troubleshooting
 
 ## Boot fails / kernel won't start
 

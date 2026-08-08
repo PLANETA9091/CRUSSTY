@@ -185,3 +185,45 @@ code, pre, .site-title, .nav-list-link {
 .highlight .gp { color: #6AD3CD; }                 /* prompt */
 .highlight .gu { color: #B69EDE; }                 /* subheading */
 .highlight .w { color: #333333; }                  /* whitespace */
+
+/* --- plain text in code blocks: brighter so it is readable on #060606 --- */
+.highlight, .highlight .p, .highlight .ge, .highlight .nl, .highlight .nn {
+  color: #d6d6d6;
+}
+
+/* --- page header icon (inline img before h1) --- */
+.page-icon {
+  width: 30px;
+  height: 30px;
+  vertical-align: -7px;
+  margin-right: 10px;
+}
+
+/* --- sidebar nav icons (mc-dp-icons datapack set) --- */
+.site-nav .nav-list-link::before {
+  content: "";
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  margin-right: 7px;
+  vertical-align: -2px;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+}
+.site-nav a[href="/CRUSSTY/"]::before { background-image: url("/CRUSSTY/assets/images/icons/datapacks.svg"); }
+.site-nav a[href="/CRUSSTY/quickstart.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/bolt.svg"); }
+.site-nav a[href="/CRUSSTY/building.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/c.svg"); }
+.site-nav a[href="/CRUSSTY/modules.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/archive.svg"); }
+.site-nav a[href="/CRUSSTY/modules/manifest.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/json.svg"); }
+.site-nav a[href="/CRUSSTY/modules/zip.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/jar.svg"); }
+.site-nav a[href="/CRUSSTY/architecture.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/mcf_load.svg"); }
+.site-nav a[href="/CRUSSTY/platform.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/mcf.svg"); }
+.site-nav a[href="/CRUSSTY/sdk.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/src.svg"); }
+.site-nav a[href="/CRUSSTY/sdk/hooks.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/function.svg"); }
+.site-nav a[href="/CRUSSTY/sdk/classes.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/java.svg"); }
+.site-nav a[href="/CRUSSTY/sdk/main-thread.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/mcf_tick.svg"); }
+.site-nav a[href="/CRUSSTY/sdk/asm.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/assembly.svg"); }
+.site-nav a[href="/CRUSSTY/examples.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/rust.svg"); }
+.site-nav a[href="/CRUSSTY/other-languages.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/python.svg"); }
+.site-nav a[href="/CRUSSTY/troubleshooting.html"]::before { background-image: url("/CRUSSTY/assets/images/icons/log.svg"); }

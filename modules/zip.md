@@ -3,7 +3,7 @@ title: Distribution as zip archives
 nav_order: 2
 ---
 
-# Distribution as zip archives
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/jar.svg" alt=""> Distribution as zip archives
 
 Modules can be distributed as a single zip (or jar) file. The scan treats
 any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.

@@ -3,7 +3,7 @@ title: Architecture
 nav_order: 4
 ---
 
-# Architecture
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf_load.svg" alt=""> Architecture
 
 ## Layers
 

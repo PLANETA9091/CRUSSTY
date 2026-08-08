@@ -4,7 +4,7 @@ parent: Module SDK
 nav_order: 4
 ---
 
-# ASM weaving
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/assembly.svg" alt=""> ASM weaving
 
 `cplug-sdk::asm` provides prebuilt bytecode surgery with `wee_alloc`-free,
 zero-dependency ASM — a small hand-rolled bytecode writer tuned for the

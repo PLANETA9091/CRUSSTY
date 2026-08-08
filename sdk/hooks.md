@@ -4,7 +4,7 @@ parent: Module SDK
 nav_order: 1
 ---
 
-# Hooks
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/function.svg" alt=""> Hooks
 
 Hooks are the primary interface: a callback invoked by the runtime for
 every class load.

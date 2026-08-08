@@ -3,7 +3,7 @@ title: Modules
 nav_order: 3
 ---
 
-# Modules
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/archive.svg" alt=""> Modules
 
 A module is either a **directory** or a **zip archive** containing a
 `cplugin.json` manifest and an entry shared library. The scan is recursive:

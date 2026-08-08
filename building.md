@@ -3,7 +3,7 @@ title: Building an example module
 nav_order: 7
 ---
 
-# Building an example module
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/c.svg" alt=""> Building an example module
 
 This guide builds a working module — the `hello` proof module — from scratch,
 step by step. You will have it running on a server in about five minutes.
@@ -240,4 +240,3 @@ scan → load → hook → main-thread bridge → JNI.
 - [Other languages](other-languages.html) — the same module in C, C++, Python, JS (Go caveat)
 - [Troubleshooting](troubleshooting.html) — common issues
 
-<script src="/CRUSSTY/assets/js/custom.js"></script>

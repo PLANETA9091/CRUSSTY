@@ -3,7 +3,7 @@ title: Quick Start
 nav_order: 2
 ---
 
-# Quick Start
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/bolt.svg" alt=""> Quick Start
 
 ## Requirements
 

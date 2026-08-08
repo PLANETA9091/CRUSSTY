@@ -2,10 +2,12 @@
 (function () {
   "use strict";
 
+  if (window.__wsJsLoaded) return;
+  window.__wsJsLoaded = true;
+
   function addCopyButtons() {
-    document.querySelectorAll(".ws-code pre, pre").forEach(function (pre) {
-      if (pre.closest(".ws-tab")) return; // tabs get their own copy button
-      if (pre.parentElement && pre.parentElement.classList.contains("ws-code")) return;
+    document.querySelectorAll("pre").forEach(function (pre) {
+      if (pre.closest(".ws-code")) return;
       var box = document.createElement("div");
       box.className = "ws-code";
       var btn = document.createElement("button");
@@ -65,7 +67,15 @@
     });
   }
 
-  document.addEventListener("DOMContentLoaded", function () {
+  function ready(fn) {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", fn);
+    } else {
+      fn();
+    }
+  }
+
+  ready(function () {
     addCopyButtons();
     initTabs();
   });

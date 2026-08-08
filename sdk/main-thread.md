@@ -4,7 +4,7 @@ parent: Module SDK
 nav_order: 3
 ---
 
-# Main thread
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf_tick.svg" alt=""> Main thread
 
 Most kernel work must happen on the server main thread. The SDK delivers a
 `Runnable` there:

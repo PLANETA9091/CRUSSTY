@@ -3,7 +3,7 @@ title: Platform bricks
 nav_order: 5
 ---
 
-# Platform bricks
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf.svg" alt=""> Platform bricks
 
 The runtime ships twelve native primitives under `runtime/src/platform/`.
 They are the building blocks every module builds on: instead of reinventing

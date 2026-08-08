@@ -3,7 +3,7 @@ title: Module SDK
 nav_order: 6
 ---
 
-# Module SDK
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> Module SDK
 
 `cplug-sdk` is the comfort layer on top of `cplug-abi`. Modules declare it
 as a dependency and get: hook registration, class lookup across loaders,

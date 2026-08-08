@@ -4,7 +4,7 @@ nav_order: 1
 parent: Modules
 ---
 
-# Manifest (cplugin.json)
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/json.svg" alt=""> Manifest (cplugin.json)
 
 A JSON file at the top level of the module (directory or archive). Only `id`
 is required; the fields the runtime reads are:

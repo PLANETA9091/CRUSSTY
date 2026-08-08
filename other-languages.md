@@ -3,7 +3,7 @@ title: Other languages
 nav_order: 10
 ---
 
-# Writing modules in other languages
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/python.svg" alt=""> Writing modules in other languages
 
 A module is just a shared library exporting one C-ABI function. Nothing in
 the loader knows or cares whether that library came from Rust, C, C++, Zig,

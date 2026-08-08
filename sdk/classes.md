@@ -4,7 +4,7 @@ parent: Module SDK
 nav_order: 2
 ---
 
-# Classes & JNI
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/java.svg" alt=""> Classes & JNI
 
 ## find_class
 
