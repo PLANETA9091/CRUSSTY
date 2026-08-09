@@ -169,4 +169,10 @@ project alive.
 
 [![GitHub stars](https://img.shields.io/github/stars/PLANETA9091/CRUSSTY?style=flat-square&label=stars)](https://github.com/PLANETA9091/CRUSSTY/stargazers)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=PLANETA9091/CRUSSTY&type=Date)](https://star-history.com/#PLANETA9091/CRUSSTY&Date)
+<a href="https://www.star-history.com/?repos=PLANETA9091%2FCRUSSTY&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=PLANETA9091/CRUSSTY&type=date&theme=dark&legend=top-left&sealed_token=4j7fLgibkeg94EJ6EC2dGfYc0Fl3zQioHSbgYmerex0GvFibN3mDp31CoKqxKt91sFGtoD5n99YGxtZ2nVRPTmmcguyICx5RvferDxO2Wckvoy-Dp8REOXnzwAnRrVFAYRX5SEYz3cfmBppauWEeo_dvLQQlWW006JKFFKUjzcOqEBmbdjlRKKdSCYhY" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=PLANETA9091/CRUSSTY&type=date&legend=top-left&sealed_token=4j7fLgibkeg94EJ6EC2dGfYc0Fl3zQioHSbgYmerex0GvFibN3mDp31CoKqxKt91sFGtoD5n99YGxtZ2nVRPTmmcguyICx5RvferDxO2Wckvoy-Dp8REOXnzwAnRrVFAYRX5SEYz3cfmBppauWEeo_dvLQQlWW006JKFFKUjzcOqEBmbdjlRKKdSCYhY" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=PLANETA9091/CRUSSTY&type=date&legend=top-left&sealed_token=4j7fLgibkeg94EJ6EC2dGfYc0Fl3zQioHSbgYmerex0GvFibN3mDp31CoKqxKt91sFGtoD5n99YGxtZ2nVRPTmmcguyICx5RvferDxO2Wckvoy-Dp8REOXnzwAnRrVFAYRX5SEYz3cfmBppauWEeo_dvLQQlWW006JKFFKUjzcOqEBmbdjlRKKdSCYhY" />
+ </picture>
+</a>
