@@ -30,6 +30,13 @@ by exactly one concern; bricks do not depend on each other's internals.
 | telemetry | `telemetry.rs` | metrics registry + UDP export |
 | save_events | `save_events.rs` | world-save lifecycle hooks |
 
+Two files in `src/platform/` are not bricks: `c_bridge.rs` (the FFI table
+`CPlatformApi`) and `hooks.rs` (the four JVM hook classes the transform
+engine probes — `SchedulerHooks`, `StorageHooks`, `NetHooks`, `TickHook`,
+embedded `.class` bytes, registered at agent start). They sit next to the
+bricks because they depend on the same infra; the `pub use` list in
+`platform/mod.rs` re-exports only the twelve bricks.
+
 ## Example: events
 
 ```rust
