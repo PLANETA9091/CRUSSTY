@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.next.outputs.version }}
+      last: ${{ steps.next.outputs.last }}
+      commits: ${{ steps.next.outputs.commits }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +33,7 @@ jobs:
         shell: bash
         run: |
           LAST=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          echo "last=${LAST:-none}" >> "$GITHUB_OUTPUT"
           if [ -z "$LAST" ]; then
             echo "version=v2.0.1"; exit 0
           fi
@@ -45,7 +48,7 @@ jobs:
             PATCH=$((PATCH+1))
           fi
           echo "version=v$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
-          echo "commits=$COMMITS"
+          echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
 
   build:
     name: build release artifacts
@@ -94,7 +97,12 @@ jobs:
         with:
           tag_name: ${{ needs.detect.outputs.version }}
           name: Crussty ${{ needs.detect.outputs.version }}
-          generate_release_notes: true
+          body: |
+            ### What changed
+
+            ${{ needs.detect.outputs.commits }}
+
+            **Full Changelog**: https://github.com/PLANETA9091/CRUSSTY/compare/${{ needs.detect.outputs.last }}...${{ needs.detect.outputs.version }}
           files: |
             assets/launcher/launcher.jar
             assets/libcrussty_runtime.so
