@@ -1,9 +1,9 @@
-# CRUSSTY — native c-plugin platform (v2)
+# CRUSSTY — inject native code into your server jar
 
-CRUSSTY turns a Paper-compatible Minecraft server into a platform for
-**native c-plugins**: modules written in Rust, C, C++, Python or
-JavaScript that hook the server at the bytecode level through a JVMTI
-runtime — no JNI boilerplate, no plugin API locks.
+CRUSSTY is a **jar injector**: it drops a native runtime into any
+Paper-compatible server jar and runs modules written in Rust, C, C++,
+Python or JavaScript — hooking the server at the bytecode level. No plugin
+API locks, no JNI boilerplate, no `-agentpath`.
 
 > **Documentation:** [planeta9091.github.io/CRUSSTY](https://planeta9091.github.io/CRUSSTY/)
 > — quickstart, module API, SDK reference, other languages, troubleshooting.
