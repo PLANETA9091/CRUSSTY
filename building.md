@@ -3,7 +3,7 @@ title: Building a module (moved)
 nav_exclude: true
 ---
 
-# Building an example module
+# Building a module (moved)
 
 This guide moved into **Creating a module**:
 
