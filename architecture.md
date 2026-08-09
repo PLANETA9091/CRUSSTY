@@ -1,6 +1,6 @@
 ---
 title: Architecture
-nav_order: 4
+nav_order: 3
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf_load.svg" alt=""> Architecture
