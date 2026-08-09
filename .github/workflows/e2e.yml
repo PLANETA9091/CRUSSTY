@@ -20,6 +20,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless curl unzip
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # ubuntu-latest images default to Java 17; force the freshly
+          # installed JDK 21 on PATH (e2e.sh requires 21+).
+          echo "/usr/lib/jvm/java-21-openjdk-amd64/bin" >> "$GITHUB_PATH"
+          echo "JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64" >> "$GITHUB_ENV"
 
       - name: Unit tests (all crates)
         run: |
