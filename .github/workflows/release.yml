@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build runtime (release)
+        run: |
+          cargo build --release --manifest-path runtime/Cargo.toml
+          cp runtime/target/release/libcrussty_runtime.so .
+      - name: Build launcher.jar
+        run: |
+          mkdir -p launcher/out
+          javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java
+          jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            launcher/launcher.jar
+            libcrussty_runtime.so
+            run.sh
+            run.bat
+          if-no-files-found: error
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: assets
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            assets/launcher/launcher.jar
+            assets/libcrussty_runtime.so
+            assets/run.sh
+            assets/run.bat
+          fail_on_unmatched_files: false
