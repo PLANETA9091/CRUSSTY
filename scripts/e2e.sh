@@ -89,7 +89,11 @@ for id in $MODULES; do
     [ -f "$m/cplugin.json" ] || fail "module $id has no cplugin.json"
     log "build + install module: $id"
     cargo build --manifest-path "$m/Cargo.toml" || fail "cargo build $id"
-    cp "$m/target/debug/lib$id.so" "$m/lib$id.so"
+    # Idempotent install: cargo may leave the artifact hardlinked to the
+    # installed copy (same inode) — copying it onto itself would fail.
+    if ! [ "$m/target/debug/lib$id.so" -ef "$m/lib$id.so" ]; then
+        cp "$m/target/debug/lib$id.so" "$m/lib$id.so"
+    fi
 done
 
 # --------------------------------------------------------------- 4. boot
@@ -144,11 +148,16 @@ m="$REPO/modules/$RELOAD_ID"
 
 # Honest reload: the .so the server has dlopened must change on disk (new
 # inode) BEFORE the trigger, exactly like a developer rebuilding a module.
+# Force a real recompile: cargo's up-to-date check can no-op even when its
+# output got replaced by our previous install (artifacts end up hardlinked
+# to the installed copy), so the artifact is removed first.
 OLD_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
 touch "$m/src/lib.rs"
+rm -f "$m/target/debug/lib$RELOAD_ID.so"
 cargo build --manifest-path "$m/Cargo.toml" || fail "rebuild $RELOAD_ID for reload"
-# Replace via mv (new directory entry): an in-place cp would keep the inode
-# and the server's dlopen cache could return the same mapping.
+# Replace via mv (new directory entry): guaranteed new inode — in-place cp
+# would keep the inode and the server's dlopen cache could return the same
+# mapping.
 mv -f "$m/target/debug/lib$RELOAD_ID.so" "$m/lib$RELOAD_ID.so"
 NEW_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
 if [ "$OLD_INODE" = "$NEW_INODE" ]; then
@@ -192,6 +201,63 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
+# -------------------------------------------- 7. single-jar distribution path
+stage "7. single-jar boot (java -jar, no -agentpath) + reload"
+# README's recommended distribution: dist/crussty-<ver>.jar extracts the
+# runtime + modules through Boot.java and loads them via JNI_OnLoad. The
+# pgrep matcher differs from stage 5 (jar is named crussty-*.jar, not
+# purpur-*.jar), so this stage is the only automated coverage of that path.
+SJ_PORT=$((SERVER_PORT + 1))
+bash scripts/build-single-jar.sh "$PURPUR_VERSION" >/dev/null 2>&1 \
+    || fail "build-single-jar.sh failed"
+SJ_DIR="$SERIAL_DIR/sjrun"
+mkdir -p "$SJ_DIR"
+SJ_JAR="$REPO/dist/crussty-$PURPUR_VERSION.jar"
+log "booting $SJ_JAR on port $SJ_PORT (workdir $SJ_DIR)"
+
+printf 'eula=true\n' > "$SJ_DIR/eula.txt"
+( cd "$SJ_DIR" && $SETSID java -Xmx2G -jar "$SJ_JAR" --nogui --port "$SJ_PORT" \
+    > sj.log 2>&1 < /dev/null ) &
+SJ_LAUNCHER_PID=$!
+trap 'kill -TERM -- "$SJ_LAUNCHER_PID" 2>/dev/null || true; cleanup' EXIT
+
+SJ_LOG="$SJ_DIR/sj.log"
+found_sj_pipeline=0; found_sj_done=0
+SJ_DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+while :; do
+    [ -f "$SJ_LOG" ] || { sleep 2; continue; }
+    grep -q "pipeline ready" "$SJ_LOG" && found_sj_pipeline=1
+    grep -q "Done (" "$SJ_LOG" && found_sj_done=1
+    [ "$found_sj_pipeline" -eq 1 ] && [ "$found_sj_done" -eq 1 ] && break
+    if ! kill -0 "$SJ_LAUNCHER_PID" 2>/dev/null; then
+        fail "single-jar exited early; tail: $(tail -c 1500 "$SJ_LOG" 2>/dev/null)"
+    fi
+    if [ "$(date +%s)" -ge "$SJ_DEADLINE" ]; then
+        fail "single-jar timeout (pipeline=$found_sj_pipeline done=$found_sj_done); tail: $(tail -c 2500 "$SJ_LOG" 2>/dev/null)"
+    fi
+    sleep "$POLL_SEC"
+done
+log "single-jar boot ok: pipeline=$found_sj_pipeline done=$found_sj_done"
+
+SJ_PID="$(pgrep -f "crussty-$PURPUR_VERSION.jar.*--port $SJ_PORT" | head -1 || true)"
+[ -n "$SJ_PID" ] || fail "no single-jar server pid on port $SJ_PORT"
+kill -USR1 "$SJ_PID" 2>/dev/null || fail "kill -USR1 $SJ_PID failed"
+log "sent SIGUSR1 to $SJ_PID; waiting for reload + hook purge"
+
+found_sj_reload=0; found_sj_purge=0
+SJ_RDEADLINE=$(( $(date +%s) + 40 ))
+while [ "$(date +%s)" -lt "$SJ_RDEADLINE" ]; do
+    grep -q "reloaded (dlopen'd fresh" "$SJ_LOG" 2>/dev/null && found_sj_reload=1
+    grep -q "hook purge" "$SJ_LOG" 2>/dev/null && found_sj_purge=1
+    if [ "$found_sj_reload" -eq 1 ] && [ "$found_sj_purge" -eq 1 ]; then break; fi
+    sleep 2
+done
+kill -0 "$SJ_PID" 2>/dev/null || fail "single-jar server died during hot-reload (reload=$found_sj_reload purge=$found_sj_purge)"
+[ "$found_sj_reload" -eq 1 ] || fail "single-jar hot-reload never completed (reload=$found_sj_reload purge=$found_sj_purge)"
+[ "$found_sj_purge" -eq 1 ] || fail "single-jar stale hooks not purged (reload=$found_sj_reload purge=$found_sj_purge)"
+log "single-jar hot-reload ok: reloaded=$found_sj_reload hook-purge=$found_sj_purge"
+kill -TERM -- "$SJ_PID" 2>/dev/null || true
+
 echo
 echo "================ E2E PASS ================"
 echo "  kernel:    purpur-$PURPUR_VERSION"
@@ -199,5 +265,6 @@ echo "  modules:   $MODULES"
 echo "  pipeline:  ready"
 echo "  hello:     from native c-plugin"
 echo "  crussty:   $([ "$found_native" -eq 1 ] && echo "native surface live" || echo "NOT verified (check modules/crussty/native/)")"
+echo "  single-jar: boot + hot-reload ok"
 echo "  boot time: $((SECONDS - START))s"
 exit 0
