@@ -8,10 +8,16 @@ target/
 !modules/*/tests/**
 versions/
 /world/
+world_nether/
+world_the_end/
 logs/
 crash-reports/
 cache/
 config/
+plugins/
+purpur.yml
+spigot.yml
+version_history.json
 launcher/out/
 libcrussty_runtime.so
 hs_err_pid*.log
