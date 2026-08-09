@@ -2,7 +2,7 @@
 // embedded via a QuickJS shim (quickjs-ng).
 // Build:  cc -shared -fPIC -O2 -I/usr/include $(pkg-config --cflags)
 //         -o lib__NAME__.so shim.c $(pkg-config --libs qjs)
-// Deploy: lib__NAME__.so + cplugin.json { "id": "__NAME__" } in modules/
+// Deploy: lib__NAME__.so + module.json { "id": "__NAME__" } in modules/
 //
 // The runtime dlopens this .so and calls cplugin_init. The shim embeds
 // QuickJS, evaluates __NAME__.js, and calls its exported on_class_load

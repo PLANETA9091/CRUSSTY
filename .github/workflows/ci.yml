@@ -37,8 +37,12 @@ jobs:
           java-version: "21"
       - name: Rebuild helpers
         run: bash scripts/build-helpers.sh
-      - name: JNI bridge table in sync with manifest
-        run: python3 scripts/gen_crussty_table.py render --check
+      - name: JNI bridge table in sync with manifest (c-crussty)
+        run: |
+          git clone --depth 1 https://github.com/PLANETA9091/c-crussty.git /tmp/c-crussty
+          python3 scripts/gen_crussty_table.py render --check \
+            --manifest /tmp/c-crussty/native/JNI_EXPORTS.manifest \
+            --out /tmp/c-crussty/src/jni_table.rs
       - name: Verify committed artifacts unchanged
         run: |
           if ! git diff --quiet --exit-code cplug-sdk/asm-build runtime/build/hooks; then
@@ -69,7 +73,7 @@ jobs:
       - name: Install toolchains
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc g++ python3 golang-go
+          sudo apt-get install -y -qq gcc g++ python3 python3-dev golang-go
       - name: Clone module examples
         run: git clone --depth 1 https://github.com/PLANETA9091/examples-multilang.git /tmp/examples-multilang
       - name: Build every language example

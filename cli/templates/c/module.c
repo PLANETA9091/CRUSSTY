@@ -2,7 +2,7 @@
 //
 // Build:  gcc -shared -fPIC -O2 -I../../cplug-sdk-c/include \
 //             -o lib__NAME__.so hello.c
-// Deploy: lib__NAME__.so  +  cplugin.json { "id": "__NAME__" }  in modules/
+// Deploy: lib__NAME__.so  +  module.json { "id": "__NAME__" }  in modules/
 //
 // Registers a class-file hook; on every kernel class load after boot it logs
 // once via stderr (the JVM forwards stderr to the server console). Also

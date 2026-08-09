@@ -1,7 +1,7 @@
 // __NAME__ — a Crussty module written in Go (cgo, c-shared).
 //
 // Build:  go build -buildmode=c-shared -o lib__NAME__.so .
-// Deploy: lib__NAME__.so  +  cplugin.json { "id": "__NAME__" }  in modules/
+// Deploy: lib__NAME__.so  +  module.json { "id": "__NAME__" }  in modules/
 //
 // Go exports cplugin_init via //export, so cgo emits an unmangled C symbol.
 // Cgo bakes its own runtime into the .so, which the *host* (the JVM

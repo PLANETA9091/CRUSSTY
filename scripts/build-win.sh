@@ -1,34 +1,51 @@
 #!/usr/bin/env bash
 # Cross-compile the v2 artifacts for Windows (x86_64-pc-windows-msvc):
-#   agent libcrussty_runtime.so -> crussty_runtime.dll
+#   runtime libcrussty_runtime.so -> crussty_runtime.dll
 #   modules lib<id>.so     -> <id>.dll
-# Run from v2/ (or any dir; paths are relative to this script).
+# Modules are built from their own repositories (convention: c-<id>),
+# vendored cplug-abi/cplug-sdk so they build standalone; clones land in
+# $MODULE_CLONE_DIR (default: ./modules-src — gitignored).
 # Requires: rustup target add x86_64-pc-windows-msvc
 #           (MSVC toolchain with `link.exe` on PATH — e.g. x64 Native Tools prompt).
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 TARGET=x86_64-pc-windows-msvc
 CARGO="${CARGO:-cargo}"
 TOOLCHAIN="${RUSTUP_TOOLCHAIN:-+stable}"
+CLONE_DIR="${MODULE_CLONE_DIR:-modules-src}"
+mkdir -p dist "$CLONE_DIR"
 
 rustup target list --installed | grep -q "$TARGET" || {
     echo "missing target $TARGET — run: rustup target add $TARGET" >&2
     exit 1
 }
 
-$CARGO "$TOOLCHAIN" build --release --target "$TARGET" --manifest-path agent/Cargo.toml
-$CARGO "$TOOLCHAIN" build --release --target "$TARGET" --manifest-path modules/crussty/Cargo.toml
-$CARGO "$TOOLCHAIN" build --release --target "$TARGET" --manifest-path modules/dist/Cargo.toml
-$CARGO "$TOOLCHAIN" build --release --target "$TARGET" --manifest-path modules/hello/Cargo.toml
+clone_module() { # repo dir
+    local repo="$1" dir="$2"
+    [ -d "$CLONE_DIR/$dir/.git" ] || git clone --depth 1 \
+        "https://github.com/PLANETA9091/$repo.git" "$CLONE_DIR/$dir"
+}
 
-cp "agent/target/$TARGET/release/crussty_runtime.dll" ./crussty_runtime.dll
-cp "modules/crussty/target/$TARGET/release/crussty.dll" modules/crussty/crussty.dll
-cp "modules/dist/target/$TARGET/release/dist.dll" modules/dist/dist.dll
-cp "modules/hello/target/$TARGET/release/hello.dll" modules/hello/hello.dll
+$CARGO "$TOOLCHAIN" build --release --target "$TARGET" --manifest-path runtime/Cargo.toml
+
+MODULES=(
+    "c-crussty:crussty"
+    "c-dist:dist"
+    "c-hello:hello"
+)
+for spec in "${MODULES[@]}"; do
+    repo="${spec%%:*}"
+    id="${spec##*:}"
+    clone_module "$repo" "$id"
+    $CARGO "$TOOLCHAIN" build --release --target "$TARGET" \
+        --manifest-path "$CLONE_DIR/$id/Cargo.toml"
+    mkdir -p "modules/$id"
+    cp "$CLONE_DIR/$id/target/$TARGET/release/$id.dll" "modules/$id/$id.dll"
+done
 
 # The Crussty CE native libs are also Windows .dll builds — drop them next to
-# the module like on Linux (see modules/crussty/native/).
+# the module like on Linux (see c-crussty/native/).
 mkdir -p modules/crussty/native
 for name in paper_native_jni paper_native_chunk_encode_jni; do
     src="crussty-native-windows/$name.dll"

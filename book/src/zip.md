@@ -5,7 +5,7 @@ any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 
 ## How extraction works
 
-1. The runtime opens the archive and peeks for `cplugin.json` at the top
+1. The runtime opens the archive and peeks for `module.json` at the top
    level. Archives **without a manifest are ignored** (they are ordinary
    data archives).
 2. The archive is extracted into the cache directory:

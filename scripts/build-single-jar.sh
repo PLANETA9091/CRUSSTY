@@ -3,7 +3,7 @@
 #   java -Xmx2G -jar crussty-1.21.10.jar --nogui
 # The jar bundles: paperclip kernel (unmodified), the native runtime
 # (libcrussty_runtime.so), and every published module bundle from the catalog
-# (cplugin.json + lib*.so + native deps) — extracted to ./crussty/ on first
+# (module.json + lib*.so + native deps) — extracted to ./crussty/ on first
 # boot by dev.dist.launcher.Boot, which then loads the runtime via JNI_OnLoad
 # (no -agentpath needed) and starts the kernel.
 set -euo pipefail

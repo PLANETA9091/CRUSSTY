@@ -40,7 +40,7 @@ signature, and JNI bindings for your language.
 ## Verified examples (`examples-multilang/`)
 
 Each of `c`, `cpp`, `python`, `js` ships a `build.sh` that links against
-`../../cplug-abi/cplug-abi.h`, a `cplugin.json`, and a module body. All four
+`../../cplug-abi/cplug-abi.h`, a `module.json`, and a module body. All four
 were exercised end-to-end on a live Purpur 1.21.10 server: the runtime loads
 the four `.so`s, and every class load fires all four hooks (16,000+ hook
 invocations per module per boot with no errors). The Go module additionally
@@ -52,7 +52,7 @@ Shared mechanics every shim needs:
 - **Class-name bytes**: the JVM hands the hook a name buffer that is **not NUL-terminated** after the name — copy the printable-ASCII prefix into your own buffer before handing it to your runtime (C/C++ can print it raw; Python/JS must bound it).
 - **Threads**: hooks run on arbitrary JVM class-load threads, possibly re-entrantly (a nested class can load inside another class's hook). Python survives this because the GIL is recursive; a JS shim needs a **recursive** mutex around the interpreter, and the Python shim must `PyEval_SaveThread()` after `Py_Initialize()` — otherwise the init thread keeps the GIL forever and the first hook on another thread deadlocks.
 - **Interpreter startup**: `Py_Initialize()` and `JS_NewRuntime()` are called once in `cplugin_init`; QuickJS needs `JS_SetMaxStackSize(rt, 0)` because its default stack bookkeeping misfires on deep JVM stacks.
-- **Entry resolution**: the runtime derives the module library name from the module id (`lib<id>.so`) unless `cplugin.json` sets `"main"`.
+- **Entry resolution**: the runtime derives the module library name from the module id (`lib<id>.so`) unless `module.json` sets `"main"`.
 
 ## The shared-runtime gotcha
 

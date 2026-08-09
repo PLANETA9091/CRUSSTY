@@ -122,7 +122,7 @@ for id in $MODULES; do
     git clone --depth 1 "https://github.com/$repo.git" "$src" >/dev/null 2>&1 \
         || fail "cannot clone $repo"
     [ -f "$src/Cargo.toml" ] || fail "module $id has no Cargo.toml in $repo"
-    [ -f "$src/cplugin.json" ] || fail "module $id has no cplugin.json"
+    [ -f "$src/module.json" ] || fail "module $id has no module.json"
     cargo build --manifest-path "$src/Cargo.toml" || fail "cargo build $id"
     # The [lib] name may differ from the module id (cargo forbids hyphens in
     # library target names, while manifest ids may carry them), so resolve the
@@ -130,7 +130,7 @@ for id in $MODULES; do
     LIB_NAME="$(sed -n '/^\[lib\]/,/^\[/p' "$src/Cargo.toml" | sed -n 's/^name *= *"\(.*\)"/\1/p' | head -1)"
     LIB_NAME="${LIB_NAME:-$id}"
     mkdir -p "$REPO/modules/$id"
-    cp "$src/cplugin.json" "$REPO/modules/$id/"
+    cp "$src/module.json" "$REPO/modules/$id/"
     cp "$src/target/debug/lib$LIB_NAME.so" "$REPO/modules/$id/lib$id.so"
     # bundled native deps (e.g. c-crussty/native) are part of the module
     [ -d "$src/native" ] && cp -r "$src/native" "$REPO/modules/$id/"

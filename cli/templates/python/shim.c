@@ -3,7 +3,7 @@
 //
 // Build:  cc -shared -fPIC -O2 $(python3-config --cflags)
 //         -o lib__NAME__.so shim.c $(python3-config --embed --ldflags)
-// Deploy: lib__NAME__.so  +  cplugin.json { "id": "__NAME__" }  in modules/
+// Deploy: lib__NAME__.so  +  module.json { "id": "__NAME__" }  in modules/
 //
 // The runtime dlopens this .so and calls cplugin_init. The shim embeds a
 // CPython interpreter and defers hook logic to __NAME__.py — so the

@@ -9,7 +9,7 @@ platform.
 git clone https://github.com/PLANETA9091/c-hello modules/hello
 ```
 
-- `cplugin.json` manifest (`id: hello`), entry `libhello.so`
+- `module.json` manifest (`id: hello`), entry `libhello.so`
 - `hooks::register("org/bukkit/Bukkit")` — pipeline participation
 - `on_kernel_ready` → `run_on_main_thread` → JNI `Bukkit.getLogger().info`
 - Expected log: `hello from native c-plugin (v2 pipeline alive)`
@@ -57,7 +57,7 @@ next to the manifest, and the runtime picks it up on the next boot.
 
 The `examples-multilang/` tree (in the platform repo) demonstrates the
 **non-Rust** module path: `c`, `cpp`, `python` and `js` each contain a
-`shim.c` exporting the C-ABI `cplugin_init`, a `build.sh`, a `cplugin.json`
+`shim.c` exporting the C-ABI `cplugin_init`, a `build.sh`, a `module.json`
 and a module body (Python/JS shims embed CPython/QuickJS). Go builds and
 passes a harness but crashes the JVM in-process — see
 [other-languages.md](other-languages.md).

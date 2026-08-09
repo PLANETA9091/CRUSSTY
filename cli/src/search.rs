@@ -1,56 +1,85 @@
 use crate::lib;
 use serde_json::Value;
 
-pub fn search(query: &str) -> i32 {
+pub struct Hit {
+    pub full: String,
+    pub version: Option<String>,
+    pub stars: u64,
+    pub desc: String,
+}
+
+pub fn fetch_hits(query: &str) -> Vec<Hit> {
     let token = std::env::var("GITHUB_TOKEN")
         .or_else(|_| std::env::var("GH_TOKEN"))
         .ok();
     let hits: Vec<Value> = if let Some(token) = &token {
         match code_search(query, token) {
             Some(v) => v,
-            None => {
-                eprintln!("crussty: code search failed, falling back to repo search");
-                repo_search(query)
-            }
+            None => repo_search(query),
         }
     } else {
         repo_search(query)
     };
     if hits.is_empty() {
-        println!("crussty: no modules found for '{query}'");
-        return 0;
+        return Vec::new();
     }
     let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<Hit> = Vec::new();
     for item in &hits {
-        let full = item.get("full_name").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+        let full = item
+            .get("full_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
         if seen.contains(&full) {
             continue;
         }
         seen.push(full.clone());
-        let stars = item.get("stargazers_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        let stars = item
+            .get("stargazers_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
         let desc = item
             .get("description")
             .and_then(|x| x.as_str())
             .unwrap_or("")
-            .chars()
-            .take(80)
-            .collect::<String>();
+            .trim()
+            .to_string();
         let (owner, repo) = split_repo(&full);
         match fetch_manifest(owner, repo) {
-            Some(m) => {
-                let id = m.get("id").and_then(|x| x.as_str()).unwrap_or("");
-                let ver = m.get("version").and_then(|x| x.as_str()).unwrap_or("?");
-                println!(
-                    "  {:<28} v{:<7} \u{2605} {:<4} {} ({})",
-                    full, ver, stars, desc, id
-                );
-            }
-            None => {
-                println!(
-                    "  {:<28} \u{2605} {:<4} {} (no cplugin.json)",
-                    full, stars, desc
-                );
-            }
+            Some(m) => out.push(Hit {
+                version: m.get("version").and_then(|x| x.as_str()).map(String::from),
+                full,
+                stars,
+                desc,
+            }),
+            None => out.push(Hit {
+                version: None,
+                full,
+                stars,
+                desc,
+            }),
+        }
+    }
+    out
+}
+
+pub fn search(query: &str) -> i32 {
+    let hits = fetch_hits(query);
+    if hits.is_empty() {
+        println!("crussty: no modules found for '{query}'");
+        return 0;
+    }
+    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    let max_desc = (cols as usize).saturating_sub(6).max(40);
+    for h in &hits {
+        match &h.version {
+            Some(ver) => println!("{}  v{ver}  \u{2605} {}", h.full, h.stars),
+            None => println!("{}  \u{2605} {}  (no module.json)", h.full, h.stars),
+        }
+        let desc = h.desc.chars().take(max_desc).collect::<String>();
+        if !desc.is_empty() {
+            println!("    {desc}");
         }
     }
     println!();
@@ -58,9 +87,9 @@ pub fn search(query: &str) -> i32 {
     0
 }
 
-/// GitHub code search over cplugin.json contents — needs a token.
+/// GitHub code search over module.json contents — needs a token.
 fn code_search(query: &str, token: &str) -> Option<Vec<Value>> {
-    let q = format!("{} filename:cplugin.json", urlencode(query));
+    let q = format!("{} filename:module.json OR filename:cplugin.json", urlencode(query));
     let url = format!(
         "https://api.github.com/search/code?q={q}&per_page=10"
     );
@@ -129,7 +158,7 @@ fn repo_search(query: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Install straight from a GitHub repo: reads cplugin.json (main/master),
+/// Install straight from a GitHub repo: reads module.json (main/master),
 /// then downloads a platform bundle from the repo's releases if present.
 pub fn install_repo(repo: &str) -> i32 {
     let (owner, name) = split_repo(repo);
@@ -140,7 +169,7 @@ pub fn install_repo(repo: &str) -> i32 {
     let manifest = match fetch_manifest(owner, name) {
         Some(m) => m,
         None => {
-            eprintln!("crussty: no cplugin.json in {owner}/{name}");
+            eprintln!("crussty: no module.json in {owner}/{name}");
             return 1;
         }
     };
@@ -225,11 +254,13 @@ fn find_bundle(owner: &str, repo: &str, id: &str, platform: &str) -> Option<Stri
 
 fn fetch_manifest(owner: &str, repo: &str) -> Option<Value> {
     for branch in ["main", "master"] {
-        let url = format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/cplugin.json");
-        if let Ok(resp) = lib::http().get(&url).call() {
-            if let Ok(text) = resp.into_body().read_to_string() {
-                if let Ok(v) = serde_json::from_str(&text) {
-                    return Some(v);
+        for name in ["module.json", "cplugin.json"] {
+            let url = format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{name}");
+            if let Ok(resp) = lib::http().get(&url).call() {
+                if let Ok(text) = resp.into_body().read_to_string() {
+                    if let Ok(v) = serde_json::from_str(&text) {
+                        return Some(v);
+                    }
                 }
             }
         }
@@ -237,7 +268,7 @@ fn fetch_manifest(owner: &str, repo: &str) -> Option<Value> {
     fetch_monorepo_manifest(owner, repo)
 }
 
-/// Monorepo layout: cplugin.json under modules/<name>/.
+/// Monorepo layout: module.json under modules/<name>/.
 fn fetch_monorepo_manifest(owner: &str, repo: &str) -> Option<Value> {
     for branch in ["main", "master"] {
         let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/modules?ref={branch}");
@@ -264,13 +295,15 @@ fn fetch_monorepo_manifest(owner: &str, repo: &str) -> Option<Value> {
             .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("dir"))
             .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from));
         for dir in dirs {
-            let url = format!(
-                "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/modules/{dir}/cplugin.json"
-            );
-            if let Ok(resp) = lib::http().get(&url).call() {
-                if let Ok(text) = resp.into_body().read_to_string() {
-                    if let Ok(m) = serde_json::from_str(&text) {
-                        return Some(m);
+            for name in ["module.json", "cplugin.json"] {
+                let url = format!(
+                    "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/modules/{dir}/{name}"
+                );
+                if let Ok(resp) = lib::http().get(&url).call() {
+                    if let Ok(text) = resp.into_body().read_to_string() {
+                        if let Ok(m) = serde_json::from_str(&text) {
+                            return Some(m);
+                        }
                     }
                 }
             }

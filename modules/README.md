@@ -2,7 +2,7 @@
 
 Crussty modules live in their own repositories (convention: `c-<id>`); this
 directory is only the install location on a running server (the launcher
-loads every subdirectory that carries a `cplugin.json`).
+loads every subdirectory that carries a `module.json`).
 
 Published modules (installable via `crussty install <id>` from the catalog
 `PLANETA9091/crussty-catalog`):

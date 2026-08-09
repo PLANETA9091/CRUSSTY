@@ -2,7 +2,7 @@
 //
 // Build:  g++ -shared -fPIC -O2 -std=c++17 -I../../cplug-sdk-c/include \
 //             -o lib__NAME__.so hello.cpp
-// Deploy: lib__NAME__.so  +  cplugin.json { "id": "__NAME__" }  in modules/
+// Deploy: lib__NAME__.so  +  module.json { "id": "__NAME__" }  in modules/
 //
 // Same ABI as the C module; C++ lets us keep state in a small struct. The
 // extern "C" guard keeps the exported symbol unmangled. Also exercises the

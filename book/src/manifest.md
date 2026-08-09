@@ -1,4 +1,4 @@
-# Manifest (cplugin.json)
+# Manifest (module.json)
 
 A JSON file at the top level of the module (directory or archive). Only `id`
 matters to the platform; the rest is metadata for tooling.

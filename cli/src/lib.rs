@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 pub const RUNTIME_CRATE: &str = "libcrussty_runtime.so";
 pub const CONFIG_NAME: &str = "crussty.toml";
+pub const MANIFEST: &str = "module.json";
+pub const LEGACY_MANIFEST: &str = "cplugin.json";
 
 pub fn http() -> ureq::Agent {
     ureq::Agent::config_builder().build().into()
@@ -23,11 +25,24 @@ pub fn server_modules_dir(server: &Path) -> PathBuf {
     server.join("modules")
 }
 
+/// module.json in `dir`, falling back to the legacy cplugin.json.
+pub fn manifest_path(dir: &Path) -> PathBuf {
+    let new = dir.join(MANIFEST);
+    if new.is_file() {
+        return new;
+    }
+    let old = dir.join(LEGACY_MANIFEST);
+    if old.is_file() {
+        return old;
+    }
+    new
+}
+
 pub fn is_plugin_dir(server: &Path, name: &str) -> bool {
     if name.ends_with(".disabled") || name.ends_with(".x") {
         return false;
     }
-    let manifest = server_modules_dir(server).join(name).join("cplugin.json");
+    let manifest = manifest_path(&server_modules_dir(server).join(name));
     let lib = entry_for(server, name);
     manifest.is_file() && lib.exists()
 }
@@ -36,7 +51,7 @@ pub fn is_plugin_dir(server: &Path, name: &str) -> bool {
 /// lib<id>.so (id with any status suffix stripped).
 pub fn entry_for(server: &Path, name: &str) -> PathBuf {
     let dir = server_modules_dir(server).join(name);
-    let manifest_path = dir.join("cplugin.json");
+    let manifest_path = manifest_path(&dir);
     if let Ok(text) = std::fs::read_to_string(&manifest_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(main) = v.get("main").and_then(|m| m.as_str()) {

@@ -55,7 +55,7 @@ crussty-linux-x64 reload    # hot-reload all modules (no server restart)
 ## What is a module?
 
 A module is a directory (or `.zip`/`.jar` archive) with a
-`cplugin.json` manifest and an entry library exporting
+`module.json` manifest and an entry library exporting
 `cplugin_init(api, vm, options)`. It can hook class loading, patch
 bytecode, run code on the server's main thread, and use the platform's
 twelve native bricks (events, storage, hot reload, …) — see

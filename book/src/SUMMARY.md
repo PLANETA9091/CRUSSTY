@@ -3,7 +3,7 @@
 - [Introduction](./intro.md)
 - [Quick Start](./quickstart.md)
 - [Modules](./modules.md)
-  - [Manifest (cplugin.json)](./manifest.md)
+  - [Manifest (module.json)](./manifest.md)
   - [Distribution as zip archives](./zip.md)
 - [Architecture](./architecture.md)
 - [Platform bricks](./platform.md)

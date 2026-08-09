@@ -1,6 +1,6 @@
 //! Convention (matches how the rest of the world ships plugins — LV2 bundles,
 //! npm/Node packages, VST3 bundles, Mattermost plugins): a plugin is a
-//! DIRECTORY containing a `cplugin.json` manifest. The manifest names the
+//! DIRECTORY containing a `module.json` manifest. The manifest names the
 //! entry library in `main` (path relative to the manifest, like package.json
 //! `main` / LV2 `lv2:binary`); when absent it defaults to the platform
 //! cdylib name for the plugin id (`lib<id>.so` / `lib<id>.dylib` /
@@ -34,13 +34,13 @@ pub struct CPlugin {
 }
 
 /// Scan `root` recursively for plugins. Plugins are directories containing a
-/// `cplugin.json` manifest; the manifest's `main` field names the entry
+/// `module.json` manifest; the manifest's `main` field names the entry
 /// library relative to that directory (default: the platform cdylib name for
 /// the plugin id, e.g. `lib<id>.so` on Linux, `<id>.dll` on Windows). Bundled
 /// native libraries without a manifest are never plugins. `.zip` / `.jar`
 /// archives anywhere under `root` are extracted to a content-addressed cache
 /// dir under the system temp dir and scanned as plugins when they carry a
-/// top-level `cplugin.json`. Anything (file or dir) named `*.disabled` (Paper
+/// top-level `module.json`. Anything (file or dir) named `*.disabled` (Paper
 /// convention) or `*.x` (ad-hoc park: `mv cells cells.x`) is skipped.
 pub fn scan(root: &Path) -> Vec<CPlugin> {
     let mut found = Vec::new();
@@ -54,7 +54,7 @@ pub fn scan(root: &Path) -> Vec<CPlugin> {
                 }
             }
             None => eprintln!(
-                "[crussty-runtime] archive {} is not a plugin (no top-level cplugin.json or rejected)",
+                "[crussty-runtime] archive {} is not a plugin (no top-level module.json or rejected)",
                 zip_path.display()
             ),
         }
@@ -126,7 +126,7 @@ fn walk_dir(dir: &Path, out: &mut Vec<CPlugin>, zips: &mut Vec<PathBuf>) {
             zips.push(path);
             continue;
         }
-        if name == "cplugin.json" {
+        if name == "module.json" {
             if let Some(p) = load_manifest(&path) {
                 out.push(p);
             }
@@ -209,17 +209,17 @@ const MAX_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Extract `zip_path` to `temp_dir()/cplug-cache/<stem>-<content-hash>/` when
-/// not already cached, then return the path of its top-level `cplugin.json`
+/// not already cached, then return the path of its top-level `module.json`
 /// if the archive actually is a plugin. Re-extraction only happens when the
 /// content changes (the hash is part of the dir name). Archives without a
-/// top-level `cplugin.json` are not plugins and are never extracted/cached.
+/// top-level `module.json` are not plugins and are never extracted/cached.
 fn extract_zip_plugin(zip_path: &Path) -> Option<PathBuf> {
     let bytes = fs::read(zip_path).ok()?;
     // Peek first: a manifest-less archive (docs, build output) must not leave
     // a cache dir behind.
     let manifest_ok = {
         let mut peek = zip::ZipArchive::new(Cursor::new(&bytes)).ok()?;
-        peek.by_name("cplugin.json")
+        peek.by_name("module.json")
             .is_ok_and(|e| e.is_file())
     };
     if !manifest_ok {
@@ -245,7 +245,7 @@ fn extract_zip_plugin(zip_path: &Path) -> Option<PathBuf> {
             }
         }
     }
-    let manifest = dir.join("cplugin.json");
+    let manifest = dir.join("module.json");
     manifest.is_file().then_some(manifest)
 }
 
@@ -334,16 +334,16 @@ mod tests {
         fs::create_dir_all(dir.join("liba")).unwrap();
         fs::write(dir.join("cplug.disabled"), b"").unwrap();
         fs::write(
-            dir.join("dist/cplugin.json"),
+            dir.join("dist/module.json"),
             r#"{"id":"dist","main":"libdist_core.so","dependencies":["libb"]}"#,
         )
         .unwrap();
         fs::write(dir.join("dist/libdist_core.so"), b"x").unwrap();
         fs::write(dir.join("liba.so"), b"x").unwrap();
         fs::write(dir.join("liba.disabled"), b"x").unwrap();
-        fs::write(dir.join("liba/cplugin.json"), r#"{"id":"liba"}"#).unwrap();
+        fs::write(dir.join("liba/module.json"), r#"{"id":"liba"}"#).unwrap();
         fs::write(dir.join("liba/libliba.so"), b"x").unwrap();
-        fs::write(dir.join("group/cplugin.json"), r#"{"id":"libb"}"#).unwrap();
+        fs::write(dir.join("group/module.json"), r#"{"id":"libb"}"#).unwrap();
         fs::write(dir.join("group/liblibb.so"), b"x").unwrap();
         fs::write(dir.join("group/readme.txt"), b"ignore").unwrap();
         // bundled native libs without a manifest must NOT be scanned
@@ -351,11 +351,11 @@ mod tests {
         fs::write(dir.join("group/vendor/libpaper_native_jni.so"), b"x").unwrap();
         // default entry lib<id>.so missing -> whole plugin skipped
         fs::create_dir_all(dir.join("empty")).unwrap();
-        fs::write(dir.join("empty/cplugin.json"), r#"{"id":"empty"}"#).unwrap();
+        fs::write(dir.join("empty/module.json"), r#"{"id":"empty"}"#).unwrap();
         // *.x parked plugins are skipped too (ad-hoc disable)
         fs::create_dir_all(dir.join("parked.x")).unwrap();
         fs::write(
-            dir.join("parked.x/cplugin.json"),
+            dir.join("parked.x/module.json"),
             r#"{"id":"parked","main":"libparked.so"}"#,
         )
         .unwrap();
@@ -374,7 +374,7 @@ mod tests {
         );
         // `main` must not escape the plugin directory.
         fs::write(
-            dir.join("group/cplugin.json"),
+            dir.join("group/module.json"),
             r#"{"id":"libb","main":"../evil.so"}"#,
         )
         .unwrap();
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(ids, vec!["dist", "liba"]);
         // Windows-style escaping must also be rejected, not just POSIX `../`.
         fs::write(
-            dir.join("group/cplugin.json"),
+            dir.join("group/module.json"),
             r#"{"id":"libb","main":"C:\evil.dll"}"#,
         )
         .unwrap();
@@ -393,7 +393,7 @@ mod tests {
         let plugins = scan(&dir);
         assert!(plugins.iter().all(|p| p.id != "libb"));
         fs::write(
-            dir.join("group/cplugin.json"),
+            dir.join("group/module.json"),
             r#"{"id":"libb","main":"..\evil.dll"}"#,
         )
         .unwrap();
@@ -425,7 +425,7 @@ mod tests {
         write_test_zip(
             &root.join("foo.zip"),
             &[
-                ("cplugin.json", br#"{"id":"foo","main":"libfoo.so"}"#),
+                ("module.json", br#"{"id":"foo","main":"libfoo.so"}"#),
                 ("libfoo.so", b"x"),
             ],
         );
@@ -451,7 +451,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_test_zip(
             &root.join("bar.jar"),
-            &[("cplugin.json", br#"{"id":"bar"}"#), ("libbar.so", b"x")],
+            &[("module.json", br#"{"id":"bar"}"#), ("libbar.so", b"x")],
         );
         let plugins = scan(&root);
         assert_eq!(plugins.len(), 1);
@@ -479,21 +479,21 @@ mod tests {
             (
                 "evil.zip",
                 vec![
-                    ("cplugin.json", br#"{"id":"evil","main":"libevil.so"}"#.as_slice()),
+                    ("module.json", br#"{"id":"evil","main":"libevil.so"}"#.as_slice()),
                     ("../evil.so", b"x".as_slice()),
                 ],
             ),
             (
                 "evil2.zip",
                 vec![
-                    ("cplugin.json", br#"{"id":"evil2","main":"libevil2.so"}"#.as_slice()),
+                    ("module.json", br#"{"id":"evil2","main":"libevil2.so"}"#.as_slice()),
                     (r"..\evil2.so", b"x".as_slice()),
                 ],
             ),
             (
                 "evil3.zip",
                 vec![
-                    ("cplugin.json", br#"{"id":"evil3","main":"libevil3.so"}"#.as_slice()),
+                    ("module.json", br#"{"id":"evil3","main":"libevil3.so"}"#.as_slice()),
                     (r"C:\evil3.dll", b"x".as_slice()),
                 ],
             ),
@@ -511,7 +511,7 @@ mod tests {
         write_test_zip(
             &root.join("old.zip.disabled"),
             &[
-                ("cplugin.json", br#"{"id":"old","main":"libold.so"}"#),
+                ("module.json", br#"{"id":"old","main":"libold.so"}"#),
                 ("libold.so", b"x"),
             ],
         );

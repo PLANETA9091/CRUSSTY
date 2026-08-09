@@ -42,7 +42,7 @@ enum Command {
     },
     /// Hot-reload all modules (SIGUSR1 to the running JVM).
     Reload,
-    /// Search GitHub for Crussty modules (repos with cplugin.json).
+    /// Search GitHub for Crussty modules (repos with module.json).
     Search { query: String },
     /// Install a module by id from the catalog, or <owner/repo> directly from GitHub.
     Install {
@@ -75,38 +75,8 @@ fn main() -> ExitCode {
     let code = match cli.command {
         None => {
             if tui::needs_tty() {
-                match tui::run() {
-                    Some(tui::Action::Run) => server::run(),
-                    Some(tui::Action::Stop) => server::stop(),
-                    Some(tui::Action::Log) => server::log(false),
-                    Some(tui::Action::Ls) => modules::list(),
-                    Some(tui::Action::Init { dir }) => init::run(init::InitArgs {
-                        dir,
-                        version: "1.21.10".into(),
-                        release: "v2.0.0".into(),
-                        no_kernel: false,
-                    }),
-                    Some(tui::Action::ModuleNew { name }) => {
-                        scaffold::run_new(scaffold::NewArgs {
-                            name,
-                            template: scaffold::LangTemplate::Rust,
-                        })
-                    }
-                    Some(tui::Action::ModuleBuild) => scaffold::run_build(),
-                    Some(tui::Action::ModuleWatch) => scaffold::run_watch(),
-                    Some(tui::Action::ModulePack) => {
-                        pack::run(pack::PackArgs { version: None, out: None })
-                    }
-                    Some(tui::Action::Search { query }) => search::search(&query),
-                    Some(tui::Action::Install { module }) => {
-                        if module.contains('/') {
-                            search::install_repo(&module)
-                        } else {
-                            catalog::install(&module, None)
-                        }
-                    }
-                    Some(tui::Action::Quit) | None => 0,
-                }
+                tui::run();
+                0
             } else {
                 use clap::CommandFactory;
                 let mut cmd = Cli::command();

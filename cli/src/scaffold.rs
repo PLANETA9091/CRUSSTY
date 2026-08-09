@@ -22,7 +22,7 @@ pub enum LangTemplate {
     Rust,
 }
 
-const MANIFEST: &str = include_str!("../templates/cplugin.json.tpl");
+const MANIFEST: &str = include_str!("../templates/module.json.tpl");
 
 struct Tpl<'a> {
     name: LangTemplate,
@@ -91,7 +91,7 @@ pub fn run_new(args: NewArgs) -> i32 {
     };
     let manifest = MANIFEST.replace("__NAME__", &args.name);
     let _ = fs::create_dir(dir.join("src"));
-    let mut files: Vec<(String, String)> = vec![("cplugin.json".into(), manifest)];
+    let mut files: Vec<(String, String)> = vec![("module.json".into(), manifest)];
     for (path, content) in tpl.files {
         files.push((path.to_string(), content.replace("__NAME__", &args.name)));
     }
@@ -116,6 +116,9 @@ pub fn run_new(args: NewArgs) -> i32 {
     }
     println!("created module {} in {}", args.name, dir.display());
     println!("  cd {} && crussty module build", args.name);
+    println!(
+        "  tip: set your server jar version in module.json (field version)"
+    );
     0
 }
 
@@ -140,7 +143,17 @@ pub fn run_build() -> i32 {
 
 pub fn run_watch() -> i32 {
     let dir = std::env::current_dir().unwrap_or_default();
-    println!("crussty: watching {} for changes (Ctrl-C to stop)", dir.display());
+    if !dir.join("build.sh").is_file() {
+        eprintln!("crussty: this is not a module directory — no build.sh here");
+        eprintln!("crussty: create a module first with 'crussty module new <name>'");
+        return 1;
+    }
+    println!("crussty: live rebuild mode");
+    println!(
+        "  changes to source files trigger a rebuild (build.sh) and reload on the running server"
+    );
+    println!("  directory: {}", dir.display());
+    println!("  press Ctrl-C to stop");
     let exts = ["rs", "c", "cpp", "h", "cc", "js", "py", "go"];
     let mut last = snapshot(&dir, &exts);
     loop {
@@ -153,6 +166,8 @@ pub fn run_watch() -> i32 {
             if rc == 0 {
                 println!("crussty: reloading modules on live server");
                 crate::server::reload();
+            } else {
+                eprintln!("crussty: build failed — waiting for the next change");
             }
         }
     }

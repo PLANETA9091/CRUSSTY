@@ -1,235 +1,367 @@
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, poll};
 use crossterm::execute;
-use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{size, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::terminal;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::tty::IsTty;
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::{Frame, Terminal};
 use std::io::{self, Write};
+use std::process::Command;
 use std::time::Duration;
 
 const LOGO: &str = include_str!("../assets/logo.txt");
-const LOGO_LINES: usize = 6;
 
 const MENU: &[&str] = &[
-    "Запустить сервер",
-    "Создать сервер (init)",
-    "Журнал сервера (log)",
-    "Остановить сервер",
-    "Список модулей (ls)",
-    "Работа с модулями",
-    "Поиск модулей на GitHub",
-    "Установить модуль",
-    "Выход",
+    "New module",
+    "Build",
+    "Auto-rebuild on file change",
+    "Pack",
+    "Search modules on GitHub",
+    "Install module",
+    "Exit",
 ];
 
-const SUBMENU: &[&str] = &[
-    "Новый модуль (new)",
-    "Собрать (build)",
-    "Пересборка при изменениях (watch)",
-    "Упаковать (pack)",
-    "Назад",
-];
+const GRAY: Color = Color::Gray;
+const WHITE: Color = Color::White;
 
-pub enum Action {
-    Run,
-    Stop,
-    Log,
-    Ls,
-    Init { dir: String },
-    ModuleNew { name: String },
-    ModuleBuild,
-    ModuleWatch,
-    ModulePack,
-    Search { query: String },
-    Install { module: String },
-    Quit,
+struct App {
+    screen: usize,
+    selected: usize,
+    results: Vec<crate::search::Hit>,
+    input: Option<(String, String)>,
+    status: Option<String>,
 }
 
-fn logo_width() -> usize {
-    LOGO.lines().map(|l| l.chars().count()).max().unwrap_or(0)
-}
-
-fn layout(items: usize) -> (u16, u16, u16) {
-    let (cols, rows) = size().unwrap_or((80, 24));
-    let logo_w = logo_width() as u16;
-    let menu_h = items as u16 + 4;
-    let y_logo = rows.saturating_sub(menu_h + LOGO_LINES as u16 + 8) / 2;
-    let x_center = cols.saturating_sub(logo_w) / 2;
-    let x_menu = cols.saturating_sub(30) / 2;
-    (x_center, y_logo, x_menu)
-}
-
-fn render_menu(out: &mut impl Write, items: &[&str], selected: usize) {
-    let (cols, rows) = size().unwrap_or((80, 24));
-    let (x_center, y_logo, x_menu) = layout(items.len());
-
-    let _ = execute!(out, SetBackgroundColor(Color::Black), SetForegroundColor(Color::White), Clear(ClearType::All), MoveTo(0, 0));
-
-    for (i, line) in LOGO.lines().enumerate() {
-        let _ = execute!(out, MoveTo(x_center, y_logo + i as u16), Print(line));
+impl App {
+    fn new() -> Self {
+        App {
+            screen: 0,
+            selected: 0,
+            results: Vec::new(),
+            input: None,
+            status: None,
+        }
     }
 
-    for (i, item) in items.iter().enumerate() {
-        let y = y_logo + LOGO_LINES as u16 + 4 + i as u16;
-        if i == selected {
-            let _ = execute!(
-                out,
-                MoveTo(x_menu, y),
-                SetBackgroundColor(Color::White),
-                SetForegroundColor(Color::Black),
-                Print(format!("  {}  ", item)),
-                ResetColor
-            );
+    fn items(&self) -> Vec<String> {
+        if self.screen == 1 {
+            self.results
+                .iter()
+                .map(|h| match &h.version {
+                    Some(v) => format!("{}  v{v}  \u{2605} {}", h.full, h.stars),
+                    None => format!("{}  \u{2605} {}  (no module.json)", h.full, h.stars),
+                })
+                .collect()
         } else {
-            let _ = execute!(
-                out,
-                MoveTo(x_menu, y),
-                SetBackgroundColor(Color::Black),
-                SetForegroundColor(Color::White),
-                Print(format!("  {}  ", item))
+            MENU.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    if area.width < 24 || area.height < 10 {
+        f.render_widget(
+            Paragraph::new("Terminal too small — enlarge the window"),
+            area,
+        );
+        return;
+    }
+    let [main, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+
+    let logo_w = LOGO.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let logo_h = LOGO.lines().count() as u16;
+    let items = app.items();
+
+    let menu_w = if app.screen == 1 {
+        58u16.min(main.width.saturating_sub(4))
+    } else {
+        38u16.min(main.width.saturating_sub(4))
+    };
+    let menu_h = (items.len() as u16 + 2).min(main.height.saturating_sub(2));
+    let block_top = if app.screen == 1 {
+        main.y + (main.height.saturating_sub(menu_h)) / 2
+    } else {
+        let block_h = logo_h + 1 + 1 + 2 + menu_h;
+        main.y + (main.height.saturating_sub(block_h)) / 2
+    };
+
+    if app.screen == 0 {
+        for (i, l) in LOGO.lines().enumerate() {
+            let y = block_top + i as u16;
+            let text: String = l.chars().take(main.width as usize).collect();
+            let pad = main.width.saturating_sub(logo_w) / 2;
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("{}{}", " ".repeat(pad as usize), text),
+                    Style::default().fg(WHITE),
+                ))),
+                Rect::new(main.x, y, main.width, 1),
             );
         }
-    }
-
-    let hint = "↑/↓ — выбор   Enter — ок   Q — выход";
-    let _ = execute!(
-        out,
-        MoveTo(cols.saturating_sub(hint.chars().count() as u16) / 2, rows.checked_sub(2).unwrap_or(0)),
-        Print(hint),
-        MoveTo(0, 0)
-    );
-}
-
-fn wait_key() -> KeyCode {
-    loop {
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => return k.code,
-            Ok(Event::Resize(_, _)) => return KeyCode::Null,
-            _ => {}
-        }
-    }
-}
-
-fn ask_input(out: &mut impl Write, prompt: &str) -> Option<String> {
-    let (cols, rows) = size().unwrap_or((80, 24));
-    let mut buf = String::new();
-    loop {
-        let label = format!("{}: {}", prompt, buf);
-        let _ = execute!(
-            out,
-            MoveTo(0, rows / 2),
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::Black),
-            Clear(ClearType::CurrentLine),
-            Print(&label),
-            MoveTo(0, 0)
+        let title_text = format!(" CRUSSTY ");
+        let pad_t = main.width.saturating_sub(title_text.chars().count() as u16) / 2;
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{}{}", " ".repeat(pad_t as usize), title_text),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(main.x, block_top + logo_h + 1, main.width, 1),
         );
-        let _ = out.flush();
-        match wait_key() {
-            KeyCode::Enter => return Some(buf),
-            KeyCode::Esc => return None,
-            KeyCode::Backspace => {
-                buf.pop();
-            }
-            KeyCode::Char(c) => {
-                if label.chars().count() < cols as usize {
-                    buf.push(c);
-                }
-            }
-            _ => {}
-        }
     }
-}
 
-fn exit_screen(out: &mut impl Write) {
-    let _ = execute!(out, LeaveAlternateScreen, Show, ResetColor);
-    let _ = terminal::disable_raw_mode();
-}
-
-pub fn run() -> Option<Action> {
-    let mut out = io::stdout();
-    let _ = execute!(out, EnterAlternateScreen);
-    let _ = terminal::enable_raw_mode();
-    let _ = execute!(
-        out,
-        SetBackgroundColor(Color::Black),
-        SetForegroundColor(Color::White),
-        Hide
+    let menu_area = Rect::new(
+        main.x + main.width.saturating_sub(menu_w) / 2,
+        block_top + if app.screen == 0 { logo_h + 3 } else { 0 },
+        menu_w,
+        menu_h,
     );
 
-    let (x_center, y_logo, _) = layout(MENU.len());
-    let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
-    for (i, line) in LOGO.lines().enumerate() {
-        let _ = execute!(out, MoveTo(x_center, y_logo + i as u16), Print(line));
-        let _ = out.flush();
-        std::thread::sleep(Duration::from_millis(110));
-    }
-    std::thread::sleep(Duration::from_millis(450));
+    let list: Vec<ListItem> = items
+        .iter()
+        .map(|s| ListItem::new(Line::from(Span::styled(s, Style::default().fg(WHITE)))))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(GRAY))
+        .title(Line::from(Span::styled(
+            if app.screen == 1 { " RESULTS " } else { " MENU " },
+            Style::default().fg(GRAY),
+        )))
+        .title_alignment(Alignment::Center);
+    let list = List::new(list)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    let mut screen = 0usize;
-    let mut selected = 0usize;
+    let mut state = ListState::default();
+    state.select(Some(app.selected));
+    f.render_stateful_widget(list, menu_area, &mut state);
+
+    if let Some((prompt, buf)) = &app.input {
+        let h = 3u16;
+        let w = 44u16.min(main.width.saturating_sub(4));
+        let input_area = Rect::new(
+            main.x + main.width.saturating_sub(w) / 2,
+            main.y + main.height.saturating_sub(h + 2),
+            w,
+            h,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Line::from(Span::styled(
+                format!(" {prompt} "),
+                Style::default().fg(Color::Cyan),
+            )));
+        let text = format!("{buf}▍");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(WHITE),
+            ))),
+            block.inner(input_area),
+        );
+        f.render_widget(block, input_area);
+    }
+
+    let footer_left = if let Some(s) = &app.status {
+        s.clone()
+    } else if app.screen == 1 {
+        "↑/↓ — select    Enter — install    Esc — back    Q — quit".to_string()
+    } else {
+        "↑/↓ — select    Enter — run    Esc — quit    Q — quit".to_string()
+    };
+    let footer_right = format!("crussty {}", env!("CARGO_PKG_VERSION"));
+    let right_w = footer_right.chars().count() as u16;
+    let pad = main
+        .width
+        .saturating_sub(right_w + footer_left.chars().count() as u16) as usize;
+    let left_span = Line::from(vec![
+        Span::styled(footer_left, Style::default().fg(GRAY)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(footer_right, Style::default().fg(GRAY)),
+    ]);
+    f.render_widget(Paragraph::new(left_span), footer);
+}
+
+fn run_command(argv: &[String]) -> i32 {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "crussty".into());
+    let code = match Command::new(&exe).args(argv).status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("crussty: {e}");
+            1
+        }
+    };
+    let _ = io::stdout().flush();
+    println!();
+    println!("[press Enter to return to the menu]");
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+    code
+}
+
+pub fn run() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, EnterAlternateScreen);
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = execute!(stdout, crossterm::cursor::Hide);
+
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = crossterm::terminal::disable_raw_mode();
+            return;
+        }
+    };
+
+    let mut app = App::new();
     loop {
-        let items = if screen == 0 { MENU } else { SUBMENU };
-        render_menu(&mut out, items, selected);
-        let _ = out.flush();
-        let key = wait_key();
-        match key {
-            KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                selected = (selected + 1).min(items.len() - 1);
-            }
-            KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Enter => {
-                let action = match screen {
-                    0 => match selected {
-                        0 => Some(Action::Run),
-                        1 => {
-                            let dir = ask_input(&mut out, "Каталог сервера (Enter — текущий)");
-                            match dir {
-                                Some(dir) => {
-                                    let dir: String = if dir.is_empty() { ".".into() } else { dir };
-                                    Some(Action::Init { dir })
+        let _ = terminal.draw(|f| draw(f, &mut app));
+
+        if let Some((_prompt, _buf)) = &app.input {
+            match event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                    KeyCode::Enter => {
+                        let (_p, buf) = app.input.take().unwrap();
+                        if app.selected == 4 {
+                            let hits = crate::search::fetch_hits(&buf);
+                            if hits.is_empty() {
+                                app.status = Some(format!("no modules found for '{buf}'"));
+                            } else {
+                                app.results = hits;
+                                app.screen = 1;
+                                app.selected = 0;
+                            }
+                        } else {
+                            let argv = match app.selected {
+                                0 => vec!["module".into(), "new".into(), buf],
+                                _ => vec!["install".into(), buf],
+                            };
+                            let code = run_command(&argv);
+                            app.status = Some(if code == 0 {
+                                if app.selected == 0 {
+                                    "✓ module created — set your server jar version in version (module.json)".to_string()
+                                } else {
+                                    "✓ done".to_string()
                                 }
-                                None => None,
+                            } else {
+                                format!("✗ command failed with code {code}")
+                            });
+                        }
+                    }
+                    KeyCode::Esc => {
+                        app.input = None;
+                    }
+                    KeyCode::Backspace => {
+                        if let Some((_, buf)) = &mut app.input {
+                            buf.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some((_, buf)) = &mut app.input {
+                            if buf.chars().count() < 40 {
+                                buf.push(c);
                             }
                         }
-                        2 => Some(Action::Log),
-                        3 => Some(Action::Stop),
-                        4 => Some(Action::Ls),
-                        5 => {
-                            screen = 1;
-                            selected = 0;
-                            None
-                        }
-                        6 => ask_input(&mut out, "Поиск").map(|query| Action::Search { query }),
-                        7 => ask_input(&mut out, "Модуль (id или owner/repo)").map(|module| Action::Install { module }),
-                        _ => Some(Action::Quit),
-                    },
-                    _ => match selected {
-                        0 => ask_input(&mut out, "Имя модуля").map(|name| Action::ModuleNew { name }),
-                        1 => Some(Action::ModuleBuild),
-                        2 => Some(Action::ModuleWatch),
-                        3 => Some(Action::ModulePack),
-                        _ => {
-                            screen = 0;
-                            None
-                        }
-                    },
-                };
-                if let Some(action) = action {
-                    exit_screen(&mut out);
-                    return Some(action);
-                }
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
-            _ => {}
+            continue;
+        }
+
+        let mut advanced = false;
+        while let Ok(true) = poll(Duration::from_millis(16)) {
+            match event::read() {
+                Ok(Event::Key(k))
+                    if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat =>
+                {
+                    let items_len = app.items().len();
+                    match k.code {
+                        KeyCode::Up => {
+                            app.selected = app.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.selected = (app.selected + 1).min(items_len - 1);
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if app.screen == 1 && k.code == KeyCode::Esc {
+                                app.screen = 0;
+                                app.selected = 0;
+                            } else {
+                                return;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let mut argv: Option<Vec<String>> = None;
+                            if app.screen == 1 {
+                                if let Some(h) = app.results.get(app.selected) {
+                                    argv = Some(vec!["install".into(), h.full.clone()]);
+                                } else {
+                                    app.screen = 0;
+                                    app.selected = 0;
+                                }
+                            } else {
+                                match app.selected {
+                                    0 => {
+                                        app.input =
+                                            Some(("Module name".into(), String::new()))
+                                    }
+                                    1 => argv = Some(vec!["module".into(), "build".into()]),
+                                    2 => argv = Some(vec!["module".into(), "watch".into()]),
+                                    3 => argv = Some(vec!["module".into(), "pack".into()]),
+                                    4 => app.input = Some(("Search".into(), String::new())),
+                                    5 => app.input = Some(("Module (id or owner/repo)".into(), String::new())),
+                                    _ => return,
+                                }
+                            }
+                            if let Some(argv) = argv {
+                                advanced = true;
+                                let _ = execute!(
+                                    io::stdout(),
+                                    LeaveAlternateScreen,
+                                    crossterm::cursor::Show
+                                );
+                                let _ = crossterm::terminal::disable_raw_mode();
+                                let _ = io::stdout().flush();
+                                let code = run_command(&argv);
+                                let _ = execute!(
+                                    io::stdout(),
+                                    EnterAlternateScreen,
+                                    crossterm::cursor::Hide
+                                );
+                                let _ = crossterm::terminal::enable_raw_mode();
+                                let _ = terminal.clear();
+                                app.status = Some(if code == 0 {
+                                    "✓ done".to_string()
+                                } else {
+                                    format!("✗ command failed with code {code}")
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            if advanced {
+                break;
+            }
         }
     }
-
-    exit_screen(&mut out);
-    Some(Action::Quit)
 }
 
 pub fn needs_tty() -> bool {

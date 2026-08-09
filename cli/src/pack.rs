@@ -1,10 +1,11 @@
+use crate::lib;
 use clap::Args;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct PackArgs {
-    /// Version to stamp in the bundle (from cplugin.json if omitted).
+    /// Version to stamp in the bundle (from module.json if omitted).
     #[arg(long)]
     pub version: Option<String>,
     /// Output file.
@@ -14,18 +15,21 @@ pub struct PackArgs {
 
 pub fn run(args: PackArgs) -> i32 {
     let dir = std::env::current_dir().unwrap_or_default();
-    let manifest_path = dir.join("cplugin.json");
+    let manifest_path = lib::manifest_path(&dir);
     let text = match fs::read_to_string(&manifest_path) {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("crussty: no cplugin.json here — run 'crussty module new' first");
+            eprintln!("crussty: no module.json here — run 'crussty module new' first");
             return 1;
         }
     };
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("crussty: cplugin.json parse error: {e}");
+            eprintln!(
+                "crussty: {} parse error: {e}",
+                manifest_path.file_name().unwrap_or_default().to_string_lossy()
+            );
             return 1;
         }
     };
@@ -65,7 +69,13 @@ pub fn run(args: PackArgs) -> i32 {
 
     let root = format!("{id}/");
     for (src, dst) in [
-        (manifest_path.clone(), format!("{root}cplugin.json")),
+        (
+            manifest_path.clone(),
+            format!(
+                "{root}{}",
+                manifest_path.file_name().unwrap().to_string_lossy()
+            ),
+        ),
         (
             lib_path.clone(),
             format!("{root}{}", lib_path.file_name().unwrap().to_string_lossy()),
@@ -128,7 +138,7 @@ fn extra_files(dir: &Path, lib_name: &str) -> Vec<(String, PathBuf)> {
     for entry in walk(&dir) {
         let full = entry.0.clone();
         let name = entry.0.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        if name == "cplugin.json" || name == lib_name {
+        if name == "module.json" || name == "cplugin.json" || name == lib_name {
             continue;
         }
         if let Some(ext) = entry.0.extension().and_then(|e| e.to_str()) {
