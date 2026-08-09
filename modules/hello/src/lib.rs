@@ -16,14 +16,14 @@ pub unsafe extern "C" fn cplugin_init(
     vm: JavaVmPtr,
     _options: *const std::ffi::c_char,
 ) -> i32 {
-    eprintln!("[hello-plugin] cplugin_init (native, before kernel boot)");
+    eprintln!("[hello-module] cplugin_init (native, before kernel boot)");
     cplug_sdk::init(api, vm);
 
     // Pattern hook: fires through the agent's class-file hook pipeline when
     // org/bukkit/Bukkit is defined — proves the hook chain reaches modules.
     // The callback runs on the class-loading thread, so it stays cheap.
     cplug_sdk::hooks::register("org/bukkit/Bukkit", |_name| {
-        eprintln!("[hello-plugin] Bukkit class load observed (hook chain ok)");
+        eprintln!("[hello-module] Bukkit class load observed (hook chain ok)");
     });
 
     // GetLoadedClasses + JNI: once the kernel is up, log through
@@ -33,7 +33,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::on_kernel_ready("org.bukkit.Bukkit", || {
         let found = cplug_sdk::classes::find_class("org/bukkit/Bukkit").is_some();
         eprintln!(
-            "[hello-plugin] GetLoadedClasses resolved Bukkit: {}",
+            "[hello-module] GetLoadedClasses resolved Bukkit: {}",
             found
         );
         cplug_sdk::run_on_main_thread(|_env| {

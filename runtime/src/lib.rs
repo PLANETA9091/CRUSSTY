@@ -240,7 +240,7 @@ impl CrusstyRuntime {
             eprintln!("[crussty-runtime] no modules= in options; nothing injected");
         }
         eprintln!(
-            "[crussty-runtime] pipeline ready: {} plugin hook(s)",
+            "[crussty-runtime] pipeline ready: {} module hook(s)",
             hooks().lock().unwrap().len()
         );
 
@@ -646,7 +646,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
     if found.is_empty() {
-        eprintln!("[crussty-runtime] no plugins found under {}", root.display());
+        eprintln!("[crussty-runtime] no modules found under {}", root.display());
     }
     for plugin in found {
         // RTLD_LOCAL: one plugin cannot shadow another's symbols (the Java
@@ -676,7 +676,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
         let _owner = begin_registration(&plugin.id, 1);
         let rc = unsafe { init(api, vm, c_options.as_ptr()) };
         drop(_owner);
-        eprintln!("[crussty-runtime] plugin {} -> init rc={rc}", plugin.id);
+        eprintln!("[crussty-runtime] module {} -> init rc={rc}", plugin.id);
         if rc == 0 {
             // Admit the loaded library into the hot-reload registry: the
             // registry owns the mapping (dlclose on replace), keeps it
@@ -695,7 +695,7 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
                 Ok(()) => {}
                 Err((e, lib)) => {
                     eprintln!(
-                        "[crussty-runtime] plugin {} not admitted to hot reload: {e}",
+                        "[crussty-runtime] module {} not admitted to hot reload: {e}",
                         plugin.id
                     );
                     // Keep the module alive and functional regardless.

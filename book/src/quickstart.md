@@ -76,7 +76,7 @@ markers instead of you watching the log:
 
 ```
 [crussty-runtime] pipeline ready: N hook(s)
-[hello-plugin] ... hello from native c-plugin
+[hello-module] ... hello from native c-plugin
 ```
 
 Exit code 0 only if both appear before the timeout; stages are logged.
@@ -89,7 +89,7 @@ Check the server log:
 
 ```
 [crussty-runtime] module hello -> init rc=0
-[hello-plugin] cplugin_init (native, before kernel boot)
+[hello-module] cplugin_init (native, before kernel boot)
 [crussty-runtime] pipeline ready: 3 module hook(s)
 [13:36:26 INFO]: hello from native c-plugin (v2 pipeline alive)
 ```

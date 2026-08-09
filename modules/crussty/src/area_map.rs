@@ -58,7 +58,7 @@ pub fn register() {
         match classfile::patch_update(bytes) {
             Ok(b) => {
                 eprintln!(
-                    "[crussty-plugin] area_map: patched {name} update() ({} -> {} bytes)",
+                    "[crussty-module] area_map: patched {name} update() ({} -> {} bytes)",
                     bytes.len(),
                     b.len()
                 );
@@ -66,7 +66,7 @@ pub fn register() {
             }
             Err(e) => {
                 PATCHED.store(false, Ordering::SeqCst);
-                eprintln!("[crussty-plugin] area_map: patch failed: {e}");
+                eprintln!("[crussty-module] area_map: patch failed: {e}");
                 None
             }
         }
@@ -91,12 +91,12 @@ pub fn activate() {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                eprintln!("[crussty-plugin] area_map: {MAP_CLASS} not loaded within 60s, hook stays dormant");
+                eprintln!("[crussty-module] area_map: {MAP_CLASS} not loaded within 60s, hook stays dormant");
                 return;
             }
             if !forced_once && std::time::Instant::now() > deadline - std::time::Duration::from_secs(50) {
                 forced_once = true;
-                eprintln!("[crussty-plugin] area_map: forcing kernel load of {MAP_CLASS}");
+                eprintln!("[crussty-module] area_map: forcing kernel load of {MAP_CLASS}");
                 force_load_kernel_class();
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -130,11 +130,11 @@ pub fn activate() {
                 match env.define_class(name, loader, bytes) {
                     Some(c) => {
                         env.delete_local_ref(c);
-                        eprintln!("[crussty-plugin] area_map: defined {name} in map loader");
+                        eprintln!("[crussty-module] area_map: defined {name} in map loader");
                     }
                     None => {
                         crate::clear_exception(env);
-                        eprintln!("[crussty-plugin] area_map: define_class({name}) failed");
+                        eprintln!("[crussty-module] area_map: define_class({name}) failed");
                         ok = false;
                     }
                 }
@@ -144,17 +144,17 @@ pub fn activate() {
             ok
         });
         if !defined.unwrap_or(false) {
-            eprintln!("[crussty-plugin] area_map: helper definition aborted (no env or loader)");
+            eprintln!("[crussty-module] area_map: helper definition aborted (no env or loader)");
             return;
         }
 
         READY.store(true, Ordering::Release);
         let rc = cplug_sdk::retransform_class(MAP_CLASS);
-        eprintln!("[crussty-plugin] area_map: hook armed, retransform rc={rc}");
+        eprintln!("[crussty-module] area_map: hook armed, retransform rc={rc}");
 
         // Semantic self-test through the real bridge + native.
         if cplug_sdk::jni_util::with_attached(bridge_selftest).is_none() {
-            eprintln!("[crussty-plugin] area_map: self-test skipped (no env)");
+            eprintln!("[crussty-module] area_map: self-test skipped (no env)");
         }
     });
 }
@@ -217,7 +217,7 @@ fn bridge_selftest(env: &JniEnv) -> Option<()> {
         env.delete_local_ref(ops_arr);
         env.delete_local_ref(keys_arr);
         if had_exc {
-            eprintln!("[crussty-plugin] area_map: self-test rect ({from_x},{from_z},d{old_d})->({to_x},{to_z},d{new_d}) threw");
+            eprintln!("[crussty-module] area_map: self-test rect ({from_x},{from_z},d{old_d})->({to_x},{to_z},d{new_d}) threw");
             failures += 1;
             continue;
         }
@@ -245,7 +245,7 @@ fn bridge_selftest(env: &JniEnv) -> Option<()> {
             failures += 1;
             if failures <= 3 {
                 eprintln!(
-                    "[crussty-plugin] area_map: SELF-TEST FAIL ({from_x},{from_z},d{old_d})->({to_x},{to_z},d{new_d}): n={n} expected {}+{} (dup={dup})",
+                    "[crussty-module] area_map: SELF-TEST FAIL ({from_x},{from_z},d{old_d})->({to_x},{to_z},d{new_d}): n={n} expected {}+{} (dup={dup})",
                     expected_adds.len(),
                     expected_removes.len()
                 );
@@ -255,9 +255,9 @@ fn bridge_selftest(env: &JniEnv) -> Option<()> {
     }
     env.delete_local_ref(cls);
     if failures == 0 {
-        eprintln!("[crussty-plugin] area_map: self-test OK ({checked} rects, native == naive set difference)");
+        eprintln!("[crussty-module] area_map: self-test OK ({checked} rects, native == naive set difference)");
     } else {
-        eprintln!("[crussty-plugin] area_map: self-test FAILED {failures}/{checked}");
+        eprintln!("[crussty-module] area_map: self-test FAILED {failures}/{checked}");
     }
     Some(())
 }
@@ -299,7 +299,7 @@ fn naive_set_difference(
 fn force_load_kernel_class() {
     let _ = cplug_sdk::jni_util::with_attached(|env| {
         let Some(seed) = cplug_sdk::classes::find_class("org/bukkit/Bukkit") else {
-            eprintln!("[crussty-plugin] area_map: force load: Bukkit not found");
+            eprintln!("[crussty-module] area_map: force load: Bukkit not found");
             return None::<()>;
         };
         // getClassLoader is declared on java.lang.Class; GetMethodID on an
@@ -307,7 +307,7 @@ fn force_load_kernel_class() {
         // resolve the mid from the Class class directly.
         let Some(class_cls) = env.find_class("java/lang/Class") else {
             crate::clear_exception(env);
-            eprintln!("[crussty-plugin] area_map: force load: no Class class");
+            eprintln!("[crussty-module] area_map: force load: no Class class");
             return None::<()>;
         };
         let Some(loader) = env
@@ -318,7 +318,7 @@ fn force_load_kernel_class() {
             })
         else {
             crate::clear_exception(env);
-            eprintln!("[crussty-plugin] area_map: force load: no kernel loader");
+            eprintln!("[crussty-module] area_map: force load: no kernel loader");
             return None::<()>;
         };
         let forname = env.get_static_method_id(
@@ -328,7 +328,7 @@ fn force_load_kernel_class() {
         );
         let Some(forname) = forname else {
             crate::clear_exception(env);
-            eprintln!("[crussty-plugin] area_map: force load: no forName mid");
+            eprintln!("[crussty-module] area_map: force load: no forName mid");
             return None::<()>;
         };
         let dot = MAP_CLASS.replace('/', ".");
@@ -344,9 +344,9 @@ fn force_load_kernel_class() {
         );
         let had_exc = crate::clear_exception(env);
         if loaded.is_null() {
-            eprintln!("[crussty-plugin] area_map: Class.forName({MAP_CLASS}) failed (exc={had_exc})");
+            eprintln!("[crussty-module] area_map: Class.forName({MAP_CLASS}) failed (exc={had_exc})");
         } else {
-            eprintln!("[crussty-plugin] area_map: Class.forName({MAP_CLASS}) succeeded");
+            eprintln!("[crussty-module] area_map: Class.forName({MAP_CLASS}) succeeded");
         }
         env.delete_local_ref(loaded);
         env.delete_local_ref(name);

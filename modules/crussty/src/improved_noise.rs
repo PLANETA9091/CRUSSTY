@@ -109,7 +109,7 @@ fn class_version(b: &[u8]) -> Option<(u16, u16)> {
 pub fn register() {
     if !enabled() {
         eprintln!(
-            "[crussty-plugin] improved_noise: dormant (set CRUSSTY_NATIVE_IMPROVED_NOISE=1 to enable)"
+            "[crussty-module] improved_noise: dormant (set CRUSSTY_NATIVE_IMPROVED_NOISE=1 to enable)"
         );
         return;
     }
@@ -126,7 +126,7 @@ pub fn register() {
         // Serve the precomputed patch; zero Java work on this thread.
         let cached = patch_lock().lock().unwrap().clone();
         eprintln!(
-            "[crussty-plugin] improved_noise: hook serve {} bytes (major {})",
+            "[crussty-module] improved_noise: hook serve {} bytes (major {})",
             cached.as_ref().map(|c| c.len()).unwrap_or(0),
             cached.as_ref().and_then(|c| class_version(c)).map(|(m, _)| m).unwrap_or(0)
         );
@@ -146,7 +146,7 @@ pub fn activate() {
             }
             if std::time::Instant::now() > deadline {
                 eprintln!(
-                    "[crussty-plugin] improved_noise: {NOISE_CLASS} not loaded within 60s, hook stays dormant"
+                    "[crussty-module] improved_noise: {NOISE_CLASS} not loaded within 60s, hook stays dormant"
                 );
                 return;
             }
@@ -155,7 +155,7 @@ pub fn activate() {
             {
                 forced_once = true;
                 eprintln!(
-                    "[crussty-plugin] improved_noise: forcing kernel load of {NOISE_CLASS}"
+                    "[crussty-module] improved_noise: forcing kernel load of {NOISE_CLASS}"
                 );
                 force_load_kernel_class();
             }
@@ -172,12 +172,12 @@ pub fn activate() {
         // registered and passive (READY=false) until this point.
         if !wait_for_boot() {
             eprintln!(
-                "[crussty-plugin] improved_noise: boot marker not seen, hook stays dormant"
+                "[crussty-module] improved_noise: boot marker not seen, hook stays dormant"
             );
             return;
         }
         eprintln!(
-            "[crussty-plugin] improved_noise: server booted, defining bridge into kernel loader"
+            "[crussty-module] improved_noise: server booted, defining bridge into kernel loader"
         );
 
         let defined = cplug_sdk::jni_util::with_attached(|env| {
@@ -213,11 +213,11 @@ pub fn activate() {
                 match env.define_class(name, gref, bytes) {
                     Some(c) => {
                         env.delete_local_ref(c);
-                        eprintln!("[crussty-plugin] improved_noise: defined {name} in kernel loader");
+                        eprintln!("[crussty-module] improved_noise: defined {name} in kernel loader");
                     }
                     None => {
                         crate::clear_exception(env);
-                        eprintln!("[crussty-plugin] improved_noise: define_class({name}) failed");
+                        eprintln!("[crussty-module] improved_noise: define_class({name}) failed");
                         ok = false;
                     }
                 }
@@ -227,7 +227,7 @@ pub fn activate() {
             // mid-retransformation (mirrors area_map: no class definition
             // inside the class-file hook callback).
             if cplug_sdk::asm::ensure_defined(env, gref).is_none() {
-                eprintln!("[crussty-plugin] improved_noise: asm helper define failed");
+                eprintln!("[crussty-module] improved_noise: asm helper define failed");
                 ok = false;
             }
             env.delete_local_ref(loader);
@@ -235,7 +235,7 @@ pub fn activate() {
             ok
         });
         if !defined.unwrap_or(false) {
-            eprintln!("[crussty-plugin] improved_noise: bridge definition aborted (no env or loader)");
+            eprintln!("[crussty-module] improved_noise: bridge definition aborted (no env or loader)");
             return;
         }
 
@@ -245,14 +245,14 @@ pub fn activate() {
         // callback — then a SINGLE retransform serves it back.
         let original = orig_lock().lock().unwrap().clone();
         let Some(original) = original else {
-            eprintln!("[crussty-plugin] improved_noise: no original bytes captured (class loaded before hook?), hook stays dormant");
+            eprintln!("[crussty-module] improved_noise: no original bytes captured (class loaded before hook?), hook stays dormant");
             return;
         };
 
         // Phase 2: run the ASM pipeline here (quiet thread, no JVMTI locks).
         let loader = KERNEL_LOADER.load(Ordering::SeqCst);
         if loader == 0 {
-            eprintln!("[crussty-plugin] improved_noise: no kernel loader captured");
+            eprintln!("[crussty-module] improved_noise: no kernel loader captured");
             return;
         }
         let patched = cplug_sdk::jni_util::with_attached(|env| {
@@ -284,11 +284,11 @@ pub fn activate() {
         })
         .flatten();
         let Some(patched) = patched else {
-            eprintln!("[crussty-plugin] improved_noise: patch computation failed, hook stays dormant");
+            eprintln!("[crussty-module] improved_noise: patch computation failed, hook stays dormant");
             return;
         };
         eprintln!(
-            "[crussty-plugin] improved_noise: computed patch for noise() ({} -> {} bytes), orig major {} patch major {}",
+            "[crussty-module] improved_noise: computed patch for noise() ({} -> {} bytes), orig major {} patch major {}",
             original.len(),
             patched.len(),
             class_version(&original).map(|(m, _)| m).unwrap_or(0),
@@ -299,7 +299,7 @@ pub fn activate() {
         // Phase 3: a SINGLE retransform; the callback serves the cached patch.
         READY.store(true, Ordering::Release);
         let rc = cplug_sdk::retransform_class(NOISE_CLASS);
-        eprintln!("[crussty-plugin] improved_noise: hook armed, retransform rc={rc}");
+        eprintln!("[crussty-module] improved_noise: hook armed, retransform rc={rc}");
 
         bridge_selftest();
     });
@@ -347,7 +347,7 @@ fn wait_for_boot() -> bool {
 fn force_load_kernel_class() {
     let _ = cplug_sdk::jni_util::with_attached(|env| {
         let Some(seed) = cplug_sdk::classes::find_class("org/bukkit/Bukkit") else {
-            eprintln!("[crussty-plugin] improved_noise: force load: Bukkit not found");
+            eprintln!("[crussty-module] improved_noise: force load: Bukkit not found");
             return None::<()>;
         };
         let Some(class_cls) = env.find_class("java/lang/Class") else {
@@ -394,11 +394,11 @@ fn force_load_kernel_class() {
         let had_exc = crate::clear_exception(env);
         if loaded.is_null() {
             eprintln!(
-                "[crussty-plugin] improved_noise: Class.forName({NOISE_CLASS}) failed (exc={had_exc})"
+                "[crussty-module] improved_noise: Class.forName({NOISE_CLASS}) failed (exc={had_exc})"
             );
         } else {
             eprintln!(
-                "[crussty-plugin] improved_noise: Class.forName({NOISE_CLASS}) succeeded"
+                "[crussty-module] improved_noise: Class.forName({NOISE_CLASS}) succeeded"
             );
         }
         env.delete_local_ref(loaded);
@@ -416,7 +416,7 @@ fn bridge_selftest() {
     let ok = cplug_sdk::jni_util::with_attached(|env| {
         let Some(bridge) = env.find_class(NATIVE_BRIDGE) else {
             crate::clear_exception(env);
-            eprintln!("[crussty-plugin] improved_noise: self-test: find_class({NATIVE_BRIDGE}) failed");
+            eprintln!("[crussty-module] improved_noise: self-test: find_class({NATIVE_BRIDGE}) failed");
             return false;
         };
         let Some(build) = env.get_static_method_id(bridge, "nativeBuildHandle", "([BDDD)J") else {
@@ -457,7 +457,7 @@ fn bridge_selftest() {
             let args = [jni::jvalue { l: arr }, d(1.0), d(2.0), d(3.0), d(0.0), d(0.0)];
             let handle = (call_long)(jenv, bridge, build, args.as_ptr());
             if handle == 0 {
-                eprintln!("[crussty-plugin] improved_noise: self-test: buildHandle returned 0");
+                eprintln!("[crussty-module] improved_noise: self-test: buildHandle returned 0");
                 return false;
             }
             let pts: [(f64, f64, f64, f64, f64); 3] = [
@@ -470,7 +470,7 @@ fn bridge_selftest() {
                 let v = (call_double)(jenv, bridge, noise_mid, args.as_ptr());
                 if !v.is_finite() {
                     eprintln!(
-                        "[crussty-plugin] improved_noise: self-test: non-finite sample at ({x},{y},{z})"
+                        "[crussty-module] improved_noise: self-test: non-finite sample at ({x},{y},{z})"
                     );
                     return false;
                 }
@@ -484,9 +484,9 @@ fn bridge_selftest() {
     });
     match ok {
         Some(true) => eprintln!(
-            "[crussty-plugin] improved_noise: self-test passed (native handle round-trip through real bridge)"
+            "[crussty-module] improved_noise: self-test passed (native handle round-trip through real bridge)"
         ),
-        _ => eprintln!("[crussty-plugin] improved_noise: self-test failed/skipped"),
+        _ => eprintln!("[crussty-module] improved_noise: self-test failed/skipped"),
     }
 }
 

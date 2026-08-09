@@ -7,7 +7,7 @@
 #  3. boot the server:       ./run.sh (launcher->java -jar purpur) with modules/
 #  4. markers:               "[crussty-runtime] pipeline ready: ..."
 #                            "hello from native c-plugin"
-#                            (optional) "[crussty-plugin] native surface live"
+#                            (optional) "[crussty-module] native surface live"
 #  5. stop the server cleanly; exit 0 on success, 1 on any failure.
 #
 # Requirements: java 21+ (javac/jar), cargo, curl, python3, setsid (util-linux).
@@ -112,7 +112,7 @@ for id in $MODULES; do
     [ -f "$m/cplugin.json" ] || fail "module $id has no cplugin.json"
     log "build + install module: $id"
     cargo build --manifest-path "$m/Cargo.toml" || fail "cargo build $id"
-    # The [lib] name may differ from the plugin id (cargo forbids hyphens in
+    # The [lib] name may differ from the module id (cargo forbids hyphens in
     # library target names, while manifest ids may carry them), so resolve the
     # produced artifact instead of assuming `lib$id.so`.
     LIB_NAME="$(sed -n '/^\[lib\]/,/^\[/p' "$m/Cargo.toml" | sed -n 's/^name *= *"\(.*\)"/\1/p' | head -1)"

@@ -27,7 +27,7 @@ cd my-server && crussty-linux-x64 run
 ```
 
 That's it — the runtime boots with the kernel and loads whatever is in
-`modules/`. Expect `pipeline ready: N plugin hook(s)` in the log.
+`modules/`. Expect `pipeline ready: N module hook(s)` in the log.
 
 What's in your server directory:
 
@@ -54,7 +54,7 @@ crussty-linux-x64 reload    # hot-reload all modules (no server restart)
 
 ## What is a module?
 
-A module is a plugin: a directory (or `.zip`/`.jar` archive) with a
+A module is a directory (or `.zip`/`.jar` archive) with a
 `cplugin.json` manifest and an entry library exporting
 `cplugin_init(api, vm, options)`. It can hook class loading, patch
 bytecode, run code on the server's main thread, and use the platform's

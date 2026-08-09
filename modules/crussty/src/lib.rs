@@ -53,7 +53,7 @@ pub unsafe extern "C" fn cplugin_init(
     _options: *const c_char,
 ) -> i32 {
     cplug_sdk::init(api, vm);
-    eprintln!("[crussty-plugin] cplugin_init: injecting Crussty CE native surface in background");
+    eprintln!("[crussty-module] cplugin_init: injecting Crussty CE native surface in background");
     area_map::register();
     improved_noise::register();
     std::thread::spawn(inject_surface);
@@ -93,7 +93,7 @@ fn plugin_dir() -> Option<PathBuf> {
 fn inject_surface() {
     std::thread::sleep(Duration::from_secs(3));
     let Some(dir) = plugin_dir() else {
-        eprintln!("[crussty-plugin] cannot locate plugin dir (dladdr failed)");
+        eprintln!("[crussty-module] cannot locate plugin dir (dladdr failed)");
         return;
     };
 
@@ -114,7 +114,7 @@ fn inject_surface() {
     };
     if !main_so.exists() {
         eprintln!(
-            "[crussty-plugin] missing {}: looked in {} and {} (the published libs ship in modules/crussty/native/ — see README)",
+            "[crussty-module] missing {}: looked in {} and {} (the published libs ship in modules/crussty/native/ — see README)",
             native_lib_name(MAIN_LIB),
             native_dir.join(&main_name).display(),
             dir.join(&main_name).display()
@@ -124,7 +124,7 @@ fn inject_surface() {
     let main = match unsafe { loader::NativeLib::new(&main_so) } {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[crussty-plugin] dlopen {} failed: {e}", native_lib_name(MAIN_LIB));
+            eprintln!("[crussty-module] dlopen {} failed: {e}", native_lib_name(MAIN_LIB));
             return;
         }
     };
@@ -132,7 +132,7 @@ fn inject_surface() {
         match unsafe { loader::NativeLib::new(&chunk_so) } {
             Ok(l) => Some(l),
             Err(e) => {
-                eprintln!("[crussty-plugin] dlopen {} failed (continuing without it): {e}", native_lib_name(CHUNK_LIB));
+                eprintln!("[crussty-module] dlopen {} failed (continuing without it): {e}", native_lib_name(CHUNK_LIB));
                 None
             }
         }
@@ -140,13 +140,13 @@ fn inject_surface() {
         None
     };
 
-    eprintln!("[crussty-plugin] native libs: {main_so:?} (+ {chunk_so:?})");
+    eprintln!("[crussty-module] native libs: {main_so:?} (+ {chunk_so:?})");
 
     let mut n_classes = 0usize;
     let mut n_natives = 0usize;
     let mut n_missing = 0usize;
     let result = with_attached(|env| {
-        eprintln!("[crussty-plugin] attached: injecting bridge classes");
+        eprintln!("[crussty-module] attached: injecting bridge classes");
         for (table, lib) in [
             (jni_table::MAIN_JNI_TABLE, Some(&main)),
             (jni_table::CHUNK_JNI_TABLE, chunk.as_ref()),
@@ -172,21 +172,21 @@ fn inject_surface() {
                         n_natives += n;
                         n_missing += m;
                     }
-                    Err(e) => eprintln!("[crussty-plugin] {class}: {e}"),
+                    Err(e) => eprintln!("[crussty-module] {class}: {e}"),
                 }
             }
         }
-        eprintln!("[crussty-plugin] injection loop done");
+        eprintln!("[crussty-module] injection loop done");
         Some(())
     });
 
     if result.is_none() {
-        eprintln!("[crussty-plugin] injection aborted: no JNI env (VM not ready?)");
+        eprintln!("[crussty-module] injection aborted: no JNI env (VM not ready?)");
         return;
     }
 
     eprintln!(
-        "[crussty-plugin] native surface live: {n_classes} bridge classes, {n_natives} natives registered ({} symbols unresolved)",
+        "[crussty-module] native surface live: {n_classes} bridge classes, {n_natives} natives registered ({} symbols unresolved)",
         n_missing
     );
 
@@ -209,7 +209,7 @@ fn define_and_register(
 ) -> Result<(usize, usize, usize), String> {
     // Conflict guard: never define a bridge class another module owns.
     if !cplug_sdk::claim(&format!("class:{class}")) {
-        eprintln!("[crussty-plugin] class '{class}' claimed by another module; skipping");
+        eprintln!("[crussty-module] class '{class}' claimed by another module; skipping");
         return Err(format!("class {class} already claimed"));
     }
     let pairs: Vec<(&str, &str)> = methods.iter().map(|(m, s, _)| (*m, *s)).collect();
@@ -228,7 +228,7 @@ fn define_and_register(
         // under the same (class, name, signature) — registering twice would
         // silently repoint the existing native.
         if !cplug_sdk::claim(&format!("native:{class}#{m}:{s}")) {
-            eprintln!("[crussty-plugin] native {class}#{m}{s} claimed by another module; skipping");
+            eprintln!("[crussty-module] native {class}#{m}{s} claimed by another module; skipping");
             missing += 1;
             continue;
         }
@@ -275,30 +275,30 @@ fn live_proof(env: &JniEnv) {
         if let Some(mid) = env.get_static_method_id(cls, "nativeCheck", "()Z") {
             let ok = env.call_static_int_method(cls, mid, &[]);
             let _ = clear_exception(env);
-            eprintln!("[crussty-plugin] live proof: normalNoise.nativeCheck() = {ok}");
+            eprintln!("[crussty-module] live proof: normalNoise.nativeCheck() = {ok}");
         } else {
             let _ = clear_exception(env);
-            eprintln!("[crussty-plugin] live proof: nativeCheck unresolved");
+            eprintln!("[crussty-module] live proof: nativeCheck unresolved");
         }
         env.delete_local_ref(cls);
     } else {
         let _ = clear_exception(env);
-        eprintln!("[crussty-plugin] live proof: find_class(PaperNativeNormalNoise) failed");
+        eprintln!("[crussty-module] live proof: find_class(PaperNativeNormalNoise) failed");
     }
 
     let Some(cls) = env.find_class("PaperNativeTicketSetSearch") else {
         let _ = clear_exception(env);
-        eprintln!("[crussty-plugin] live proof: find_class(PaperNativeTicketSetSearch) failed");
+        eprintln!("[crussty-module] live proof: find_class(PaperNativeTicketSetSearch) failed");
         return;
     };
     let Some(mid) = env.get_static_method_id(cls, "binarySummary", "(I[J)I") else {
         let _ = clear_exception(env);
-        eprintln!("[crussty-plugin] live proof: get_static_method_id failed");
+        eprintln!("[crussty-module] live proof: get_static_method_id failed");
         env.delete_local_ref(cls);
         return;
     };
     let Some(arr) = env.new_long_array(1) else {
-        eprintln!("[crussty-plugin] live proof: new_long_array failed");
+        eprintln!("[crussty-module] live proof: new_long_array failed");
         env.delete_local_ref(cls);
         return;
     };
@@ -307,7 +307,7 @@ fn live_proof(env: &JniEnv) {
     let _ = clear_exception(env);
     env.delete_local_ref(arr);
     env.delete_local_ref(cls);
-    eprintln!("[crussty-plugin] live proof: ticketset binarySummary(1000) wrote {written} long(s)");
+    eprintln!("[crussty-module] live proof: ticketset binarySummary(1000) wrote {written} long(s)");
 }
 
 /// Attach the current thread if needed, run `f` with a JNI env, detach only
