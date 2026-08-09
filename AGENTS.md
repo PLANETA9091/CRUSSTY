@@ -8,10 +8,10 @@ Versions follow SemVer with a `v` prefix. Two paths:
 
 Pushing to `master` with changes in `runtime/`, `launcher/`, `cplug-abi/`,
 `cplug-sdk/`, `cplug-sdk-c/`, `cli/`, `modules/` or `scripts/` triggers
-`.github/workflows/auto-release.yml`, which computes the next version from
-the commits since the last `v[0-9]*` tag and publishes the release itself
-(launcher.jar + libcrussty_runtime.so + run.sh + run.bat). The commit
-message decides the bump:
+`.github/workflows/auto-release.yml`. It computes the next version from
+the commits since the nearest `v[0-9]*` tag that is an **ancestor** of
+HEAD (`git describe` — orphan tags from rewritten history are ignored).
+The commit message decides the bump:
 
 - contains `BREAKING` or `major:` → **major** (v2.0.1 → v3.0.0)
 - contains `feat:` (or `minor:`) → **minor** (v2.0.1 → v2.1.0)
