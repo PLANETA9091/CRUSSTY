@@ -52,6 +52,19 @@ jobs:
           fi
           echo "OK: committed artifacts are up to date"
 
+  docs:
+    name: mdbook build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook 0.4
+        run: |
+          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv mdbook /usr/local/bin/mdbook
+          mdbook --version
+      - name: Build book
+        run: mdbook build book
+
   multilang:
     name: build examples-multilang (c/cpp/go/js/python)
     runs-on: ubuntu-latest

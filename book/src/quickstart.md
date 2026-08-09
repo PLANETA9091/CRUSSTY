@@ -28,7 +28,7 @@ cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 ./scripts/build-single-jar.sh
 
 # launcher (alternative to single-jar; spawns the kernel with -agentpath)
-javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java
+javac -encoding UTF-8 -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java
 jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
 ```
 

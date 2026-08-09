@@ -114,8 +114,10 @@ fn inject_surface() {
     };
     if !main_so.exists() {
         eprintln!(
-            "[crussty-plugin] missing {main_so:?}: build crussty/native (release) and copy the {} here",
-            native_lib_name(MAIN_LIB)
+            "[crussty-plugin] missing {}: looked in {} and {} (the published libs ship in modules/crussty/native/ — see README)",
+            native_lib_name(MAIN_LIB),
+            native_dir.join(&main_name).display(),
+            dir.join(&main_name).display()
         );
         return;
     }

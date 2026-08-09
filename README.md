@@ -32,17 +32,24 @@ Two distribution paths:
 
 ## Build
 
+**Requires Java 21+** (for the kernel and `javac`/`jar` in the helper and
+launcher builds). **Requires Rust** (stable toolchain). 
+
 ```bash
 cargo build --manifest-path runtime/Cargo.toml
 cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 ./scripts/build-single-jar.sh        # -> dist/crussty-<ver>.jar
 ```
 
-Requires `versions/purpur-1.21.10.jar` (not committed).
+Requires `versions/purpur-1.21.10.jar` (not committed) — the single-jar boot
+loads the kernel from there, so it must be in place **before** running
+`build-single-jar.sh` or booting `server.jar`.
 
 ## Run (single-jar)
 
 ```bash
+# the kernel jar must already be in versions/ (see Build above):
+#   mkdir -p versions && cp /path/to/purpur-1.21.10.jar versions/
 cp dist/crussty-1.21.10.jar server.jar
 echo "eula=true" > eula.txt
 java -Xmx2G -jar server.jar --nogui
