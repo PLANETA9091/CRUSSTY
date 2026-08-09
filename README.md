@@ -157,3 +157,12 @@ python3 scripts/gen_crussty_table.py verify        # cross-check against shipped
 
 `scripts/build-single-jar.sh` embeds the `native/` dir into the jar
 automatically.
+
+## Star history
+
+If CRUSSTY is useful to you, drop a star on GitHub — it's what keeps this
+project alive.
+
+[![GitHub stars](https://img.shields.io/github/stars/PLANETA9091/CRUSSTY?style=flat-square&label=stars)](https://github.com/PLANETA9091/CRUSSTY/stargazers)
+
+[![Star History Chart](https://api.star-history.com/svg?repos=PLANETA9091/CRUSSTY&type=Date)](https://star-history.com/#PLANETA9091/CRUSSTY&Date)
