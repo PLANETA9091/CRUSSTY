@@ -37,7 +37,11 @@ jobs:
           LAST=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || true)
           echo "last=${LAST:-none}" >> "$GITHUB_OUTPUT"
           if [ -z "$LAST" ]; then
-            echo "version=v2.0.1"; echo "commits=first auto-release (base tag v2.0.0 was rewritten out of history)" >> "$GITHUB_OUTPUT"; exit 0
+            echo "version=v2.0.1" >> "$GITHUB_OUTPUT"
+            echo "commits<<EOF" >> "$GITHUB_OUTPUT"
+            echo "first auto-release (base tag v2.0.0 was rewritten out of history)" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           eval "$(echo "$LAST" | sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+).*/MAJOR=\1;MINOR=\2;PATCH=\3/')"
           COMMITS=$(git log --oneline "$LAST..HEAD")
@@ -50,7 +54,9 @@ jobs:
             PATCH=$((PATCH+1))
           fi
           echo "version=v$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
-          echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
+          echo "commits<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$COMMITS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
   build:
     name: build release artifacts
