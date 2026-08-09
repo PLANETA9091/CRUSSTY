@@ -1,6 +1,6 @@
 {
   "name": "crussty",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Crussty CLI — run Crussty servers and build c-plugins. Ships platform binaries via optionalDependencies, no install scripts.",
   "bin": {
     "crussty": "bin-wrapper.js"

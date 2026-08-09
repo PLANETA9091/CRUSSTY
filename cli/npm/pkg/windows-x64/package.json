@@ -1,6 +1,6 @@
 {
   "name": "crussty-windows-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Crussty CLI binary for windows-x64 (installed automatically via optionalDependencies)",
   "os": ["win32"],
   "cpu": ["x64"],
