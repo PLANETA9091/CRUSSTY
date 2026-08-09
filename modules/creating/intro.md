@@ -37,4 +37,4 @@ Rust, C, C++, Python, JavaScript, via shims — is a module.
 
 - [Building an example module (Rust)](rust/example.html)
 
-Full contract details: [Modules](../modules.html).
+Full contract details: [Modules](../../modules.html).

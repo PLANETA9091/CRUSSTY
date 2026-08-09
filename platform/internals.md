@@ -1,6 +1,8 @@
 ---
 title: Platform internals
-nav_order: 11
+parent: Platform
+nav_order: 2
+
 ---
 
 # Platform internals

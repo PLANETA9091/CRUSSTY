@@ -1,5 +1,6 @@
 ---
 title: Distribution as zip archives
+parent: Modules
 nav_order: 2
 ---
 

@@ -27,4 +27,4 @@ save_events) is reachable the same way: the shim forwards fields of
 
 The full API and the version-guard contract (CPAPI_VERSION=3,
 CPB_VERSION=1) is on [Platform
-bricks](../../platform.html).
+bricks](../../../platform/bricks.html).

@@ -1,6 +1,6 @@
 ---
 title: Module SDK
-nav_order: 7
+nav_order: 6
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> Module SDK
@@ -56,5 +56,5 @@ Zig modules through **`cplug-sdk-c`** — a thin C binding of the SDK
 logging) with one header and one library. Python modules drive it straight
 from `hello_sdk.py` via `ctypes`; C, C++ and Zig link it directly. You
 only write Rust if you need the bytecode weaving (`insert_call_at_start` /
-`redirect_calls`) or the profiler — see [Other languages](other-languages.html)
+`redirect_calls`) or the profiler — see the [language pages](./modules/creating.html)
 for the full matrix.

@@ -7,10 +7,10 @@ nav_exclude: true
 
 This guide moved into **Creating a module**:
 
-- [Building an example module in Rust](./creating/rust/example.html) — the
+- [Building an example module in Rust](./modules/creating/rust/example.html) — the
   original `hello` walkthrough, step by step
-- [Building a module in C](./creating/c/example.html)
-- [Building a module in Python](./creating/python/example.html)
-- [Building a module in JavaScript](./creating/javascript/example.html)
+- [Building a module in C](./modules/creating/c/example.html)
+- [Building a module in Python](./modules/creating/python/example.html)
+- [Building a module in JavaScript](./modules/creating/javascript/example.html)
 
-Start at [Creating a module](./creating.html) for the full path.
+Start at [Creating a module](./modules/creating.html) for the full path.

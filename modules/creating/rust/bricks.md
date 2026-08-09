@@ -40,5 +40,5 @@ if api.version >= 3 && !api.platform.is_null() {
 2. **Version-guard everything** — read fields only past the version you
    checked (CPAPI_VERSION=3, CPB_VERSION=1).
 
-Full contract: see [Platform bricks](../../platform.html) — same bridge, any
+Full contract: see [Platform bricks](../../../platform/bricks.html) — same bridge, any
 language.

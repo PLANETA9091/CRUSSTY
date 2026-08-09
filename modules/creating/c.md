@@ -15,7 +15,7 @@ C++ is the same path with the same header from `extern "C"` entry.
 |---|---|
 | [Building an example module](./c/example.html) | `hello.c` from scratch, build and deploy |
 | [Platform bricks in C](./c/bricks.html) | the full bridge — 28 functions across 12 bricks |
-| [SDK in C](../sdk-c.html) | `cplug-sdk-c` — convenience layer on top of the ABI |
+| [SDK in C](../../sdk-c.html) | `cplug-sdk-c` — convenience layer on top of the ABI |
 
 Reference module: [`c-hello` (c
 branch)](https://github.com/PLANETA9091/c-hello/tree/c).

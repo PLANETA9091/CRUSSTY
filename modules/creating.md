@@ -1,10 +1,11 @@
 ---
 title: Creating a module
-nav_order: 5
+parent: Modules
+nav_order: 3
 has_children: true
 ---
 
-# <img class="page-icon" src="./assets/images/icons/src.svg" alt="Creating"> Creating a module
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt="Creating"> Creating a module
 
 A Crussty module is a native shared library that exports one C-ABI function —
 `cplugin_init` — and everything else is up to you: hooks, event buses,

@@ -28,7 +28,7 @@ int32_t cplugin_init(const CPluginApi* api, JavaVM* vm, const char* options);
 The runtime scans `modules/`, dlopens each `<id>/lib<id>.so`, calls
 `cplugin_init`, and from then on your module receives class-load hook calls,
 main-thread callbacks and JNI access. That's the whole contract — anything
-that can export this function (see [Other languages](../../other-languages.html))
+that can export this function (see [JavaScript](../javascript.html), [Python](../python.html), [C & C++](../c.html))
 can be a module.
 
 ---
@@ -229,15 +229,15 @@ scan → load → hook → main-thread bridge → JNI.
   <a class="ws-btn" href="https://github.com/PLANETA9091/c-hello/releases">Try it yourself</a>
   <a class="ws-btn-ghost" href="https://github.com/PLANETA9091/c-hello">Clone the repo</a>
   <div class="ws-try-note">Stuck? See
-  <a href="troubleshooting.html">Troubleshooting</a>, or start from the ready-made
-  <a href="examples.html">example modules</a>.</div>
+  <a href="../../../troubleshooting.html">Troubleshooting</a>, or start from the ready-made
+  <a href="../../../modules/examples.html">example modules</a>.</div>
 </div>
 </div>
 
 ## Next steps
 
-- [Modules](../../modules.html) — the full module contract
-- [Module SDK](../../sdk.html) — hooks, classes, main thread, ASM
-- [Other languages](../../other-languages.html) — the same module in C, C++, Python, JS (Go caveat)
-- [Troubleshooting](../../troubleshooting.html) — common issues
+- [Modules](../../../modules.html) — the full module contract
+- [Module SDK](../../../sdk.html) — hooks, classes, main thread, ASM
+- [JavaScript](../javascript.html), [Python](../python.html), [C & C++](../c.html) — the same module in C, C++, Python, JS (Go caveat)
+- [Troubleshooting](../../../troubleshooting.html) — common issues
 

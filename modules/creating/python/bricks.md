@@ -26,4 +26,4 @@ GIL serializes access, so concurrency-sensitive bricks (events, threads)
 work best with a worker-thread pattern inside Python.
 
 Version-guard contract (`CPAPI_VERSION=3`, `CPB_VERSION=1`) is on
-[Platform bricks](../../platform.html).
+[Platform bricks](../../../platform/bricks.html).

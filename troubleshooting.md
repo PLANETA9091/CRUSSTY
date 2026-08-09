@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-nav_order: 10
+nav_order: 7
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/log.svg" alt=""> Troubleshooting

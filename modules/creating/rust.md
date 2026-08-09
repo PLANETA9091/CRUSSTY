@@ -16,5 +16,5 @@ and ASM patching — all typed.
 | [Building an example module](./rust/example.html) | the full `hello` module from scratch |
 | [Platform bricks in Rust](./rust/bricks.html) | the bridge from Rust — events, network, threads... |
 
-Start with [Quick Start](../quickstart.html) if you don't have the
+Start with [Quick Start](../../quickstart.html) if you don't have the
 platform built yet.
