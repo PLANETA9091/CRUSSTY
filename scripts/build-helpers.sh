@@ -5,6 +5,10 @@
 # workspace builds with zero Java toolchain; this script is for regenerating
 # them after a helper source change and for CI verification.
 #
+# Module Java helpers (crussty area-map/noise, dist DistKernel) now live in
+# the modules' own repositories (PLANETA9091/crussty-module, PLANETA9091/dist)
+# with their .class artifacts committed there — rebuild them from those repos.
+#
 # Requirements: javac (JDK 8+; --release 8 target works on any modern JDK).
 set -euo pipefail
 
@@ -26,29 +30,6 @@ mkdir -p cplug-sdk/asm-build
 javac "${JAVAC_FLAGS[@]}" -cp "$ASM_JAR" -d cplug-sdk/asm-build \
   cplug-sdk/asm-src/dev/dist/SdkAsmHelper.java
 
-echo "== modules/crussty area-map helpers (area-map/build/) =="
-rm -rf modules/crussty/area-map/build
-javac "${JAVAC_FLAGS[@]}" -d modules/crussty/area-map/build \
-  modules/crussty/area-map/ca/spottedleaf/moonrise/common/misc/RuntimeStubs.java \
-  modules/crussty/area-map/ca/spottedleaf/moonrise/common/misc/SingleUserAreaMapOps.java
-
-echo "== modules/crussty improved-noise bridge (noise/build/) =="
-rm -rf modules/crussty/noise/build
-javac "${JAVAC_FLAGS[@]}" -d modules/crussty/noise/build \
-  modules/crussty/noise/stubs/net/minecraft/world/level/levelgen/synth/ImprovedNoise.java \
-  modules/crussty/noise/stubs/net/minecraft/world/level/levelgen/synth/PaperNativeImprovedNoise.java \
-  modules/crussty/noise/net/minecraft/world/level/levelgen/synth/ImprovedNoiseNativeOps.java
-
-echo "== modules/dist DistKernel (build/) =="
-rm -rf modules/dist/build
-javac "${JAVAC_FLAGS[@]}" -d modules/dist/build \
-  modules/dist/helper/stubs/org/bukkit/BlockData.java \
-  modules/dist/helper/stubs/org/bukkit/Bukkit.java \
-  modules/dist/helper/stubs/org/bukkit/Chunk.java \
-  modules/dist/helper/stubs/org/bukkit/ChunkSnapshot.java \
-  modules/dist/helper/stubs/org/bukkit/World.java \
-  modules/dist/helper/DistKernel.java
-
 echo "== runtime transform hook classes (runtime/build/hooks/) =="
 rm -rf runtime/build/hooks
 javac "${JAVAC_FLAGS[@]}" -d runtime/build/hooks \
@@ -59,4 +40,4 @@ javac "${JAVAC_FLAGS[@]}" -d runtime/build/hooks \
 
 echo
 echo "Generated artifacts:"
-find cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build runtime/build/hooks -name "*.class" | sort
+find cplug-sdk/asm-build runtime/build/hooks -name "*.class" | sort

@@ -60,7 +60,8 @@ A module is a directory (or `.zip`/`.jar` archive) with a
 bytecode, run code on the server's main thread, and use the platform's
 twelve native bricks (events, storage, hot reload, …) — see
 [the docs](https://planeta9091.github.io/CRUSSTY/) for the full contract
-and `modules/hello` in this repo for the smallest working example.
+and the [`hello` module](https://github.com/PLANETA9091/hello) for the
+smallest working example.
 
 Modules are not limited to Rust: the
 [`cplug-sdk-c`](cplug-sdk-c/) binding exposes the same platform to C, C++,
@@ -109,7 +110,9 @@ if both markers appear within the timeout; every stage is logged. Env:
 - `runtime/` — JVMTI runtime: recursive scan, topological loading, hook pipeline
   - `runtime/src/platform/` — the 12 native platform bricks (see table below)
 - `launcher/` — launcher + single-jar bootstrapper (`Boot.java`)
-- `modules/` — bundled modules: `cells`, `crussty`, `dist`, `hello`
+- `modules/` — install location for modules (they live in their own repos:
+  `hello`, `dist`, `crussty-module`, `cells`, `c-moduleslist`,
+  `examples-multilang`; see `modules/README.md`)
 - `scripts/` — `build-single-jar.sh`, `e2e.sh`, `gen_crussty_table.py`
 - `docs/V2-DESIGN.md` — platform design
 - `book/` — user documentation source (published to GitHub Pages)
@@ -138,16 +141,17 @@ Signal handlers chain to whatever the JVM had installed (`sigaction`,
 `SA_SIGINFO`): the JVM's own SIGSEGV handling (hs_err, JIT null checks) is
 never clobbered. Disable with `CRUSSTY_NO_SIGNALS=1` for diagnostics.
 
-## Crussty CE native libraries (modules/crussty)
+## Crussty CE native libraries (crussty-module)
 
-The `crussty` module injects the full Crussty CE native surface (283 JNI
-exports) into any Paper-family kernel. The binaries are published in
-`modules/crussty/native/` (MIT — see `MANIFEST.md` there):
-`libpaper_native_jni.so` is required at runtime (the module logs
-`missing …` and skips injection otherwise), `libpaper_native_chunk_encode_jni.so`
-is optional. The bridge table `modules/crussty/src/jni_table.rs` is generated
-from `native/JNI_EXPORTS.manifest` (single source of truth — never edit the
-.rs by hand):
+The `crussty` module (repository
+[`PLANETA9091/crussty-module`](https://github.com/PLANETA9091/crussty-module))
+injects the full Crussty CE native surface (283 JNI exports) into any
+Paper-family kernel. The binaries are published in its `native/` directory
+(MIT — see `MANIFEST.md` there): `libpaper_native_jni.so` is required at
+runtime (the module logs `missing …` and skips injection otherwise),
+`libpaper_native_chunk_encode_jni.so` is optional. The bridge table
+`modules/crussty/src/jni_table.rs` is generated from `native/JNI_EXPORTS.manifest`
+(single source of truth — never edit the .rs by hand):
 
 ```bash
 python3 scripts/gen_crussty_table.py render        # manifest -> jni_table.rs

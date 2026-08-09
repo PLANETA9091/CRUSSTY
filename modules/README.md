@@ -1,11 +1,17 @@
-# Plugins
+# Modules
 
-Plugins (modules) live in their own `c-<name>` repositories:
+Crussty modules live in their own repositories (convention: `c-<id>`); this
+directory is only the install location on a running server (the launcher
+loads every subdirectory that carries a `cplugin.json`).
 
-- [c-hello](https://github.com/PLANETA9091/c-hello) — minimal proof module (hook + GetLoadedClasses + JNI)
-- [c-dist](https://github.com/PLANETA9091/c-dist) — the dist engine (UDP leases, fencing) as a module
-- [c-crussty](https://github.com/PLANETA9091/c-crussty) — Crussty CE native surface as a module
+Published modules (installable via `crussty install <id>` from the catalog
+`PLANETA9091/crussty-catalog`):
 
-Install: clone into `modules/<name>` and build (`cargo build && cp target/debug/lib<name>.so .`),
-or pack the plugin directory into a `.zip` and drop it next to the others — the
-runtime extracts and loads it automatically.
+| id              | repository                                       |
+|-----------------|--------------------------------------------------|
+| `hello`         | github.com/PLANETA9091/c-hello                    |
+| `dist`          | github.com/PLANETA9091/c-dist                     |
+| `crussty`       | github.com/PLANETA9091/c-crussty                  |
+| `cells`         | github.com/PLANETA9091/c-cells (maintained separately) |
+| `c-moduleslist` | github.com/PLANETA9091/c-moduleslist              |
+| examples        | github.com/PLANETA9091/examples-multilang         |

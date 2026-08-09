@@ -27,7 +27,7 @@ jobs:
 
       - name: Unit tests (all crates)
         run: |
-          for crate in runtime cplug-abi cplug-sdk modules/hello modules/dist modules/crussty modules/cells; do
+          for crate in runtime cplug-abi cplug-sdk; do
             echo "== $crate =="
             cargo test --manifest-path "$crate/Cargo.toml"
           done

@@ -1,6 +1,0 @@
-*.so
-*.h
-!js/qjs/quickjs.h
-*.o
-__pycache__/
-*.pyc

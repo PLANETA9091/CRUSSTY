@@ -55,3 +55,6 @@ server.properties
 !runtime/build/hooks/dev/crussty/hooks/NetHooks.class
 !runtime/build/hooks/dev/crussty/hooks/TickHook.class
 !runtime/build/hooks/dev/crussty/hooks/StorageHooks.class
+
+modules/*
+!modules/README.md

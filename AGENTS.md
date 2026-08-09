@@ -7,7 +7,7 @@ Versions follow SemVer with a `v` prefix. Two paths:
 ### Automatic (default)
 
 Pushing to `master` with changes in `runtime/`, `launcher/`, `cplug-abi/`,
-`cplug-sdk/`, `cplug-sdk-c/`, `cli/`, `modules/` or `scripts/` triggers
+`cplug-sdk/`, `cplug-sdk-c/`, `cli/` or `scripts/` triggers
 `.github/workflows/auto-release.yml`. It computes the next version from
 the commits since the nearest `v[0-9]*` tag that is an **ancestor** of
 HEAD (`git describe` — orphan tags from rewritten history are ignored).

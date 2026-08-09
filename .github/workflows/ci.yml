@@ -15,10 +15,6 @@ jobs:
           - cplug-abi
           - cplug-sdk
           - runtime
-          - modules/hello
-          - modules/dist
-          - modules/crussty
-          - modules/cells
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,9 +41,9 @@ jobs:
         run: python3 scripts/gen_crussty_table.py render --check
       - name: Verify committed artifacts unchanged
         run: |
-          if ! git diff --quiet --exit-code cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build; then
+          if ! git diff --quiet --exit-code cplug-sdk/asm-build runtime/build/hooks; then
             echo "::error::Java helper .class artifacts are out of sync with sources. Run scripts/build-helpers.sh and commit the result."
-            git diff --stat cplug-sdk/asm-build modules/crussty/area-map/build modules/crussty/noise/build modules/dist/build
+            git diff --stat cplug-sdk/asm-build runtime/build/hooks
             exit 1
           fi
           echo "OK: committed artifacts are up to date"
@@ -74,9 +70,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc g++ python3 golang-go
+      - name: Clone module examples
+        run: git clone --depth 1 https://github.com/PLANETA9091/examples-multilang.git /tmp/examples-multilang
       - name: Build every language example
         run: |
-          cd modules/examples-multilang
+          cd /tmp/examples-multilang
           for lang in c cpp go js python; do
             echo "== building $lang =="
             bash $lang/build.sh

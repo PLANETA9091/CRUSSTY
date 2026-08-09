@@ -72,7 +72,7 @@ stage() { printf '\n%s\n' "=== STAGE $1 ==="; }
 
 # ---------------------------------------------------------------- 1. toolchain
 stage "1. toolchain"
-require java; require javac; require jar; require curl; require cargo
+require java; require javac; require jar; require curl; require cargo; require git
 JMAJOR="$(java -version 2>&1 | head -1 | sed 's/^[^0-9]*\([0-9][0-9]*\).*/\1/')"
 if [ "${JMAJOR:-0}" -lt 21 ] && [ "${CRUSSTY_ALLOW_OLD_JAVA:-0}" != "1" ]; then
     fail "Java 21+ required (found $JMAJOR); set CRUSSTY_ALLOW_OLD_JAVA=1 to bypass"
@@ -106,22 +106,34 @@ javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java \
 jar cfe "launcher/launcher.jar" dev.dist.launcher.Main -C launcher/out . \
     || fail "jar launcher"
 
+# Modules live in their own repos (c-<id> convention); clone fresh and
+# install into modules/<id>/ (this dir is also where the launcher discovers
+# them at boot).
+module_repo() {
+    case "$1" in
+        c-*) echo "PLANETA9091/$1" ;;
+        *) echo "PLANETA9091/c-$1" ;;
+    esac
+}
 for id in $MODULES; do
-    m="$REPO/modules/$id"
-    [ -f "$m/Cargo.toml" ] || fail "module not found: $id"
-    [ -f "$m/cplugin.json" ] || fail "module $id has no cplugin.json"
-    log "build + install module: $id"
-    cargo build --manifest-path "$m/Cargo.toml" || fail "cargo build $id"
+    repo="$(module_repo "$id")"
+    src="$SERIAL_DIR/mod-src/$id"
+    log "clone + build + install module: $id ($repo)"
+    git clone --depth 1 "https://github.com/$repo.git" "$src" >/dev/null 2>&1 \
+        || fail "cannot clone $repo"
+    [ -f "$src/Cargo.toml" ] || fail "module $id has no Cargo.toml in $repo"
+    [ -f "$src/cplugin.json" ] || fail "module $id has no cplugin.json"
+    cargo build --manifest-path "$src/Cargo.toml" || fail "cargo build $id"
     # The [lib] name may differ from the module id (cargo forbids hyphens in
     # library target names, while manifest ids may carry them), so resolve the
     # produced artifact instead of assuming `lib$id.so`.
-    LIB_NAME="$(sed -n '/^\[lib\]/,/^\[/p' "$m/Cargo.toml" | sed -n 's/^name *= *"\(.*\)"/\1/p' | head -1)"
+    LIB_NAME="$(sed -n '/^\[lib\]/,/^\[/p' "$src/Cargo.toml" | sed -n 's/^name *= *"\(.*\)"/\1/p' | head -1)"
     LIB_NAME="${LIB_NAME:-$id}"
-    # Idempotent install: cargo may leave the artifact hardlinked to the
-    # installed copy (same inode) — copying it onto itself would fail.
-    if ! [ "$m/target/debug/lib$LIB_NAME.so" -ef "$m/lib$id.so" ]; then
-        cp "$m/target/debug/lib$LIB_NAME.so" "$m/lib$id.so"
-    fi
+    mkdir -p "$REPO/modules/$id"
+    cp "$src/cplugin.json" "$REPO/modules/$id/"
+    cp "$src/target/debug/lib$LIB_NAME.so" "$REPO/modules/$id/lib$id.so"
+    # bundled native deps (e.g. c-crussty/native) are part of the module
+    [ -d "$src/native" ] && cp -r "$src/native" "$REPO/modules/$id/"
 done
 
 # --------------------------------------------------------------- 4. boot
@@ -171,23 +183,24 @@ stage "5. hot-reload: rebuild a module (new inode), SIGUSR1, assert purge + aliv
 log "pipeline ready=$found_pipeline  hello native=$found_hello  crussty live=$found_native"
 
 RELOAD_ID="${E2E_RELOAD_ID:-hello}"
-m="$REPO/modules/$RELOAD_ID"
-[ -f "$m/Cargo.toml" ] || fail "reload module not found: $RELOAD_ID"
+m="$SERIAL_DIR/mod-src/$RELOAD_ID"
+[ -f "$m/Cargo.toml" ] || fail "reload module not found: $RELOAD_ID (mod-src clone)"
 
 # Honest reload: the .so the server has dlopened must change on disk (new
 # inode) BEFORE the trigger, exactly like a developer rebuilding a module.
 # Force a real recompile: cargo's up-to-date check can no-op even when its
 # output got replaced by our previous install (artifacts end up hardlinked
 # to the installed copy), so the artifact is removed first.
-OLD_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
+INSTALLED="$REPO/modules/$RELOAD_ID"
+OLD_INODE="$(stat -c '%i' "$INSTALLED/lib$RELOAD_ID.so")"
 touch "$m/src/lib.rs"
 rm -f "$m/target/debug/lib$RELOAD_ID.so"
 cargo build --manifest-path "$m/Cargo.toml" || fail "rebuild $RELOAD_ID for reload"
 # Replace via mv (new directory entry): guaranteed new inode — in-place cp
 # would keep the inode and the server's dlopen cache could return the same
 # mapping.
-mv -f "$m/target/debug/lib$RELOAD_ID.so" "$m/lib$RELOAD_ID.so"
-NEW_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
+mv -f "$m/target/debug/lib$RELOAD_ID.so" "$INSTALLED/lib$RELOAD_ID.so"
+NEW_INODE="$(stat -c '%i' "$INSTALLED/lib$RELOAD_ID.so")"
 if [ "$OLD_INODE" = "$NEW_INODE" ]; then
     fail "reload artifact not actually replaced (same inode $OLD_INODE)"
 fi
