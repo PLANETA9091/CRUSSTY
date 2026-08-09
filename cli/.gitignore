@@ -1,0 +1,4 @@
+target/
+npm/bin/crussty
+npm/bin/crussty.exe
+npm/package-lock.json

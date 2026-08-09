@@ -1,0 +1,15 @@
+[package]
+name = "crussty-mod"
+version = "0.1.0"
+edition = "2021"
+description = "Crussty c-plugin scaffold"
+
+[workspace]
+
+[lib]
+name = "__NAME__"
+crate-type = ["cdylib"]
+
+[dependencies]
+cplug-abi = { git = "https://github.com/PLANETA9091/CRUSSTY", path = "cplug-abi" }
+cplug-sdk = { git = "https://github.com/PLANETA9091/CRUSSTY", path = "cplug-sdk" }

@@ -1,0 +1,95 @@
+//! Crussty CLI — server ops for Crussty server builders, module tooling for
+//! c-plugin developers.
+
+use clap::{Parser, Subcommand};
+use std::process::ExitCode;
+
+mod catalog;
+mod init;
+mod lib;
+mod modules;
+mod pack;
+mod scaffold;
+mod server;
+
+#[derive(Parser)]
+#[command(name = "crussty", version, about = "CLI for Crussty servers and c-plugins")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Scaffold a Crussty server directory.
+    Init(init::InitArgs),
+    /// Launch the server; stdin is forwarded to the server console.
+    Run,
+    /// Stop the running server.
+    Stop,
+    /// Tail the console log.
+    Log { #[arg(long, short)] follow: bool },
+    /// List modules and their status (active / parked / disabled).
+    Ls,
+    /// Activate a parked/disabled module.
+    Enable { module: String },
+    /// Park (append .x) or disable (--disabled → .disabled) a module.
+    Disable {
+        module: String,
+        #[arg(long)] disabled: bool,
+    },
+    /// Hot-reload all modules (SIGUSR1 to the running JVM).
+    Reload,
+    /// Install a module from the Crussty module catalog.
+    Install {
+        module: String,
+        /// Catalog repo "owner/name"; defaults to PLANETA9091/crussty-catalog.
+        #[arg(long)]
+        catalog: Option<String>,
+    },
+    /// Module developer tooling.
+    Module {
+        #[command(subcommand)]
+        cmd: ModuleCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModuleCmd {
+    /// Scaffold a new module from a language template.
+    New(scaffold::NewArgs),
+    /// Build the module in the current directory.
+    Build,
+    /// Rebuild and hot-reload on every code change.
+    Watch,
+    /// Package the module as a distributable tarball.
+    Pack(pack::PackArgs),
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let code = match cli.command {
+        Command::Init(args) => init::run(args),
+        Command::Run => server::run(),
+        Command::Stop => server::stop(),
+        Command::Log { follow } => server::log(follow),
+        Command::Ls => modules::list(),
+        Command::Enable { module } => modules::set_enabled(&module, true),
+        Command::Disable { module, disabled } => {
+            if disabled {
+                modules::set_enabled(&module, false)
+            } else {
+                modules::park(&module)
+            }
+        }
+        Command::Reload => server::reload(),
+        Command::Install { module, catalog } => catalog::install(&module, catalog.as_deref()),
+        Command::Module { cmd } => match cmd {
+            ModuleCmd::New(args) => scaffold::run_new(args),
+            ModuleCmd::Build => scaffold::run_build(),
+            ModuleCmd::Watch => scaffold::run_watch(),
+            ModuleCmd::Pack(args) => pack::run(args),
+        },
+    };
+    ExitCode::from(code as u8)
+}

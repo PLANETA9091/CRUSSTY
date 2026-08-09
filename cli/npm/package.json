@@ -1,0 +1,17 @@
+{
+  "name": "crussty-cli",
+  "version": "0.1.0",
+  "description": "Crussty CLI — run Crussty servers and build c-plugins (binary via GitHub releases)",
+  "bin": {
+    "crussty": "bin/crussty"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": ["install.js", "bin"],
+  "license": "MIT",
+  "keywords": ["crussty", "minecraft", "paper", "purpur", "c-plugin"],
+  "engines": {
+    "node": ">=14"
+  }
+}
