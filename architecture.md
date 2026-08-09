@@ -90,7 +90,7 @@ against a different ABI version.
 ## Module loading
 
 `RTLD_LOCAL` everywhere. Every class produced by `register_class_hook` is
-named with the module prefix (`dist/...`, `crussty/...`) so modules never
+named with the module prefix (`dist/...`, `crussty/...`) so modules do not
 collide in the kernel's loader namespace.
 
 ## Topological order

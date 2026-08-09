@@ -10,7 +10,7 @@ A Crussty module is a **shared library** that exports exactly one C-ABI
 function:
 
 ```c
-int32_t cplugin_init(const CPluginApi* api, JavaVM* vm, const char* options);
+int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options);
 ```
 
 The runtime scans `modules/` on every boot, loads each manifest, and for

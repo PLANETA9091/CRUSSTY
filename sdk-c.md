@@ -55,8 +55,9 @@ typedef void  (*cplug_main_fn)(void* ctx, void* env /* JNIEnv* */);
 | `cplug_sdk_attach_current_thread()` | attaches if needed; thread stays attached | `JNIEnv*` or `NULL` |
 | `cplug_sdk_detach_current_thread()` | detaches — only if **you** attached | — |
 
-Callbacks must stay valid for the whole module lifetime — hooks are never
-unregistered.
+Callbacks must stay valid for the module lifetime — the SDK itself never
+unregisters them (the runtime purges a replaced module's hooks on hot
+reload).
 
 ## Memory contract for byte hooks
 
@@ -99,22 +100,47 @@ def sdk(name, restype, argtypes):
     return f
 
 sdk_init = sdk("cplug_sdk_init", None, [ctypes.c_void_p, ctypes.c_void_p])
+sdk_log_info = sdk("cplug_sdk_log_info", None, [ctypes.c_char_p])
 sdk_hook = sdk("cplug_sdk_hook_register", ctypes.c_int32,
                [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p])
+sdk_ready = sdk("cplug_sdk_on_kernel_ready", ctypes.c_int32,
+                [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p])
+sdk_main = sdk("cplug_sdk_run_on_main_thread", ctypes.c_int32,
+               [ctypes.c_void_p, ctypes.c_void_p])
+
 HOOK = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_char_p)
+READY = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+MAIN = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
 
 @HOOK
 def on_class(ctx, name):
-    sdk_log(b"[hello] python saw " + (name or b"?"))
+    sdk_log_info(b"[hello_sdk] python saw class " + (name or b"?"))
+
+@READY
+def on_ready(ctx):
+    sdk_log_info(b"[hello_sdk] kernel ready (python)")
+    sdk_main(None, on_main)
+
+@MAIN
+def on_main(ctx, env):
+    sdk_log_info(b"[hello_sdk] on the server thread (python)")
 
 def cplugin_init(api_addr, vm_addr, options):
     sdk_init(ctypes.c_void_p(api_addr), ctypes.c_void_p(vm_addr))
     sdk_hook(b"org/bukkit/**", None, on_class)
+    sdk_ready(b"org/bukkit/Bukkit", None, on_ready)
+    sdk_main(None, on_main)
     return 0
 ```
 
 Keep the callbacks alive for the whole module lifetime (CPython refcounts
-free them otherwise) — the example keeps them in a list.
+free them otherwise) — the example keeps them in a list. The C shim
+(`shim.c`) holds only the `cplugin_init` export: it re-registers libpython
+globally (the runtime dlopens with `RTLD_LOCAL`), runs `Py_Initialize()`
+once on the OnLoad thread, imports `hello_sdk` and calls its
+`cplugin_init(api, vm, options)` while holding the GIL, then releases it —
+hooks from arbitrary class-load threads re-take the GIL via
+`PyGILState_Ensure`.
 
 ## Caveats
 

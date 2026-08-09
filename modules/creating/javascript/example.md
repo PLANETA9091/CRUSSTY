@@ -38,7 +38,8 @@ exposes the hook callback to the runtime as a C class-file hook:
 #include "quickjs.h"
 #include "cplug-abi.h"
 
-/* ... quickjs_std.h eval of hello_hello.js, pick make_hook, wrap it ... */
+/* ... quickjs_std eval of hello_hello.js, keep the exported hook in
+ * g_js_hook (a JS function), wrap the interpreter in g_js_lock ... */
 
 static int32_t on_class_load(
     void* ctx, const char* name,
@@ -46,11 +47,16 @@ static int32_t on_class_load(
     uint8_t** out_data, size_t* out_len
 ) {
     JSContext* cx = (JSContext*)ctx;
-    JSValue fn = JS_GetPropertyStr(cx, g_js_hook, "on_class_load");
-    JSValue argv[1] = { JS_NewString(cx, name) };
-    JSValue ret = JS_Call(cx, fn, JS_UNDEFINED, 1, argv);
-    /* ret == null -> keep original bytes (return 1 from the hook) */
-    return 1;
+    pthread_mutex_lock(&g_js_lock);
+    JSValue arg = JS_NewString(cx, name);
+    JSValue ret = JS_Call(cx, g_js_hook, JS_UNDEFINED, 1, (JSValueConst[]){arg});
+    if (JS_IsException(ret)) {
+        /* ... dump the error to stderr ... */
+    }
+    JS_FreeValue(cx, ret);
+    JS_FreeValue(cx, arg);
+    pthread_mutex_unlock(&g_js_lock);
+    return 0; /* keep original bytes */
 }
 
 int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
@@ -63,7 +69,7 @@ int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options) {
 ## 3. Manifest — `cplugin.json`
 
 ```json
-{"id": "hello", "main": "libhello.so"}
+{"id": "hello_js", "main": "libhello_js.so"}
 ```
 
 ## 4. Build — `build.sh`
@@ -74,9 +80,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 QJS_DIR="${QJS_DIR:-$PWD/qjs}"
 cc -shared -fPIC -O2 \
-    -I"$PWD/../../cplug-abi" \
-    -I"$QJS_DIR/../.." \
-    -o libhello.so shim.c \
+    -I"$PWD/../../../cplug-sdk-c/include" \
+    -I"$QJS_DIR" \
+    -o libhello_js.so shim.c \
     -L"$QJS_DIR" -Wl,-rpath,'$ORIGIN/qjs' -lqjs
 ```
 
@@ -85,5 +91,5 @@ working copy is committed in `./qjs` next to the script.)
 
 ## 5. Deploy
 
-Drop `libhello.so` and `cplugin.json` into `modules/` and start the server.
+Drop `libhello_js.so` and `cplugin.json` into `modules/` and start the server.
 Expected log: `[hello-js] hook fired for ...` on every kernel class load.

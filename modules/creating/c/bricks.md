@@ -8,7 +8,7 @@ nav_order: 2
 
 A C module receives the entire platform API: `CPluginApi` (class hooks,
 JVMTI, key claims) **plus** its trailing `platform` pointer — `CPlatformApi`,
-version `CPB_VERSION=1`. In C you call the bridge directly, no shim.
+version `CPAPI_PLATFORM_VERSION=1` (the C header's name; the Rust crate calls it `CPB_VERSION`). In C you call the bridge directly, no shim.
 
 ## The API surface
 

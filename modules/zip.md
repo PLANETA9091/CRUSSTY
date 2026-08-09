@@ -20,9 +20,18 @@ any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 
 ## Security
 
-Entries whose paths escape the extraction directory via `..` are rejected.
-An offending entry fails the whole extraction; the module is skipped with a
-warning.
+Entries whose paths escape the extraction directory via `..` are rejected
+(also `\`, empty components, drive letters, and symlinks — special files
+are never materialized). An offending entry fails the whole extraction;
+the module is skipped with a warning.
+
+Hard caps on the archive, enforced before extraction:
+
+| Limit | Counts |
+|---|---|
+| 10 000 | entries (central directory records, directories included) |
+| 256 MiB | a single entry's unwrapped (uncompressed) size |
+| 1 GiB | total unwrapped size across all entries |
 
 ## When to use zip
 

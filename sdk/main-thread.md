@@ -10,13 +10,13 @@ Most kernel work must happen on the server main thread. The SDK delivers a
 `Runnable` there:
 
 ```rust
-main_thread::run_on_main_thread(|env| {
-    let msg = cstr("hello from native c-plugin (v2 pipeline alive)");
-    let _ = classes::static_method("org/bukkit/Bukkit", "getLogger", "()Lorg/bukkit/Logger;")
-        .and_then(|_| { /* invoke */ Ok(()) });
-    log::info(msg);
+main_thread::run_on_main_thread(|_env| {
+    log::info("dispatched on the server main thread");
 });
 ```
+
+The callback receives a real `JNIEnv` of the main thread — use it for
+method lookups (see [Classes & JNI](classes.html)).
 
 ## Why the main thread is special
 
@@ -29,10 +29,10 @@ main_thread::run_on_main_thread(|env| {
 
 ## Delivery
 
-The SDK bridges a small Java `Runnable` into the kernel (compiled with
-`javac --release 8` and `include_bytes!`'d into the module), loads it on the
-main thread, and invokes it — no reflection, no per-call classloading. The
-callback receives a real `JNIEnv` of the main thread.
+The SDK hand-assembles a small Java-compatible `Runnable` (Java 8 class
+format) and defines it into the kernel on demand, then invokes it on the
+main thread — no reflection, no per-call classloading. The callback
+receives a real `JNIEnv` of the main thread.
 
 ## Blocking
 

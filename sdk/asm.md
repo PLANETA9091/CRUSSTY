@@ -6,17 +6,26 @@ nav_order: 4
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/assembly.svg" alt=""> ASM weaving
 
-`cplug-sdk::asm` provides prebuilt bytecode surgery with `wee_alloc`-free,
-zero-dependency ASM — a small hand-rolled bytecode writer tuned for the
-patterns native modules need:
+`cplug-sdk::asm` replaces a Java method's body with a call to your native
+bridge. The rewriting itself is done by a small injected Java helper
+(`SdkAsmHelper`, built on `org/objectweb/asm`) defined into the target
+class's loader — no hand-rolled bytecode writer, no per-module classpath:
 
-- **replace_body(class, method, desc, instrs)** — replaces a method's
-  body with hand-assembled bytecode. Used for hot-path swaps where the
+- **replace_body(env, loader, class_bytes, spec)** — rewrites the class
+  bytes so the method named in `spec` becomes
+  `invokestatic <bridge>; return`. Used for hot-path swaps where the
   original Java method is entirely replaced by native logic.
-- **ArgSpec** — typed access to a method's arguments inside the woven body:
-  `ArgSpec::Local(idx)` reads a local slot, `ArgSpec::ThisField(field)` reads
-  an instance field (e.g. grabbing the chunk's `BlockStatePalette` from the
-  receiver).
+- **ReplaceBody** — the spec struct: `method_name` / `method_desc` (the
+  method to replace), `bridge_owner` / `bridge_name` / `bridge_desc` (the
+  native bridge to call instead), and `args` (the call arguments).
+- **ArgSpec** — an argument source for the bridge call (must match the
+  bridge's parameter types exactly):
+  - `ArgSpec::Local { slot, ty }` — reads a local variable of the patched
+    method (`slot 0` = `this` for instance methods); `ty` is a JVM type
+    char (`I`/`J`/`D`/`F`/`Z`/`L`/`[`) selecting the load opcode.
+  - `ArgSpec::ThisField { name, desc }` — emits `aload 0; getfield` to
+    read an instance field of the patched class (e.g. grabbing the chunk's
+    `BlockStatePalette` from the receiver).
 
 Typical usage in `c-crussty` (worldgen noise): hook the chunk generator
 class, locate the noise method, verify the signature, then
@@ -25,6 +34,10 @@ noise implementation.
 
 ## Guidelines
 
+- Retransform cannot change field access flags: reading a private field
+  with `ThisField` is fine, but changing the field's flags in the
+  rewritten class fails with
+  `JVMTI_ERROR_UNSUPPORTED_REDEFINITION_SCHEMA_CHANGED`.
 - Verify the class and method before weaving; never guess signatures —
   the kernel's obfuscation is Mojang-mapped at runtime on Purpur, but map
   names can shift between versions.

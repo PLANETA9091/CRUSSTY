@@ -1,6 +1,7 @@
 ---
 title: Module SDK
 nav_order: 6
+has_children: true
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> Module SDK
@@ -12,12 +13,12 @@ main-thread dispatch, logging, and ASM method patching.
 ```rust
 use cplug_sdk::{init, hooks, classes, log};
 
-init(api, vm, options)?;
+init(api, vm); // stores the JavaVM, registers the SDK dispatch hook
 
-hooks::register("org/bukkit/Bukkit", |ctx, bytes, len| {
-    // patch bytecode of every Bukkit class load
-    Ok(Some(patched.to_vec()))
-})?;
+hooks::register("org/bukkit/Bukkit", |name| {
+    // fires on every Bukkit class load (name-only hook)
+    eprintln!("Bukkit loaded: {name}");
+});
 ```
 
 ## Golden rules
@@ -30,9 +31,9 @@ hooks::register("org/bukkit/Bukkit", |ctx, bytes, len| {
 3. **Unique class names per module.** Prefix generated classes with your
    module id (`hello/Bridge`), or you collide with other modules' generated
    classes in the kernel's loader.
-4. **Never call `jvmti_allocate` yourself** — use
-   `cplug_sdk::alloc_replacement` / the ABI allocator, so the runtime can
-   free everything after the JVM copies it.
+4. **Never call `jvmti_allocate` yourself for replacement bytes** — byte
+   hooks return `Vec<u8>` and the SDK routes them through the ABI allocator,
+   so the runtime can free everything after the JVM copies it.
 
 ## Modules
 

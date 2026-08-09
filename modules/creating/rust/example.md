@@ -22,7 +22,7 @@ step by step. You will have it running on a server in about five minutes.
 A module is a shared library that exports **one** C-ABI function:
 
 ```c
-int32_t cplugin_init(const CPluginApi* api, JavaVM* vm, const char* options);
+int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options);
 ```
 
 The runtime scans `modules/`, dlopens each `<id>/lib<id>.so`, calls
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn cplugin_init(
     // Once the kernel is up, log through Bukkit.getLogger() from the
     // main thread (the queue flushes only after the server object exists).
     cplug_sdk::on_kernel_ready("org.bukkit.Bukkit", || {
-        let found = cplug_sdk::classes::find_class("org/bukkit/Bukkit").is_ok();
+        let found = cplug_sdk::classes::find_class("org/bukkit/Bukkit").is_some();
         eprintln!("[hello-plugin] GetLoadedClasses resolved Bukkit: {}", found);
         cplug_sdk::run_on_main_thread(|_env| {
             cplug_sdk::log::info("hello from native c-plugin (v2 pipeline alive)");

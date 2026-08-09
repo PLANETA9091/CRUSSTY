@@ -19,7 +19,7 @@ What this means in practice:
 | network | via shim export | registry + traffic counters, string keys |
 | storage | via shim export | key-value, JSON-serializable in JS |
 | threads | via shim export | worker thread with JS event loop |
-| hot_reload | automatic | swap `libhello.so` — QuickJS state is re-seeded |
+| hot_reload | automatic | swap `libhello_js.so` — QuickJS state is re-seeded |
 
 Everything else (transform, signals, telemetry, side_table,
 save_events, barriers when wrapped) is reachable the same way: the shim
@@ -27,5 +27,5 @@ forwards fields of
 `api->platform` into functions callable from JS.
 
 The full API and the version-guard contract (CPAPI_VERSION=3,
-CPB_VERSION=1) is on [Platform
+CPAPI_PLATFORM_VERSION=1) is on [Platform
 bricks](../../../platform/bricks.html).

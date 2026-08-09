@@ -22,12 +22,14 @@ typedef struct CPluginApi {
     uint32_t version;
     int32_t (*register_class_hook)(...);
     uint8_t* (*jvmti_allocate)(size_t);
+    int32_t (*retransform_class)(const char* name);
+    int32_t (*claim)(unsigned long owner, const char* key);
     /* v3 trailing */
     const CPlatformApi* platform;   /* NULL on older runtimes */
 } CPluginApi;
 ```
 
-`CPlatformApi` is versioned itself (`CPB_VERSION=1`). Before touching any
+`CPlatformApi` is versioned itself (the C header's `CPAPI_PLATFORM_VERSION`, Rust's `CPB_VERSION`, both = 1). Before touching any
 brick function you must:
 
 ```c
@@ -64,7 +66,7 @@ is not part of `CPlatformApi`:
    checked.
 3. **Callbacks you hand to the bridge must live forever** — the platform
    keeps them; module memory must stay valid for the whole runtime.
-4. Bridge versions bump independently: `CPAPI_VERSION` and `CPB_VERSION`
+4. Bridge versions bump independently: `CPAPI_VERSION` and `CPAPI_PLATFORM_VERSION`/`CPB_VERSION`
    are separate.
 
 ## Per-language

@@ -1,6 +1,7 @@
 ---
 title: Modules
 nav_order: 4
+has_children: true
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/archive.svg" alt=""> Modules
@@ -59,7 +60,7 @@ A malformed `main` (absolute path, or escaping the module directory with
 Every module library must export the cplug-abi entry point:
 
 ```c
-int32_t cplugin_init(const CPluginApi* api, JavaVM* vm, const char* options);
+int32_t cplugin_init(const CPluginApi* api, void* vm, const char* options);
 ```
 
 `api` provides three services: register a class-file hook, allocate

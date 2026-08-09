@@ -55,7 +55,9 @@ int32_t cplugin_init(const CPluginApi* api, void* vm_ptr, const char* options) {
 ## 3. Build
 
 ```bash
-gcc -shared -fPIC -O2 -o libhello_c.so hello.c
+gcc -shared -fPIC -O2 \
+    -I"$PWD/../../../cplug-sdk-c/include" \
+    -o libhello_c.so hello.c
 ```
 
 (the runtime picks `lib<id>.so` = `libhello_c.so` next to the manifest.)
@@ -68,5 +70,6 @@ the first kernel class load after boot.
 
 ## C++
 
-Identical: build the same sources with `g++ -shared -fPIC -O2`, and export the
-entry with `extern "C"`. `cplug-abi.h` is plain C-compatible.
+Identical: build the same sources with `g++ -shared -fPIC -O2 -std=c++17`
+(plus the same `-I`), and export the entry with `extern "C"`. `cplug-abi.h`
+is plain C-compatible.
