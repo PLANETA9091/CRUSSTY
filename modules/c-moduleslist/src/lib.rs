@@ -206,7 +206,7 @@ fn install_command(env: &JniEnv, cmd_cls_ref: &ClassRef) {
     env.delete_local_ref(cls);
 }
 
-/// `server.getCommandMap().register(prefix, new Cmd("modules"))`.
+/// `server.getCommandMap().register("crussty", new Cmd("modules"))`.
 fn register_with_server(env: &JniEnv, cmd_cls: jni::jclass) {
     let clean_up = |env: &JniEnv| {
         if env.exception_check() {
@@ -264,73 +264,34 @@ fn register_with_server(env: &JniEnv, cmd_cls: jni::jclass) {
         return;
     };
     let map_cls = env.get_object_class(map);
-    // Observed on Paper 1.21.10: GetMethodID resolves inherited methods
-    // (dispatch, clearCommands, getCommand, getKnownCommands) but NOT
-    // `register(String, Command)` — the craft command map in the running
-    // classpath appears rewritten without it (reflection-rewriter). The
-    // command is therefore registered through the route that only touches
-    // methods that DO resolve: `getKnownCommands().put("modules", cmd)`.
-    // SimpleCommandMap.dispatch reads exactly that map, so `/modules` is
-    // dispatched like any other command, no Plugin involved.
-    let Some(reg) = env.get_method_id(
-        map_cls,
-        "register",
-        "(Ljava/lang/String;Lorg/bukkit/command/Command;)V",
-    ) else {
+    // `CommandMap.register(String, Command)` returns boolean — the classic
+    // old-Bukkit `void register(...)` signature no longer exists on Paper,
+    // so a GetMethodID lookup with a `)V` descriptor comes back null while
+    // every other inherited method (also boolean-returning ones, e.g.
+    // dispatch) resolves fine. The map object is a CraftCommandMap that
+    // declares only <init>/getKnownCommands; register is inherited from
+    // SimpleCommandMap and must be looked up with its real descriptor.
+    let reg_sig = "(Ljava/lang/String;Lorg/bukkit/command/Command;)Z";
+    let Some(reg) = env.get_method_id(map_cls, "register", reg_sig) else {
         clean_up(env);
-        // Fallback route that only touches methods DECLARED on the map's own
-        // class + JDK Map: getKnownCommands().put("modules", cmd).
-        let Some(gkc) = env.get_method_id(map_cls, "getKnownCommands", "()Ljava/util/Map;")
-        else {
-            eprintln!("[c-moduleslist] CommandMap.register not found");
-            return;
-        };
-        let known = env.call_object_method(map, gkc, &[]);
-        if known.is_null() {
-            clean_up(env);
-            eprintln!("[c-moduleslist] getKnownCommands() null");
-            return;
-        }
-        let known_cls = env.get_object_class(known);
-        let Some(put) = env.get_method_id(
-            known_cls,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        ) else {
-            clean_up(env);
-            eprintln!("[c-moduleslist] Map.put not found");
-            return;
-        };
-        let Some(label) = env.new_string("modules") else {
-            clean_up(env);
-            return;
-        };
-        env.call_object_method(known, put, &[jni::jvalue { l: label }, jni::jvalue { l: cmd }]);
-        if env.exception_check() {
-            eprintln!("[c-moduleslist] Map.put threw");
-            env.exception_describe();
-            env.exception_clear();
-            return;
-        }
-        eprintln!("[c-moduleslist] /modules registered (via knownCommands.put)");
+        eprintln!("[c-moduleslist] CommandMap.register ({reg_sig}) not found");
         return;
     };
     let Some(prefix) = env.new_string("crussty") else {
         clean_up(env);
         return;
     };
-    env.call_void_method(
+    let ok = env.call_boolean_method(
         map,
         reg,
         &[jni::jvalue { l: prefix }, jni::jvalue { l: cmd }],
     );
     if env.exception_check() {
+        clean_up(env);
         eprintln!("[c-moduleslist] CommandMap.register threw");
-        env.exception_describe();
-        env.exception_clear();
         return;
     }
-    eprintln!("[c-moduleslist] /modules registered");
+    eprintln!("[c-moduleslist] /modules registered (register returned {ok})");
 }
 
 // ---------------------------------------------------------------------------
