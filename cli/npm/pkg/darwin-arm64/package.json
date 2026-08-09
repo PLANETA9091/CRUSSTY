@@ -1,0 +1,9 @@
+{
+  "name": "crussty-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Crussty CLI binary for macos-arm64 (installed automatically via optionalDependencies)",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "license": "MIT"
+}

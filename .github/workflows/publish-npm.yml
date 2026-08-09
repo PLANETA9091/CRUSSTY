@@ -1,0 +1,78 @@
+name: publish-npm
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            pkg: crussty-linux-x64
+            tag: linux-x64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            pkg: crussty-linux-arm64
+            tag: linux-arm64
+          - os: macos-latest
+            arch: arm64
+            pkg: crussty-darwin-arm64
+            tag: darwin-arm64
+          - os: windows-latest
+            arch: x64
+            pkg: crussty-win32-x64
+            tag: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Build
+        working-directory: cli
+        run: cargo build --release
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: |
+            cli/target/release/crussty
+            cli/target/release/crussty.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Stage binaries into platform packages
+        run: |
+          for d in dist/*/; do
+            pkg=$(basename "$d")
+            tag=${pkg#crussty-}
+            mkdir -p "cli/npm/pkg/$tag/bin"
+            cp "$d"/crussty* "cli/npm/pkg/$tag/bin/"
+            chmod +x "cli/npm/pkg/$tag/bin/"crussty*
+          done
+      - name: Publish platform packages
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > .npmrc
+          for tag in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
+            (cd "cli/npm/pkg/$tag" && npm publish --access public)
+          done
+      - name: Publish main package
+        working-directory: cli/npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > .npmrc
+          npm publish --access public

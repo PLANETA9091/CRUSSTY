@@ -1,0 +1,9 @@
+{
+  "name": "crussty-win32-x64",
+  "version": "0.1.0",
+  "description": "Crussty CLI binary for windows-x64 (installed automatically via optionalDependencies)",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["bin"],
+  "license": "MIT"
+}
