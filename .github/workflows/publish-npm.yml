@@ -27,8 +27,8 @@ jobs:
             tag: darwin-arm64
           - os: windows-latest
             arch: x64
-            pkg: crussty-win32-x64
-            tag: win32-x64
+            pkg: crussty-windows-x64
+            tag: windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
           done
       - name: Publish platform packages
         run: |
-          for tag in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
+          for tag in linux-x64 linux-arm64 darwin-arm64 windows-x64; do
             (cd "cli/npm/pkg/$tag" && npm publish --access public)
           done
       - name: Publish main package

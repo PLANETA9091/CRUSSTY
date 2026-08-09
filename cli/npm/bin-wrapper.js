@@ -11,7 +11,7 @@ const platformPkgs = {
   "linux-x64": "crussty-linux-x64",
   "linux-arm64": "crussty-linux-arm64",
   "darwin-arm64": "crussty-darwin-arm64",
-  "win32-x64": "crussty-win32-x64",
+  "win32-x64": "crussty-windows-x64",
 };
 const pkgName = platformPkgs[`${process.platform}-${process.arch}`];
 const binName = process.platform === "win32" ? "crussty.exe" : "crussty";

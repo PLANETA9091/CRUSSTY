@@ -1,6 +1,6 @@
 {
   "name": "crussty",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Crussty CLI — run Crussty servers and build c-plugins. Ships platform binaries via optionalDependencies, no install scripts.",
   "bin": {
     "crussty": "bin-wrapper.js"
@@ -11,7 +11,7 @@
     "crussty-linux-x64": "0.1.0",
     "crussty-linux-arm64": "0.1.0",
     "crussty-darwin-arm64": "0.1.0",
-    "crussty-win32-x64": "0.1.0"
+    "crussty-windows-x64": "0.1.0"
   },
   "license": "MIT",
   "keywords": ["crussty", "minecraft", "paper", "purpur", "c-plugin"],
