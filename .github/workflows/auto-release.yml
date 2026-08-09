@@ -43,7 +43,7 @@ jobs:
           else
             PATCH=$((PATCH+1))
           fi
-          echo "version=v$MAJOR.$MINOR.$PATCH"
+          echo "version=v$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
           echo "commits=$COMMITS"
 
   build:
