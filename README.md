@@ -1,5 +1,13 @@
 # CRUSSTY — native c-plugin platform (v2)
 
+> **Docs:** [planeta9091.github.io/CRUSSTY](https://planeta9091.github.io/CRUSSTY/)
+> (quickstart, module API, SDK reference, troubleshooting)
+>
+> **Download:** ready-to-run artifacts — `crussty-linux-x64` (single-jar),
+> `launcher.jar`, `libcrussty_runtime.so`, run scripts — in
+> [Releases](https://github.com/PLANETA9091/CRUSSTY/releases). Build from
+> source only if you need to hack on the runtime itself.
+
 Injects native Rust modules into any Paper-compatible kernel: a JVMTI runtime
 with a ClassFileLoadHook hot-patch pipeline. A module is a plugin: a directory
 (or `.zip`/`.jar` archive) with a `cplugin.json` manifest and an entry library.
