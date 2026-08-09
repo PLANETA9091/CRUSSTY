@@ -22,7 +22,7 @@ cd "$REPO"
 PURPUR_VERSION="${PURPUR_VERSION:-1.21.10}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-420}"
 POLL_SEC="${POLL_SEC:-2}"
-MODULES_DEFAULT="hello dist crussty"
+MODULES_DEFAULT="hello dist crussty c-moduleslist"
 MODULES="${MODULES:-$MODULES_DEFAULT}"
 
 # Pick a port that is actually free right now (python3 is a hard depend two
@@ -112,10 +112,15 @@ for id in $MODULES; do
     [ -f "$m/cplugin.json" ] || fail "module $id has no cplugin.json"
     log "build + install module: $id"
     cargo build --manifest-path "$m/Cargo.toml" || fail "cargo build $id"
+    # The [lib] name may differ from the plugin id (cargo forbids hyphens in
+    # library target names, while manifest ids may carry them), so resolve the
+    # produced artifact instead of assuming `lib$id.so`.
+    LIB_NAME="$(sed -n '/^\[lib\]/,/^\[/p' "$m/Cargo.toml" | sed -n 's/^name *= *"\(.*\)"/\1/p' | head -1)"
+    LIB_NAME="${LIB_NAME:-$id}"
     # Idempotent install: cargo may leave the artifact hardlinked to the
     # installed copy (same inode) — copying it onto itself would fail.
-    if ! [ "$m/target/debug/lib$id.so" -ef "$m/lib$id.so" ]; then
-        cp "$m/target/debug/lib$id.so" "$m/lib$id.so"
+    if ! [ "$m/target/debug/lib$LIB_NAME.so" -ef "$m/lib$id.so" ]; then
+        cp "$m/target/debug/lib$LIB_NAME.so" "$m/lib$id.so"
     fi
 done
 
@@ -213,6 +218,30 @@ kill -0 "$JAVA_PID" 2>/dev/null || fail "server died during hot-reload (reload=$
 [ "$found_reload" -eq 1 ] || fail "hot-reload never completed (reload=$found_reload purge=$found_purge)"
 [ "$found_purge" -eq 1 ] || fail "stale hooks not purged on reload (would SIGSEGV on next class load)"
 log "hot-reload ok: reloaded=$found_reload hook-purge=$found_purge"
+
+# -------------------------------------------- 5b. /modules native command
+stage "5b. /modules command replies like /plugins (no plugin involved)"
+# The console accepts input once the server is up; keep typing until the
+# reply shows up (bounded), so this stage has no ordering burden on boot.
+found_registered=0; found_reply=0; found_listed=0
+CDEADLINE=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$CDEADLINE" ]; do
+    echo "modules" >&9
+    for target in "$SERVER_TEE" "$LAUNCHER_LOG"; do
+        [ -f "$target" ] || continue
+        grep -q "\[c-moduleslist\] /modules registered" "$target" && found_registered=1
+        grep -q "Modules (" "$target" && found_reply=1
+        grep -q "Modules ([0-9]\+): .*c-moduleslist" "$target" && found_listed=1
+    done
+    if [ "$found_registered" -eq 1 ] && [ "$found_reply" -eq 1 ] && [ "$found_listed" -eq 1 ]; then break; fi
+    sleep 3
+done
+kill -0 "$JAVA_PID" 2>/dev/null || fail "server died before /modules check (reg=$found_registered reply=$found_reply)"
+[ "$found_registered" -eq 1 ] || fail "/modules command never registered"
+[ "$found_reply" -eq 1 ] || fail "/modules never replied (tail: $(tail -c 2000 "$LAUNCHER_LOG" 2>/dev/null))"
+[ "$found_listed" -eq 1 ] || fail "/modules reply does not list c-moduleslist (tail: $(tail -c 2000 "$LAUNCHER_LOG" 2>/dev/null))"
+N="$(grep -o 'Modules ([0-9]\+):' "$SERVER_TEE" "$LAUNCHER_LOG" 2>/dev/null | head -1)"
+log "modules command ok: ${N:-Modules (?)}, reply listed c-moduleslist"
 
 # ---------------------------------------------------------------- 6. stop
 stage "6. graceful stop"

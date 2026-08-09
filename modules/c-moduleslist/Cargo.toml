@@ -1,0 +1,16 @@
+[package]
+name = "c-moduleslist"
+version = "0.1.0"
+edition = "2021"
+description = "Native-only /modules command: lists loaded crussty modules exactly like /plugins lists plugins. No Bukkit plugin object is ever created."
+
+[workspace]
+
+[lib]
+name = "cmoduleslist"
+crate-type = ["cdylib"]
+
+[dependencies]
+cplug-abi = { path = "../../cplug-abi" }
+cplug-sdk = { path = "../../cplug-sdk" }
+jvmti-bindings = "2"
