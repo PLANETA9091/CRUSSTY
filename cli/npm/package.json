@@ -6,6 +6,7 @@
     "crussty": "bin-wrapper.js"
   },
   "files": ["bin-wrapper.js"],
+  "repository": "github:PLANETA9091/CRUSSTY",
   "optionalDependencies": {
     "crussty-linux-x64": "0.1.0",
     "crussty-linux-arm64": "0.1.0",

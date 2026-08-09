@@ -5,5 +5,6 @@
   "os": ["linux"],
   "cpu": ["x64"],
   "files": ["bin"],
+  "repository": "github:PLANETA9091/CRUSSTY",
   "license": "MIT"
 }

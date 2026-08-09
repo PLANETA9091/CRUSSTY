@@ -3,6 +3,10 @@ name: publish-npm
 on:
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -62,17 +66,10 @@ jobs:
             chmod +x "cli/npm/pkg/$tag/bin/"crussty*
           done
       - name: Publish platform packages
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > "$HOME/.npmrc"
           for tag in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
             (cd "cli/npm/pkg/$tag" && npm publish --access public)
           done
       - name: Publish main package
         working-directory: cli/npm
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > "$HOME/.npmrc"
-          npm publish --access public
+        run: npm publish --access public
