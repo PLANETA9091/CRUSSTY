@@ -32,7 +32,9 @@ jobs:
         id: next
         shell: bash
         run: |
-          LAST=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          # Nearest tag that is an ANCESTOR of HEAD. Orphan tags (history
+          # was rewritten at some point) must not contribute commits.
+          LAST=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || true)
           echo "last=${LAST:-none}" >> "$GITHUB_OUTPUT"
           if [ -z "$LAST" ]; then
             echo "version=v2.0.1"; exit 0
