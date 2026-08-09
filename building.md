@@ -1,5 +1,5 @@
 ---
-title: Building an example module
+title: Building a module (moved)
 nav_exclude: true
 ---
 

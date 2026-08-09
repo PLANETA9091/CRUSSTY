@@ -28,6 +28,10 @@ The bridge groups 28 functions into 11 bricks under `runtime/src/platform/`:
 | hot_reload | swap a module's library without a restart | `hot_reload_*` |
 | side_table | O(1) metadata beside kernel objects | `side_table_*` |
 
+The same 11 groups (28 functions) with their purpose are listed in the
+[full table on Platform bricks](../../../platform/bricks.html) — this page
+shows how the C module reaches them.
+
 ## Version and contract
 
 ```c

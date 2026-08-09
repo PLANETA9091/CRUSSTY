@@ -7,7 +7,9 @@ nav_order: 2
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf.svg" alt=""> Platform internals
 
-The runtime ships twelve native primitives under `runtime/src/platform/`.
+The runtime ships twelve native primitives under `runtime/src/platform/`
+(11 of them are exposed through the C bridge — `barriers` stays runtime-side;
+see [Platform bricks](./bricks.html)).
 They are the building blocks every module builds on: instead of reinventing
 event buses, tick routing or persistence in each module, a module uses the
 brick's public API (re-exported from `platform/mod.rs`). Each file is owned

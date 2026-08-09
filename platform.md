@@ -9,6 +9,8 @@ has_children: true
 What the CRUSSTY platform exposes to modules — and what it does internally.
 
 - [Platform bricks](platform/bricks.html) — the C bridge: `CPlatformApi`,
-  all twelve brick groups, and the rules for using them safely.
+  its 11 brick groups (28 functions), and the rules for using them safely.
+- [Platform internals](platform/internals.html) — how the 12 runtime bricks
+  are built and how they work under the hood.
 - [Platform internals](platform/internals.html) — how the platform is built
   and how it works under the hood.
