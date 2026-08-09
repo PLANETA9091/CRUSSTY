@@ -2,23 +2,35 @@
 
 ## Releases (semver)
 
-Versions follow SemVer with a `v` prefix: **`v2.0.1`** (patch), **`v2.1.0`**
-(minor), **`v3.0.0`** (major), and so on. `v1.0.0-ce` and `v2.0.0` already exist.
+Versions follow SemVer with a `v` prefix. Two paths:
 
-To publish a release:
+### Automatic (default)
 
-1. Bump the version where relevant (kernel compat version, module versions).
-2. Create and push the tag — CI builds `launcher.jar` + `libcrussty_runtime.so`
-   and attaches them (plus `run.sh`/`run.bat`) to the release automatically:
+Pushing to `master` with changes in `runtime/`, `launcher/`, `cplug-abi/`,
+`cplug-sdk/`, `cplug-sdk-c/`, `cli/`, `modules/` or `scripts/` triggers
+`.github/workflows/auto-release.yml`, which computes the next version from
+the commits since the last `v[0-9]*` tag and publishes the release itself
+(launcher.jar + libcrussty_runtime.so + run.sh + run.bat). The commit
+message decides the bump:
+
+- contains `BREAKING` or `major:` → **major** (v2.0.1 → v3.0.0)
+- contains `feat:` (or `minor:`) → **minor** (v2.0.1 → v2.1.0)
+- anything else (fix, docs, refactor, …) → **patch** (v2.0.1 → v2.0.2)
+
+So a `fix:`/`docs:` commit automatically releases the next patch version.
+Doc-only changes (paths outside the list above) do NOT trigger a release.
+
+### Manual (for pinned tags like `v1.0.0-ce`)
 
 ```bash
 git tag v2.0.1 && git push origin v2.0.1
 ```
 
-The `v[0-9]*` tag pattern triggers `.github/workflows/release.yml`; tags like
+The `v[0-9]*` tag triggers `.github/workflows/release.yml`; tags like
 `foo`, `wip-*` or `cli-*` do NOT create a release (the latter only publishes
-CLI binaries to npm). Do not overwrite an existing tag — bump the version
-instead.
+CLI binaries to npm). The automatic path can double-publish if a commit
+contains both `BREAKING` and `feat:` — bump the version instead of
+overwriting an existing tag.
 
 ## Other notes
 

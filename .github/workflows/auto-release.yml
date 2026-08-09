@@ -1,0 +1,101 @@
+name: auto-release
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - "runtime/**"
+      - "launcher/**"
+      - "cplug-abi/**"
+      - "cplug-sdk/**"
+      - "cplug-sdk-c/**"
+      - "cli/**"
+      - "modules/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  detect:
+    name: detect next version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute next semver
+        id: next
+        shell: bash
+        run: |
+          LAST=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          if [ -z "$LAST" ]; then
+            echo "version=v2.0.1"; exit 0
+          fi
+          eval "$(echo "$LAST" | sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+).*/MAJOR=\1;MINOR=\2;PATCH=\3/')"
+          COMMITS=$(git log --oneline "$LAST..HEAD")
+          [ -n "$COMMITS" ] || { echo "no commits since $LAST"; exit 1; }
+          if echo "$COMMITS" | grep -qiE 'BREAKING|major:'; then
+            MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0
+          elif echo "$COMMITS" | grep -qiE '\bfeat(?::|\([^)]*\):)?\b|minor:'; then
+            MINOR=$((MINOR+1)); PATCH=0
+          else
+            PATCH=$((PATCH+1))
+          fi
+          echo "version=v$MAJOR.$MINOR.$PATCH"
+          echo "commits=$COMMITS"
+
+  build:
+    name: build release artifacts
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build runtime (release)
+        run: |
+          cargo build --release --manifest-path runtime/Cargo.toml
+          cp runtime/target/release/libcrussty_runtime.so .
+      - name: Build launcher.jar
+        run: |
+          mkdir -p launcher/out
+          javac -d launcher/out launcher/src/main/java/dev/dist/launcher/Main.java
+          jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            launcher/launcher.jar
+            libcrussty_runtime.so
+            run.sh
+            run.bat
+          if-no-files-found: error
+
+  release:
+    name: create release v${{ needs.detect.outputs.version }}
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: assets
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect.outputs.version }}
+          name: Crussty ${{ needs.detect.outputs.version }}
+          generate_release_notes: true
+          files: |
+            assets/launcher/launcher.jar
+            assets/libcrussty_runtime.so
+            assets/run.sh
+            assets/run.bat
