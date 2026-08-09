@@ -16,3 +16,4 @@ ureq = { version = "3", features = ["_tls"] }
 flate2 = "1"
 sha2 = "0.10"
 tar = "0.4"
+crossterm = "0.28"
