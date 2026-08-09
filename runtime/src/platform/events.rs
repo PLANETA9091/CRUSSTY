@@ -143,15 +143,23 @@ struct Registry {
 
 impl Registry {
     /// Snapshot the handlers that apply to `event` (exact first, then
-    /// matching patterns in insertion order).
-    fn snapshot(&self, event: &str) -> Vec<Handler> {
+    /// matching patterns in insertion order), each with its module owner.
+    fn snapshot(&self, event: &str) -> Vec<(Option<(String, u64)>, Handler)> {
         let mut out = Vec::new();
         if let Some(list) = self.exact.get(event) {
-            out.extend(list.entries.iter().map(|e| e.handler.clone()));
+            out.extend(
+                list.entries
+                    .iter()
+                    .map(|e| (e.owner.clone(), e.handler.clone())),
+            );
         }
         for (pattern, list) in &self.patterns {
             if glob_match(pattern, event) {
-                out.extend(list.entries.iter().map(|e| e.handler.clone()));
+                out.extend(
+                    list.entries
+                        .iter()
+                        .map(|e| (e.owner.clone(), e.handler.clone())),
+                );
             }
         }
         out
@@ -233,7 +241,11 @@ fn has_glob(pattern: &str) -> bool {
 struct AsyncTask {
     event: String,
     payload: Value,
-    handlers: Vec<Handler>,
+    /// Phantom guards keep the module mappings alive while their handlers
+    /// sit in the queue or run: a reload cannot dlclose a module whose async
+    /// handlers are still pending or in flight (active-count protocol).
+    leaders: Vec<Option<super::hot_reload::ModuleGuard>>,
+    handlers: Vec<(Option<(String, u64)>, Handler)>,
 }
 
 /// Bounded dispatcher pool. Workers are spawned lazily on first use and run
@@ -296,8 +308,25 @@ impl AsyncPool {
         }
     }
 
-    fn run(&self, task: AsyncTask) {
-        for handler in &task.handlers {
+    fn run(&self, mut task: AsyncTask) {
+        // Release the guards as the handlers run, so a reload can proceed
+        // once the last in-flight dispatch finishes.
+        let mut leader_index = 0usize;
+        for (owner, handler) in &task.handlers {
+            let _leader = task.leaders.get_mut(leader_index).and_then(Option::take);
+            if owner.is_some() && _leader.is_none() {
+                // Mid-swap: the module's mapping may be unmapped at any
+                // moment; skip its queued handler instead of risking a call
+                // into unloaded code.
+                eprintln!(
+                    "[crussty:events] async handler for '{}' skipped: module '{}' is being reloaded",
+                    task.event,
+                    owner.as_ref().expect("owner checked").0
+                );
+                leader_index += 1;
+                continue;
+            }
+            leader_index += 1;
             let result = catch_unwind(AssertUnwindSafe(|| handler(&task.event, &task.payload)));
             if let Err(panic) = result {
                 eprintln!("[crussty:events] async handler panicked for '{}': {panic:?}", task.event);
@@ -318,8 +347,18 @@ fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
     guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn dispatch(handlers: &[Handler], event: &str, payload: &Value) -> usize {
-    for handler in handlers {
+fn dispatch(handlers: &[(Option<(String, u64)>, Handler)], event: &str, payload: &Value) -> usize {
+    for (owner, handler) in handlers {
+        let guard = owner
+            .as_ref()
+            .and_then(|(id, _)| super::hot_reload::guard_module(id));
+        if owner.is_some() && guard.is_none() {
+            eprintln!(
+                "[crussty:events] sync handler for '{event}' skipped: module '{}' is being reloaded",
+                owner.as_ref().expect("owner checked").0
+            );
+            continue;
+        }
         let result = catch_unwind(AssertUnwindSafe(|| handler(event, payload)));
         if let Err(panic) = result {
             eprintln!("[crussty:events] handler panicked for '{event}': {panic:?}");
@@ -432,9 +471,21 @@ impl EventBus {
         let invoked = dispatch(&handlers, event, payload);
         let async_handlers = lock(&self.async_handlers).snapshot(event);
         if !async_handlers.is_empty() {
+            // Quiescence: every queued handler keeps its module's guard
+            // alive until the pool has run it (see AsyncTask::leaders), so a
+            // hot reload waits instead of dlclosing under pending handlers.
+            let leaders = async_handlers
+                .iter()
+                .map(|(owner, _)| {
+                    owner
+                        .as_ref()
+                        .and_then(|(id, _)| super::hot_reload::guard_module(id))
+                })
+                .collect();
             self.pool.push(AsyncTask {
                 event: event.to_string(),
                 payload: payload.clone(),
+                leaders,
                 handlers: async_handlers,
             });
         }

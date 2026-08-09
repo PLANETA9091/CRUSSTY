@@ -20,11 +20,34 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
 PURPUR_VERSION="${PURPUR_VERSION:-1.21.10}"
-SERVER_PORT="${SERVER_PORT:-25566}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-420}"
 POLL_SEC="${POLL_SEC:-2}"
 MODULES_DEFAULT="hello dist crussty"
 MODULES="${MODULES:-$MODULES_DEFAULT}"
+
+# Pick a port that is actually free right now (python3 is a hard depend two
+# stages down): other dev servers on the box (e.g. a long-lived cells-e2e)
+# must never turn a run into a bind collision.
+free_port() {
+    python3 - "$1" <<'EOF'
+import socket, sys
+base = int(sys.argv[1])
+for p in range(base, base + 200):
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", p))
+            print(p)
+            sys.exit(0)
+        except OSError:
+            continue
+sys.exit(1)
+EOF
+}
+if [ -n "${SERVER_PORT:-}" ]; then
+    SERVER_PORT="$SERVER_PORT"
+else
+    SERVER_PORT="$(free_port 25566)" || fail "no free port found in range"
+fi
 
 SERIAL_DIR="logs/e2e.$$"
 # The launcher tees the server's stdout+stderr into logs/server.log (and
@@ -207,7 +230,7 @@ stage "7. single-jar boot (java -jar, no -agentpath) + reload"
 # runtime + modules through Boot.java and loads them via JNI_OnLoad. The
 # pgrep matcher differs from stage 5 (jar is named crussty-*.jar, not
 # purpur-*.jar), so this stage is the only automated coverage of that path.
-SJ_PORT=$((SERVER_PORT + 1))
+SJ_PORT="$(free_port 25600)" || fail "no free port found in range (single-jar)"
 bash scripts/build-single-jar.sh "$PURPUR_VERSION" >/dev/null 2>&1 \
     || fail "build-single-jar.sh failed"
 SJ_DIR="$SERIAL_DIR/sjrun"

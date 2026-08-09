@@ -410,6 +410,17 @@ impl Agent for CrusstyRuntime {
                 .map(|f| name.contains(f))
                 .unwrap_or(true);
         for entry in &registered {
+            // Quiescence protocol: module-owned hooks run under a module
+            // guard. A reload refuses while a hook is in flight, and this
+            // hook is skipped entirely while its module is mid-swap (the
+            // replacement re-registers; the class simply stays
+            // untransformed for this load).
+            let guard = entry.owner.as_ref().and_then(|(id, _)| {
+                crate::platform::hot_reload::guard_module(id)
+            });
+            if entry.owner.is_some() && guard.is_none() {
+                continue;
+            }
             let mut out: *mut u8 = std::ptr::null_mut();
             let mut out_len: usize = 0;
             if want_trace {
@@ -433,6 +444,7 @@ impl Agent for CrusstyRuntime {
                     &mut out_len,
                 )
             };
+            drop(guard);
             if rc == 0 && !out.is_null() {
                 let mut copy = Vec::with_capacity(out_len);
                 copy.extend_from_slice(unsafe { std::slice::from_raw_parts(out, out_len) });
