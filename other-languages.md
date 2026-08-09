@@ -1,6 +1,6 @@
 ---
 title: Other languages
-nav_order: 10
+nav_order: 9
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/python.svg" alt=""> Writing modules in other languages

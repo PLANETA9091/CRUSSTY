@@ -1,6 +1,6 @@
 ---
 title: Module SDK
-nav_order: 6
+nav_order: 7
 ---
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> Module SDK
