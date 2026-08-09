@@ -46,8 +46,8 @@ wait for kernel classes to load first (`wait_class`).
 
 The pipeline is not delivering to the main thread. Check in order:
 
-1. `[crussty-runtime] module hello -> init rc=0` — module loaded?
-2. `[crussty-runtime] pipeline ready: N module hook(s)` — hook registered?
+1. `[crussty-runtime] plugin hello -> init rc=0` — module loaded?
+2. `[crussty-runtime] pipeline ready: N plugin hook(s)` — hook registered?
 3. Server log for `hello from native c-plugin` — main-thread bridge alive?
 
 ## JVM flags

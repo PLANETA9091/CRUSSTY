@@ -220,9 +220,10 @@ recursively on every boot and picks up anything new.
 Boot the platform and watch the log:
 
 ```text
-[crussty-runtime] scanning modules/ ...
-[crussty-runtime] module hello -> manifest ok, entry libhello.so
+[crussty-runtime] v2.0.0 loaded (options: modules=...;versions=...;kernel=...)
 [hello-plugin] cplugin_init (native, before kernel boot)
+[crussty-runtime] plugin hello -> init rc=0
+[crussty-runtime] pipeline ready: 1 plugin hook(s)
 [hello-plugin] Bukkit class load observed (hook chain ok)
 [hello-plugin] GetLoadedClasses resolved Bukkit: true
 [13:36:26 INFO]: hello from native c-plugin (v2 pipeline alive)

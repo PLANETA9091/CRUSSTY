@@ -49,9 +49,9 @@ The jar boots the kernel itself: no `-agentpath`, no launcher process.
 Check the server log:
 
 ```
-[crussty-runtime] module hello -> init rc=0
+[crussty-runtime] plugin hello -> init rc=0
 [hello-plugin] cplugin_init (native, before kernel boot)
-[crussty-runtime] pipeline ready: 3 module hook(s)
+[crussty-runtime] pipeline ready: 3 plugin hook(s)
 [13:36:26 INFO]: hello from native c-plugin (v2 pipeline alive)
 ```
 
