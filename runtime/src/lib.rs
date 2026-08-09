@@ -27,8 +27,23 @@ use jvmti_bindings::prelude::*;
 use jvmti_bindings::export_agent as export_runtime;
 use libloading::Library;
 
-/// (ctx, hook) pairs registered by plugins, in registration order.
-static HOOKS: OnceLock<Mutex<Vec<(usize, ClassHookFn)>>> = OnceLock::new();
+/// A plugin class hook. Every hook is attributed to the module (and library
+/// generation) that registered it, so a hot reload can purge exactly the
+/// replaced generation's hooks — by owner — instead of guessing by a
+/// registration-sequence bound.
+#[derive(Clone)]
+struct HookEntry {
+    /// `Some((module id, library generation))` when registered inside a
+    /// module `cplugin_init` handshake; `None` for registrations made
+    /// outside any handshake (tests, platform bricks) that must never be
+    /// purged by a reload.
+    owner: Option<(String, u64)>,
+    ctx: usize,
+    func: ClassHookFn,
+}
+
+/// (owner, ctx, hook) entries registered by plugins, in registration order.
+static HOOKS: OnceLock<Mutex<Vec<HookEntry>>> = OnceLock::new();
 /// Set once every transform hook class (SchedulerHooks/NetHooks/TickHook/
 /// StorageHooks) is defined and its natives registered. The transform engine
 /// must not patch a class to call a hook class that does not exist yet:
@@ -47,26 +62,58 @@ pub fn mark_hook_classes_ready() {
     HOOK_CLASSES_READY.store(true, Ordering::Relaxed);
 }
 
-/// Number of plugin hooks registered so far — the baseline a hot reload
-/// truncates to before it unloads the old library (see
-/// [`truncate_hooks_to`]; both live here next to the registry they guard).
-pub fn hook_registration_seq() -> usize {
-    hooks().lock().unwrap().len()
+/// Registration context: the module (id, library generation) whose
+/// `cplugin_init` handshake is currently on this thread. Class hooks and
+/// event subscriptions registered during the handshake are stamped with
+/// this owner; a hot reload later purges registrations by owner, so the
+/// replaced generation's hooks/subscriptions are dropped exactly, without
+/// touching hooks of other modules or of the new generation.
+static REG_CTX: OnceLock<Mutex<Option<(String, u64)>>> = OnceLock::new();
+
+fn reg_ctx() -> &'static Mutex<Option<(String, u64)>> {
+    REG_CTX.get_or_init(|| Mutex::new(None))
 }
 
-/// Drop every hook registered at/after `seq` (a module's `cplugin_init` ran
-/// between `seq` and the call). dlclose leaves hooks pointing into unmapped
-/// code otherwise: the next ClassFileLoadHook would SIGSEGV on a stale
-/// callback. Only the module under reload is affected: its hooks were the
-/// ones appended since `seq`.
-pub fn truncate_hooks_to(seq: usize) {
+/// RAII guard: while alive, every class hook / event subscription
+/// registered on this thread is attributed to module `id`, library
+/// generation `gen`. Restores the previous context on drop.
+pub struct RegistrationGuard {
+    prev: Option<(String, u64)>,
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        *reg_ctx().lock().unwrap() = self.prev.clone();
+    }
+}
+
+/// Start a module registration window (see [`RegistrationGuard`]).
+pub fn begin_registration(id: &str, gen: u64) -> RegistrationGuard {
+    let mut ctx = reg_ctx().lock().unwrap();
+    let prev = ctx.clone();
+    *ctx = Some((id.to_string(), gen));
+    RegistrationGuard { prev }
+}
+
+/// The owner stamp applied to registrations made right now (from a module
+/// handshake), or `None` outside any.
+pub fn registration_owner() -> Option<(String, u64)> {
+    reg_ctx().lock().unwrap().clone()
+}
+
+/// Drop every hook registered by module `id` of library generation `gen` —
+/// the generation a hot reload is replacing. Idempotent; other owners are
+/// untouched (including a newer generation of the same module, which is
+/// exactly why the purge is keyed by (id, gen) and not by id alone).
+pub fn purge_module_hooks(id: &str, gen: u64) {
     let mut h = hooks().lock().unwrap();
-    if h.len() > seq {
+    let before = h.len();
+    h.retain(|entry| entry.owner.as_ref() != Some(&(id.to_string(), gen)));
+    let removed = before - h.len();
+    if removed > 0 {
         eprintln!(
-            "[crussty-runtime] hook purge: dropped {} stale hook(s) from unloaded module",
-            h.len() - seq
+            "[crussty-runtime] hook purge: dropped {removed} hook(s) owned by '{id}' gen {gen}"
         );
-        h.truncate(seq);
     }
 }
 /// Raw jvmtiEnv pointer as usize (JVMTI envs are process-wide, usable from
@@ -99,7 +146,7 @@ fn cplugin_api() -> &'static CPluginApi {
     &safe.0
 }
 
-fn hooks() -> &'static Mutex<Vec<(usize, ClassHookFn)>> {
+fn hooks() -> &'static Mutex<Vec<HookEntry>> {
     HOOKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 fn libs() -> &'static Mutex<Vec<Library>> {
@@ -355,12 +402,12 @@ impl Agent for CrusstyRuntime {
 
         // 2. Plugin hooks chain in registration order: each sees the previous
         //    output (the engine's included).
-        for (ctx, f) in &registered {
+        for entry in &registered {
             let mut out: *mut u8 = std::ptr::null_mut();
             let mut out_len: usize = 0;
             let rc = unsafe {
-                f(
-                    *ctx as *mut c_void,
+                (entry.func)(
+                    entry.ctx as *mut c_void,
                     name.as_ptr() as *const c_char,
                     current,
                     current_len,
@@ -422,7 +469,12 @@ fn publish_class_loaded(name: &str, bytes_len: usize) {
 
 /// Trampolines handed to plugins through CPluginApi.
 unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn) -> i32 {
-    hooks().lock().unwrap().push((ctx as usize, hook));
+    let owner = registration_owner();
+    hooks().lock().unwrap().push(HookEntry {
+        owner,
+        ctx: ctx as usize,
+        func: hook,
+    });
     0
 }
 unsafe extern "C" fn api_jvmti_allocate(size: usize) -> *mut u8 {
@@ -587,7 +639,13 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
                     continue;
                 }
             };
+        // The init handshake runs inside a registration window stamped with
+        // (plugin id, generation 1): hooks and event subscriptions the
+        // module registers become owned by it, so a later hot reload can
+        // purge exactly the replaced generation (see purge_module_hooks).
+        let _owner = begin_registration(&plugin.id, 1);
         let rc = unsafe { init(api, vm, c_options.as_ptr()) };
+        drop(_owner);
         eprintln!("[crussty-runtime] plugin {} -> init rc={rc}", plugin.id);
         if rc == 0 {
             // Admit the loaded library into the hot-reload registry: the
@@ -659,6 +717,68 @@ mod tests {
         publish_class_loaded("x/y", 7);
         assert_eq!(count.load(Ordering::SeqCst), 1, "no subscriber, no dispatch");
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    unsafe extern "C" fn dummy_hook(
+        _ctx: *mut c_void,
+        _name: *const c_char,
+        _data: *const u8,
+        _len: usize,
+        _out: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        0
+    }
+
+    fn register(ctx: usize) -> Option<(String, u64)> {
+        unsafe { api_register_class_hook(ctx as *mut c_void, dummy_hook) };
+        registration_owner()
+    }
+
+    #[test]
+    fn purge_removes_only_the_replaced_generation() {
+        // Startup: hello gen 1 registers a hook; dist never does.
+        let _g1 = begin_registration("hello", 1);
+        assert_eq!(register(0x11), Some(("hello".to_string(), 1)));
+        drop(_g1);
+
+        // A hook registered outside any window belongs to nobody: a reload
+        // in either generation must never purge it.
+        let _: Option<(String, u64)> = register(0x22);
+        assert_eq!(hooks().lock().unwrap().len(), 2);
+
+        // Reload: the replacement runs under (hello, 2) and adds its hook.
+        let _g2 = begin_registration("hello", 2);
+        assert_eq!(register(0x33), Some(("hello".to_string(), 2)));
+        drop(_g2);
+        assert_eq!(hooks().lock().unwrap().len(), 3);
+
+        // Purging the replaced generation removes exactly gen 1, keeping
+        // the unowned hook AND the new generation's hook.
+        purge_module_hooks("hello", 1);
+        let h = hooks().lock().unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].ctx, 0x22, "unowned hook survives");
+        assert_eq!(h[0].owner, None);
+        assert_eq!(h[1].owner, Some(("hello".to_string(), 2)));
+        assert_eq!(h[1].ctx, 0x33);
+        drop(h);
+
+        // Purging a different module touches nothing.
+        purge_module_hooks("world", 1);
+        assert_eq!(hooks().lock().unwrap().len(), 2);
+
+        // Purging the new generation leaves only the unowned hook.
+        purge_module_hooks("hello", 2);
+        let h = hooks().lock().unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].owner, None);
+        assert_eq!(h[0].ctx, 0x22);
     }
 }
 

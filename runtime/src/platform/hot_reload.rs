@@ -31,15 +31,13 @@
 //! # Honest limits (hooked class-file hooks)
 //!
 //! The regenerated module re-runs `cplugin_init` with the same handshake and
-//! re-registers its class-file hooks in the runtime pipeline. The pipeline
-//! cannot attribute hooks to a module, so hooks registered by the *old*
-//! mapping stay registered until the next class load dereferences them:
-//! after a reload, that is a dangling call into an unmapped library. The
-//! busy-counter protocol therefore does NOT make a reload safe for modules
-//! that registered hooks. Reloading a module is a development/ops tool for
-//! quiescent, hook-light modules (or runtimes whose dispatcher tracks hook
-//! ownership); it is not a crash-isolated feature until the dispatcher
-//! integrates [`enter_module`]/[`leave_module`].
+//! re-registers its class-file hooks in the runtime pipeline. Every
+//! registration made during a handshake is stamped with `(module id, library
+//! generation)` (see `crate::begin_registration`): on a successful swap this
+//! brick purges exactly the replaced generation's hooks (and event-bus
+//! subscriptions) by owner before dlclosing the old library, so the pipeline
+//! never dispatches into unmapped code and no stale callback can run. A
+//! failed replacement's partial registrations are purged the same way.
 //!
 //! # Trigger
 //!
@@ -101,6 +99,11 @@ struct LoadedModule {
     /// `None` only for test-fabricated entries (unit tests cannot dlopen).
     lib: Option<Library>,
     path: PathBuf,
+    /// Library generation: 1 for the startup admit, incremented on every
+    /// successful reload. Class hooks and event subscriptions are stamped
+    /// with (id, gen) at each `cplugin_init`, so a reload purges exactly
+    /// the replaced generation.
+    gen: u64,
     /// `CPluginApi*` replayed to every `cplugin_init` handshake. Stored as
     /// `usize`: raw pointers are `!Send`, and the registry lives in a
     /// `static Mutex` (same trick as the runtime's `VM` static in lib.rs).
@@ -226,9 +229,12 @@ pub fn register_module(
 ) -> Result<(), String> {
     let options = CString::new(options)
         .map_err(|_| format!("module '{id}': options contain an interior NUL"))?;
+    // The registration window stamps everything this module registers at
+    // handshake time with (id, generation 1).
+    let _owner = crate::begin_registration(id, 1);
     let lib = acquire_replacement(&path, api as usize, vm as usize, &options)?;
-    insert_entry(id, path, lib, api as usize, vm as usize, options)
-        .map_err(|(e, _)| e)
+    drop(_owner);
+    insert_entry(id, path, lib, api as usize, vm as usize, options).map_err(|(e, _)| e)
 }
 
 /// Admit a module the caller already dlopened and initialized — the
@@ -281,6 +287,7 @@ fn insert_entry(
         LoadedModule {
             lib: Some(lib),
             path,
+            gen: 1,
             api,
             vm,
             options,
@@ -308,7 +315,7 @@ pub fn reload_module(id: &str) -> Result<(), String> {
     // Reserve the slot: fail fast if busy, then block new entries for the
     // rest of the swap so the old library cannot gain callers between the
     // busy check and its dlclose.
-    let (path, api, vm, options) = {
+    let (path, api, vm, options, old_gen) = {
         let mut reg = registry().lock().unwrap();
         let entry = reg
             .get_mut(id)
@@ -323,23 +330,39 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             return Err(format!("module '{id}' is already being reloaded"));
         }
         entry.swapping = true;
-        (entry.path.clone(), entry.api, entry.vm, entry.options.clone())
+        (
+            entry.path.clone(),
+            entry.api,
+            entry.vm,
+            entry.options.clone(),
+            entry.gen,
+        )
     };
 
     // dlopen + init the replacement OUTSIDE the registry lock: module code
     // must never run under our locks (deadlock-free callbacks, no lock held
     // across user code).
     //
-    // Class-hook ownership: the replacement's cplugin_init registers its
-    // hooks between `hook_seq` and now; the old library's, registered before
-    // `hook_seq`, are truncated right before its dlclose so the pipeline
-    // never calls into unmapped code (see crate::truncate_hooks_to).
-    let hook_seq = crate::hook_registration_seq();
+    // Registration ownership: the replacement's cplugin_init runs inside a
+    // window stamped (id, old_gen + 1); the old generation's registrations
+    // carry (id, old_gen). On success we purge exactly (id, old_gen) — the
+    // replaced generation's hooks + event subscriptions — before dlclose, so
+    // the pipeline never calls into unmapped code and never leaves stale
+    // subscription callbacks. On failure the windowed generation
+    // (id, old_gen + 1) may have partially registered: purge it so a failed
+    // replacement leaks nothing.
+    let _owner = crate::begin_registration(id, old_gen + 1);
     let replacement = acquire_replacement(&path, api, vm, &options);
+    drop(_owner);
 
     let mut reg = registry().lock().unwrap();
     match replacement {
         Err(e) => {
+            // The failed replacement may have registered hooks / subscribed
+            // before its init returned nonzero: drop registrations it made
+            // under its window.
+            crate::purge_module_hooks(id, old_gen + 1);
+            crate::platform::events::global().purge_owner(&(id.to_string(), old_gen + 1));
             if let Some(entry) = reg.get_mut(id) {
                 entry.swapping = false;
             }
@@ -350,13 +373,17 @@ pub fn reload_module(id: &str) -> Result<(), String> {
                 .get_mut(id)
                 .ok_or_else(|| format!("module '{id}' vanished during reload"))?;
             let old = entry.lib.replace(new_lib);
+            entry.gen = old_gen + 1;
             entry.loaded_at_unix = unix_now();
             entry.init_rc = 0;
             entry.swapping = false;
             drop(reg);
-            // The old library's hooks are stale: purge them before the
-            // dlclose so a class load cannot dispatch into unmapped code.
-            crate::truncate_hooks_to(hook_seq);
+            // The old generation's registrations are stale: purge them by
+            // owner BEFORE the dlclose so a class load cannot dispatch into
+            // unmapped code and a publish cannot invoke an unloaded
+            // callback.
+            crate::purge_module_hooks(id, old_gen);
+            crate::platform::events::global().purge_owner(&(id.to_string(), old_gen));
             // dlclose outside the lock. The old library is provably
             // quiescent: active was 0 at the check and swapping blocked new
             // entries until this point.
@@ -558,6 +585,7 @@ mod tests {
             LoadedModule {
                 lib: None,
                 path,
+                gen: 1,
                 api: 0,
                 vm: 0,
                 options: CString::new("").expect("empty CString"),

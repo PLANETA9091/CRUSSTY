@@ -87,6 +87,10 @@ pub struct Subscription {
 struct Entry {
     id: u64,
     gen: u64,
+    /// `Some((module id, library generation))` when the subscription was
+    /// created inside a module handshake: a hot reload purges exactly the
+    /// replaced generation's subscriptions (see [`EventBus::purge_owner`]).
+    owner: Option<(String, u64)>,
     handler: Handler,
 }
 
@@ -100,11 +104,19 @@ struct HandlerList {
 }
 
 impl HandlerList {
-    fn add(&mut self, handler: Handler, id: u64) -> Subscription {
+    fn add(&mut self, handler: Handler, id: u64, owner: Option<(String, u64)>) -> Subscription {
         let gen = self.gen;
-        self.entries.push(Entry { id, gen, handler });
+        self.entries.push(Entry { id, gen, owner, handler });
         self.gen += 1;
         Subscription { id, gen }
+    }
+
+    /// Drop every entry owned by `owner`; returns how many were removed.
+    fn purge_owner(&mut self, owner: &(String, u64)) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| e.owner.as_ref() != Some(owner));
+        before - self.entries.len()
     }
 
     fn remove(&mut self, token: &Subscription) -> bool {
@@ -145,7 +157,13 @@ impl Registry {
         out
     }
 
-    fn insert(&mut self, event: &str, handler: Handler, id: u64) -> Subscription {
+    fn insert(
+        &mut self,
+        event: &str,
+        handler: Handler,
+        id: u64,
+        owner: Option<(String, u64)>,
+    ) -> Subscription {
         let pos = self.patterns.iter().position(|(p, _)| p == event);
         let list = if let Some(pos) = pos {
             &mut self.patterns[pos].1
@@ -156,7 +174,22 @@ impl Registry {
         } else {
             self.exact.entry(event.to_string()).or_default()
         };
-        list.add(handler, id)
+        list.add(handler, id, owner)
+    }
+
+    /// Drop every entry owned by `owner` (exact and pattern lists alike).
+    /// Empty lists are removed so existence checks report the truth.
+    fn purge_owner(&mut self, owner: &(String, u64)) -> usize {
+        let mut removed = 0usize;
+        for list in self.exact.values_mut() {
+            removed += list.purge_owner(owner);
+        }
+        self.exact.retain(|_, list| !list.entries.is_empty());
+        for (_, list) in self.patterns.iter_mut() {
+            removed += list.purge_owner(owner);
+        }
+        self.patterns.retain(|(_, list)| !list.entries.is_empty());
+        removed
     }
 
     fn remove(&mut self, event: &str, token: &Subscription) -> bool {
@@ -313,11 +346,19 @@ pub fn global() -> EventBus {
 impl EventBus {
     /// Subscribe to an event name. Handler runs synchronously on the
     /// publisher's thread, in subscription order. Returns a token usable
-    /// with [`EventBus::unsubscribe`].
+    /// with [`EventBus::unsubscribe`]. When called inside a module
+    /// registration window the subscription is owned by that module
+    /// generation (purged on its hot reload).
     pub fn subscribe(&self, event: &str, f: Handler) -> Subscription {
+        let owner = crate::registration_owner();
         let token = {
             let mut registry = lock(&self.handlers);
-            registry.insert(event, f, self.next_id.fetch_add(1, Ordering::SeqCst))
+            registry.insert(
+                event,
+                f,
+                self.next_id.fetch_add(1, Ordering::SeqCst),
+                owner,
+            )
         };
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
@@ -325,14 +366,37 @@ impl EventBus {
 
     /// Subscribe with the handler dispatched on the pool instead of the
     /// publisher's thread. Never blocks `publish`; see module docs for
-    /// ordering and backpressure guarantees.
+    /// ordering and backpressure guarantees. Module-owned like
+    /// [`EventBus::subscribe`].
     pub fn subscribe_async(&self, event: &str, f: Handler) -> Subscription {
+        let owner = crate::registration_owner();
         let token = {
             let mut registry = lock(&self.async_handlers);
-            registry.insert(event, f, self.next_id.fetch_add(1, Ordering::SeqCst))
+            registry.insert(
+                event,
+                f,
+                self.next_id.fetch_add(1, Ordering::SeqCst),
+                owner,
+            )
         };
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
+    }
+
+    /// Drop every sync and async subscription owned by a module generation
+    /// (id, library gen). Used by the hot-reload brick right before it
+    /// dlcloses the replaced library, so no publish can ever invoke an
+    /// unloaded callback. Returns the number of subscriptions removed.
+    pub fn purge_owner(&self, owner: &(String, u64)) -> usize {
+        let removed =
+            lock(&self.handlers).purge_owner(owner) + lock(&self.async_handlers).purge_owner(owner);
+        if removed > 0 {
+            eprintln!(
+                "[crussty:events] purge: dropped {removed} subscription(s) owned by '{}' gen {}",
+                owner.0, owner.1
+            );
+        }
+        removed
     }
 
     /// True when at least one handler (sync or async) is subscribed to
@@ -732,6 +796,46 @@ mod tests {
         assert!(bus.unsubscribe("another.evt", &token));
         assert_eq!(subscribed.load(Ordering::SeqCst), 4, "no EVENT_SUBSCRIBED on unsubscribe");
         assert_eq!(unsubscribed.load(Ordering::SeqCst), 1, "unsubscribe fires EVENT_UNSUBSCRIBED");
+    }
+
+    #[test]
+    fn purge_owner_removes_module_subscriptions_only() {
+        let bus = EventBus::default();
+
+        // Sync + async subscriptions inside a module window (gen 1).
+        {
+            let _g = crate::begin_registration("hello", 1);
+            bus.subscribe("a.evt", Arc::new(|_, _| {}));
+            bus.subscribe_async("b.evt", Arc::new(|_, _| {}));
+        }
+        // A newer generation of the same module subscribes too.
+        {
+            let _g = crate::begin_registration("hello", 2);
+            bus.subscribe("a.evt", Arc::new(|_, _| {}));
+        }
+        // A different module, and an unowned (platform) subscriber.
+        {
+            let _g = crate::begin_registration("dist", 1);
+            bus.subscribe("c.evt", Arc::new(|_, _| {}));
+        }
+        bus.subscribe("d.evt", Arc::new(|_, _| {}));
+
+        assert_eq!(bus.publish("a.evt", &serde_json::json!(null)), 2);
+        assert_eq!(bus.publish("b.evt", &serde_json::json!(null)), 0, "async-only");
+
+        // Purging hello gen 1 removes exactly its sync + async handlers.
+        assert_eq!(
+            bus.purge_owner(&("hello".to_string(), 1)),
+            2,
+            "hello gen 1 held sync 'a.evt' + async 'b.evt'"
+        );
+        assert_eq!(bus.publish("a.evt", &serde_json::json!(null)), 1, "hello gen 2 stays");
+        assert_eq!(bus.publish("b.evt", &serde_json::json!(null)), 0, "async purged");
+        assert_eq!(bus.publish("c.evt", &serde_json::json!(null)), 1, "dist untouched");
+        assert_eq!(bus.publish("d.evt", &serde_json::json!(null)), 1, "unowned untouched");
+
+        // Purging gen that owns nothing is a no-op.
+        assert_eq!(bus.purge_owner(&("hello".to_string(), 3)), 0);
     }
 
     #[test]

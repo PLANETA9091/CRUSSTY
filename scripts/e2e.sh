@@ -135,23 +135,44 @@ while :; do
 done
 
 # ---------------------------------------------------------------- 5. reload
-stage "5. hot-reload (SIGUSR1); assert hook purge + server stays alive"
+stage "5. hot-reload: rebuild a module (new inode), SIGUSR1, assert purge + alive"
 log "pipeline ready=$found_pipeline  hello native=$found_hello  crussty live=$found_native"
 
-JAVA_PID="$(pgrep -f "purpur-$PURPUR_VERSION.jar" | head -1 || true)"
+RELOAD_ID="${E2E_RELOAD_ID:-hello}"
+m="$REPO/modules/$RELOAD_ID"
+[ -f "$m/Cargo.toml" ] || fail "reload module not found: $RELOAD_ID"
+
+# Honest reload: the .so the server has dlopened must change on disk (new
+# inode) BEFORE the trigger, exactly like a developer rebuilding a module.
+OLD_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
+touch "$m/src/lib.rs"
+cargo build --manifest-path "$m/Cargo.toml" || fail "rebuild $RELOAD_ID for reload"
+# Replace via mv (new directory entry): an in-place cp would keep the inode
+# and the server's dlopen cache could return the same mapping.
+mv -f "$m/target/debug/lib$RELOAD_ID.so" "$m/lib$RELOAD_ID.so"
+NEW_INODE="$(stat -c '%i' "$m/lib$RELOAD_ID.so")"
+if [ "$OLD_INODE" = "$NEW_INODE" ]; then
+    fail "reload artifact not actually replaced (same inode $OLD_INODE)"
+fi
+log "artifact replaced: inode $OLD_INODE -> $NEW_INODE"
+
+# Match the server by port, not by jar name alone: a foreign server running
+# the same jar (e.g. an older rollout) must never receive our trigger.
+JAVA_PID="$(pgrep -f "purpur-$PURPUR_VERSION.jar.*--port $SERVER_PORT" | head -1 || true)"
 if [ -z "$JAVA_PID" ]; then
-    fail "no server pid for SIGUSR1 reload"
+    fail "no server pid on port $SERVER_PORT for SIGUSR1 reload"
 fi
 kill -USR1 "$JAVA_PID" 2>/dev/null || fail "kill -USR1 $JAVA_PID failed"
 log "sent SIGUSR1 to $JAVA_PID; waiting for reload + stale-hook purge"
 
-found_reload=0; found_purge=0
+found_reload=0; found_purge=0; found_hooks_after=0
 RDEADLINE=$(( $(date +%s) + 40 ))
 while [ "$(date +%s)" -lt "$RDEADLINE" ]; do
     for target in "$SERVER_TEE" "$LAUNCHER_LOG"; do
         [ -f "$target" ] || continue
         grep -q "reloaded (dlopen'd fresh" "$target" && found_reload=1
         grep -q "hook purge" "$target" && found_purge=1
+        grep -q "pipeline ready: " "$target" && found_hooks_after=1
     done
     if [ "$found_reload" -eq 1 ] && [ "$found_purge" -eq 1 ]; then break; fi
     sleep 2
