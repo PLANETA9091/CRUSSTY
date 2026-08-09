@@ -75,6 +75,37 @@ struct DriverState {
     oracle_unreachable_announced: bool,
 }
 
+/// Claim the single dist runtime for this process+node. Hot reload (see
+/// runtime/src/platform/hot_reload.rs) dlopens a FRESH copy of libdist.so
+/// and re-runs cplugin_init in the same process; the old mapping's
+/// recv/driver threads are still executing their engine loops there. A
+/// second init would start a duplicate engine (second UDP socket + second
+/// driver loop hammering the server main thread) and, once the runtime
+/// dlcloses the old mapping, the old threads would run code pages that are
+/// no longer mapped — a hard SIGSEGV.
+///
+/// The claim flag is keyed by (node_id, pid): a server restart has a new
+/// pid and claims cleanly; a hot reload reuses the pid and is refused, so
+/// cplugin_init returns nonzero and the runtime keeps the previous mapping
+/// live (its documented crash-resilience path).
+pub fn claim_single_instance(node_id: u64) -> bool {
+    let path = std::env::temp_dir().join(format!(
+        "crussty-dist-{node_id}-{}.lock",
+        std::process::id()
+    ));
+    if path.exists() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// Start the engine and the periodic main-thread driver loop.
 /// Returns 0 on success, engine error code otherwise.
 pub fn start(cfg: &Config) -> i32 {

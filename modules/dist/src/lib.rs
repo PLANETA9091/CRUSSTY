@@ -33,6 +33,15 @@ pub unsafe extern "C" fn cplugin_init(
         cfg.oracle_addr, cfg.node_id, cfg.bench, cfg.commit_secs
     );
 
+    if !driver::claim_single_instance(cfg.node_id) {
+        eprintln!(
+            "[dist] init denied: single-runtime claim already held by this process \
+             (live engine threads still run the previous mapping); reload keeps the old library"
+        );
+        return 1;
+    }
+    eprintln!("[dist] single-runtime claim held");
+
     let rc = driver::start(&cfg);
     if rc != 0 {
         eprintln!("[dist] engine start failed rc={rc}");
