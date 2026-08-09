@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 QJS_DIR="${QJS_DIR:-$PWD/qjs}"
 cc -shared -fPIC -O2 \
     -I"$PWD/../../../cplug-sdk-c/include" \
-    -I"$QJS_DIR/../.." \
+    -I"$QJS_DIR" \
     -o libhello_js.so shim.c \
-    -L"$QJS_DIR" -Wl,-rpath,"$QJS_DIR" -lqjs
+    -L"$QJS_DIR" -Wl,-rpath,'$ORIGIN/qjs' -lqjs
 echo "built $(pwd)/libhello_js.so"
