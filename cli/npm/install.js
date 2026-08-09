@@ -10,21 +10,23 @@ const { spawnSync } = require("child_process");
 const VERSION = process.env.CRUSSTY_VERSION || "v2.0.0";
 const BASE = `https://github.com/PLANETA9091/CRUSSTY/releases/download/${VERSION}`;
 
-const platforms = {
-  linux: { x64: "linux-x64", arm64: "linux-arm64" },
-  darwin: { x64: "macos-x64", arm64: "macos-arm64" },
-  win32: { x64: "win-x64" },
+const assets = {
+  "linux:x64": "crussty-x64",
+  "linux:arm64": "crussty-arm64",
+  "darwin:x64": "crussty-x64",
+  "darwin:arm64": "crussty-arm64",
+  "win32:x64": "crussty-x64.exe",
+  "win32:arm64": "crussty-arm64.exe",
 };
 
-function tag() {
-  const os = process.platform;
-  const arch = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : process.arch;
-  const p = platforms[os] && platforms[os][arch];
-  if (!p) {
-    console.error(`crussty: unsupported platform ${os}/${arch}`);
+function asset() {
+  const key = `${process.platform}:${process.arch}`;
+  const a = assets[key];
+  if (!a) {
+    console.error(`crussty: unsupported platform ${key}`);
     process.exit(1);
   }
-  return p;
+  return a;
 }
 
 function download(url, dest) {
@@ -56,7 +58,7 @@ function download(url, dest) {
     console.log("crussty: already installed");
     return;
   }
-  const url = `${BASE}/crussty-${tag()}`;
+  const url = `${BASE}/${asset()}`;
   console.log(`crussty: downloading ${url}`);
   await download(url, dest);
   if (process.platform !== "win32") {
