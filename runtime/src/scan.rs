@@ -40,8 +40,8 @@ pub struct CPlugin {
 /// native libraries without a manifest are never plugins. `.zip` / `.jar`
 /// archives anywhere under `root` are extracted to a content-addressed cache
 /// dir under the system temp dir and scanned as plugins when they carry a
-/// top-level `cplugin.json`. Anything (file or dir) named `*.disabled` is
-/// skipped (Paper convention).
+/// top-level `cplugin.json`. Anything (file or dir) named `*.disabled` (Paper
+/// convention) or `*.x` (ad-hoc park: `mv cells cells.x`) is skipped.
 pub fn scan(root: &Path) -> Vec<CPlugin> {
     let mut found = Vec::new();
     let mut zips = Vec::new();
@@ -111,7 +111,7 @@ fn walk_dir(dir: &Path, out: &mut Vec<CPlugin>, zips: &mut Vec<PathBuf>) {
     for e in entries {
         let path = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".disabled") {
+        if name.ends_with(".disabled") || name.ends_with(".x") {
             continue;
         }
         if path.is_dir() {
@@ -352,6 +352,14 @@ mod tests {
         // default entry lib<id>.so missing -> whole plugin skipped
         fs::create_dir_all(dir.join("empty")).unwrap();
         fs::write(dir.join("empty/cplugin.json"), r#"{"id":"empty"}"#).unwrap();
+        // *.x parked plugins are skipped too (ad-hoc disable)
+        fs::create_dir_all(dir.join("parked.x")).unwrap();
+        fs::write(
+            dir.join("parked.x/cplugin.json"),
+            r#"{"id":"parked","main":"libparked.so"}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("parked.x/libparked.so"), b"x").unwrap();
 
         let plugins = scan(&dir);
         let ids: Vec<String> = plugins.iter().map(|p| p.id.clone()).collect();
