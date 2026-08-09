@@ -12,6 +12,14 @@ struct CatalogEntry {
     /// Optional platform filter ("linux-x64" etc.).
     #[serde(default)]
     platform: Option<String>,
+    /// Optional sha256 of the bundle; verified after download.
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(data);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn install(module: &str, catalog_repo: Option<&str>) -> i32 {
@@ -86,6 +94,16 @@ pub fn install(module: &str, catalog_repo: Option<&str>) -> i32 {
             return 1;
         }
     };
+
+    if let Some(expected) = &entry.sha256 {
+        let got = sha256_hex(&body);
+        if &got != expected {
+            let _ = fs::remove_dir_all(&dest_dir);
+            eprintln!("crussty: sha256 mismatch for {entry_id} (got {got}, expected {expected})", entry_id = entry.id);
+            return 1;
+        }
+        println!("crussty: sha256 ok");
+    }
 
     match unpack_tar_gz(&body, &dest_dir) {
         Ok(()) => {

@@ -10,6 +10,7 @@ mod lib;
 mod modules;
 mod pack;
 mod scaffold;
+mod search;
 mod server;
 
 #[derive(Parser)]
@@ -40,7 +41,9 @@ enum Command {
     },
     /// Hot-reload all modules (SIGUSR1 to the running JVM).
     Reload,
-    /// Install a module from the Crussty module catalog.
+    /// Search GitHub for Crussty modules (repos with cplugin.json).
+    Search { query: String },
+    /// Install a module by id from the catalog, or <owner/repo> directly from GitHub.
     Install {
         module: String,
         /// Catalog repo "owner/name"; defaults to PLANETA9091/crussty-catalog.
@@ -83,7 +86,14 @@ fn main() -> ExitCode {
             }
         }
         Command::Reload => server::reload(),
-        Command::Install { module, catalog } => catalog::install(&module, catalog.as_deref()),
+        Command::Search { query } => search::search(&query),
+        Command::Install { module, catalog } => {
+            if module.contains('/') {
+                search::install_repo(&module)
+            } else {
+                catalog::install(&module, catalog.as_deref())
+            }
+        }
         Command::Module { cmd } => match cmd {
             ModuleCmd::New(args) => scaffold::run_new(args),
             ModuleCmd::Build => scaffold::run_build(),
