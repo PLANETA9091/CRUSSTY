@@ -48,4 +48,4 @@ server.properties
 !runtime/build/hooks/dev/crussty/hooks/SchedulerHooks.class
 !runtime/build/hooks/dev/crussty/hooks/NetHooks.class
 !runtime/build/hooks/dev/crussty/hooks/TickHook.class
-!runtime/build/hooks/dev/crusty/hooks/StorageHooks.class
+!runtime/build/hooks/dev/crussty/hooks/StorageHooks.class
