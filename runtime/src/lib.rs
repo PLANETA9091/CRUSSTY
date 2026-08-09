@@ -402,9 +402,27 @@ impl Agent for CrusstyRuntime {
 
         // 2. Plugin hooks chain in registration order: each sees the previous
         //    output (the engine's included).
+        let trace = std::env::var_os("CRUSSTY_TRACE_HOOKS").is_some();
+        let trace_filter = std::env::var("CRUSSTY_TRACE_CLASS").ok();
+        let want_trace = trace
+            && trace_filter
+                .as_deref()
+                .map(|f| name.contains(f))
+                .unwrap_or(true);
         for entry in &registered {
             let mut out: *mut u8 = std::ptr::null_mut();
             let mut out_len: usize = 0;
+            if want_trace {
+                let owner = entry
+                    .owner
+                    .as_ref()
+                    .map(|(id, g)| format!("{id}/g{g}"))
+                    .unwrap_or_else(|| "-".to_string());
+                eprintln!(
+                    "[crussty-trace] '{name}' -> hook owner={owner} ctx=0x{:x} fn={:#x} len={}",
+                    entry.ctx, entry.func as usize, current_len
+                );
+            }
             let rc = unsafe {
                 (entry.func)(
                     entry.ctx as *mut c_void,
