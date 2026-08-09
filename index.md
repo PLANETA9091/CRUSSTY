@@ -25,7 +25,7 @@ A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
 `-agentpath` (or loaded via `JNI_OnLoad` in the single-jar distribution). It:
 
 - scans a `modules/` directory for modules,
-- loads each module (`dlopen`, `` `RTLD_LOCAL` ``) in dependency order,
+- loads each module (`dlopen`, `RTLD_LOCAL`) in dependency order,
 - forwards every class load through the module hook pipeline
   (`CLASS_FILE_LOAD_HOOK`), so modules can patch kernel bytecode on the fly
   (hot-patching),

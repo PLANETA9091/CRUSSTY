@@ -9,9 +9,9 @@ nav_order: 1
 
 Platform bricks are the runtime's native primitives exposed to modules: an
 async event bus, tick routing, telemetry, crash isolation, storage, threads —
-twelve of them, each owned by exactly one concern. A module uses them through
-the **platform bridge**: a `CPlatformApi*` attached to the ABI's `CPluginApi`
-(version >= 3).
+eleven of them reachable through the C bridge, each owned by exactly one
+concern. A module uses them through the **platform bridge**: a
+`CPlatformApi*` attached to the ABI's `CPluginApi` (version >= 3).
 
 ## The bridge
 
@@ -38,6 +38,10 @@ if (api->version >= 3 && api->platform && api->platform->version == 1) {
 
 ## Bricks
 
+The C bridge exposes **28 functions in 11 brick groups**. `barriers`
+(multi-phase sync between module threads) is a Rust-runtime-only brick and
+is not part of `CPlatformApi`:
+
 | Brick | In `CPlatformApi` | What it gives |
 |---|---|---|
 | events | `events_subscribe` / `events_publish` / `events_unsubscribe` | async pub/sub bus with backpressure, lifecycle events |
@@ -51,7 +55,6 @@ if (api->version >= 3 && api->platform && api->platform->version == 1) {
 | save_events | `save_events_*` | world-save lifecycle hooks |
 | hot_reload | `hot_reload_*` | swap a module's library without a server restart |
 | side_table | `side_table_*` | O(1) metadata beside kernel objects |
-| barriers | `barriers_*` | multi-phase sync between module threads |
 
 ## Rules
 

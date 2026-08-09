@@ -15,10 +15,15 @@ is required; the fields the runtime reads are:
 | `main` | string | derived | Path to the entry library, relative to the manifest |
 | `dependencies` | array of strings | `[]` | Module ids that must load first (topological order) |
 
+Other fields (for example `version`) are allowed but ignored by the loader —
+anything the manifest needs beyond `id`/`main`/`dependencies` is read by
+your own entry point.
+
 A `main` that is an absolute path (**POSIX `/`**, Windows `C:\`, UNC `\\`) or
 contains any `..`-escaping component marks the manifest malformed, and the
 module is skipped.
 
 The module id comes from the manifest, or defaults to the directory name (for
-archives: the archive file name). Two modules with the same id are both
-skipped by the scanner.
+archives: the archive file name). The scanner does not deduplicate: two
+modules with the same id are both loaded, and the dependency map ends up
+with whichever manifest was scanned later — keep ids unique.

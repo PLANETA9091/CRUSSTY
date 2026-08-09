@@ -11,10 +11,10 @@ any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 
 1. The runtime opens the archive and peeks for `cplugin.json` at the top
    level of the zip.
-2. The archive is extracted into a cache directory under `modules/` the
-   first time; the cache is keyed by the archive's mtime — re-extraction
-   happens only when the archive changed — after that the module is loaded
-   from cache.
+2. The archive is extracted into a cache directory
+   (`<temp>/cplug-cache/<stem>-<hash>/`) the first time; the cache is keyed
+   by the archive's hash — re-extraction happens only when the archive
+   changed — after that the module is loaded from cache.
 3. The cache entry is loaded exactly like a directory module (manifest,
    entry resolution, hooks) — the two distribution forms are equivalent.
 

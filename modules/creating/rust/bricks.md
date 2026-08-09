@@ -4,12 +4,12 @@ parent: Rust
 nav_order: 2
 ---
 
-# Platform bricks in Rust
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/rust.svg" alt=""> Platform bricks in Rust
 
 In Rust the bridge is already typed: `CPluginApi` carries a trailing
-`platform: *const CPlatformApi` (v3+) and `cplug-sdk` re-exports the
-platform's public API from `platform/mod.rs`. In Rust you mostly don't poke
-the raw struct — the SDK wraps the 12 bricks:
+`platform: *const CPlatformApi` (v3+) and `cplug-sdk` wraps it from
+`platform/mod.rs`. In Rust you mostly don't poke the raw struct directly —
+the SDK exposes typed helpers for the bricks it touches:
 
 | Brick | SDK face | What it gives |
 |---|---|---|
@@ -24,7 +24,16 @@ the raw struct — the SDK wraps the 12 bricks:
 | save_events | `save_events::*` | world-save lifecycle hooks |
 | hot_reload | runtime-managed | swap a module's library without a restart |
 | side_table | `side_table::*` | O(1) metadata beside kernel objects |
-| barriers | `barriers::*` | multi-phase sync between module threads |
+
+The SDK itself ships hooks, classes/JNI, main-thread dispatch, ASM weaving
+and logging — the other bricks live inside the runtime and are reached
+through `CPlatformApi` directly (same contract as any language). On top of
+that, Rust gets the `cplug-sdk` convenience layer (pattern/byte hooks,
+class lookup, kernel-ready notification) that other languages reach through
+`cplug-sdk-c` — see [SDK in C](../../../sdk-c.html).
+
+> Note: the platform exposes **11 brick groups** through the C bridge
+> (`barriers` is a Rust-runtime-only brick, not part of `CPlatformApi`).
 
 ## Version guard
 

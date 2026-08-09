@@ -5,7 +5,7 @@ nav_order: 2
 
 ---
 
-# Platform internals
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf.svg" alt=""> Platform internals
 
 The runtime ships twelve native primitives under `runtime/src/platform/`.
 They are the building blocks every module builds on: instead of reinventing

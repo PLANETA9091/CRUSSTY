@@ -68,7 +68,7 @@ is called:
 ```
 
 - `id` — unique module id; the runtime looks for `lib<id>.so` (here `libhello.so`)
-- `version` — optional, shown in the scan log
+- `version` — optional metadata; the loader ignores it (only `id`/`main`/`dependencies` are read)
 
 > **Rename rule:** if your library is *not* named `lib<id>.so`, set the
 > explicit entry name: `{"id": "hello", "main": "libmycustom.so"}`.
@@ -132,6 +132,10 @@ pub unsafe extern "C" fn cplugin_init(
     vm: JavaVmPtr,
     _options: *const std::ffi::c_char,
 ) -> i32 {
+    // First log line — the runtime calls this once at scan time, before
+    // the kernel boots.
+    eprintln!("[hello-plugin] cplugin_init (native, before kernel boot)");
+
     cplug_sdk::init(api, vm);
 
     // Fire when org/bukkit/Bukkit is loaded — proves the hook chain.
@@ -142,6 +146,8 @@ pub unsafe extern "C" fn cplugin_init(
     // Once the kernel is up, log through Bukkit.getLogger() from the
     // main thread (the queue flushes only after the server object exists).
     cplug_sdk::on_kernel_ready("org.bukkit.Bukkit", || {
+        let found = cplug_sdk::classes::find_class("org/bukkit/Bukkit").is_ok();
+        eprintln!("[hello-plugin] GetLoadedClasses resolved Bukkit: {}", found);
         cplug_sdk::run_on_main_thread(|_env| {
             cplug_sdk::log::info("hello from native c-plugin (v2 pipeline alive)");
         });

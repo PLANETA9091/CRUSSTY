@@ -28,11 +28,13 @@ Clone/build anyway like any module (see [Quick Start](../quickstart.html)).
 ## examples-multilang — modules written in C, C++, Python, JS
 
 The `modules/examples-multilang/` tree in this repo demonstrates the
-**non-Rust** module path: `c`, `cpp`, `python` and `js` each contain a
-`shim.c` exporting the C-ABI `cplugin_init`, a `build.sh`, a `cplugin.json`
-and a module body (Python/JS shims embed CPython/QuickJS). Go builds and
-passes a harness but crashes the JVM in-process (Go runtime signal
-handlers; keep Go modules as sidecar processes).
+**non-Rust** module path. Each language directory ships a `build.sh` and a
+module body — `c` and `cpp` are plain C/C++ sources exporting the C-ABI
+`cplugin_init`, while `python` and `js` add a small `shim.c` embedding
+CPython/QuickJS around the `.py` / `.js` body. The manifest is provided by
+the wrapping module directory (`"main"` points at the built library). Go
+builds and passes a harness but crashes the JVM in-process (Go runtime
+signal handlers; keep Go modules as sidecar processes).
 
 All four verified modules boot together on a live Purpur 1.21.10 server; each
 fires its class hook on every class load.

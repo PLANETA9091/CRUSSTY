@@ -81,8 +81,8 @@ plain C struct of function pointers (`CPluginApi`) passed into
 | API | Purpose |
 | --- | --- |
 | `register_class_hook(module_ctx, ClassHookFn) -> i32` | attach a hook to the class-load pipeline |
-| `alloc_class_bytes(size) -> *mut u8` | allocate replacement bytes via the JVMTI allocator |
-| `retransform_class(class_bytes, len) -> i32` | force retransformation (class name is embedded in the bytes; JVMTI reads it) |
+| `jvmti_allocate(size) -> *mut u8` | allocate replacement bytes via the JVMTI allocator |
+| `retransform_class(name) -> i32` | force retransformation of the named, already-loaded class (JVMTI `RetransformClasses`) |
 
 `CPAPI_VERSION` guards ABI drift: the runtime rejects modules compiled
 against a different ABI version.

@@ -21,8 +21,9 @@ What this means in practice:
 | threads | via shim export | worker thread with JS event loop |
 | hot_reload | automatic | swap `libhello.so` — QuickJS state is re-seeded |
 
-Everything else (transform, signals, telemetry, side_table, barriers,
-save_events) is reachable the same way: the shim forwards fields of
+Everything else (transform, signals, telemetry, side_table,
+save_events, barriers when wrapped) is reachable the same way: the shim
+forwards fields of
 `api->platform` into functions callable from JS.
 
 The full API and the version-guard contract (CPAPI_VERSION=3,

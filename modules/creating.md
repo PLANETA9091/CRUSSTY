@@ -15,10 +15,10 @@ folder and ends with a module running on a live server.
 ## Where to start
 
 - [What a module is](./creating/intro.html) — the module contract
-- [Rust](./creating/rust.html) — the reference path
-- [C & C++](./creating/c.html) — the native path, no shim
-- [Python](./creating/python.html) — CPython shim
 - [JavaScript](./creating/javascript.html) — QuickJS shim
+- [Python](./creating/python.html) — CPython shim
+- [C & C++](./creating/c.html) — the native path, no shim
+- [Rust](./creating/rust.html) — the reference path
 
 Each language page links the **building** guide (step by step) and the
 **platform bricks** page (which runtime primitives it can use).

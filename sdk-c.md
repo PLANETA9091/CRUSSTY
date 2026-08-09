@@ -4,7 +4,7 @@ parent: Module SDK
 nav_order: 5
 ---
 
-# <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> SDK in C, Python, JavaScript, Zig
+# <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> SDK in C (cplug-sdk-c)
 
 `cplug-sdk-c` is a thin **C binding** of the Rust SDK: one header, one
 library, plain `extern "C"` functions. It exposes the same convenience
@@ -18,7 +18,7 @@ under `cplug-sdk-c/` (build: `cargo build --release -p cplug-sdk-c` →
 
 Who uses it:
 
-- **C / C++ / Zig** — link the static lib directly, call the functions.
+- **C / C++** — link the static lib directly, call the functions.
 - **Python** — `ctypes` only: no shim logic beyond the embedding trampoline,
   no JNI code at all. See `cplug-sdk-c/examples/python`.
 - **JavaScript** — from a QuickJS C shim. See `modules/examples-multilang/js`.
@@ -26,7 +26,7 @@ Who uses it:
 ## The header
 
 `#include "cplug-sdk.h"` next to `cplug-abi.h`. It defines four callback
-types and sixteen functions.
+types and fourteen functions.
 
 ```c
 typedef void  (*cplug_hook_fn)(void* ctx, const char* name);
@@ -124,5 +124,5 @@ is recursive; QuickJS — a recursive mutex around the interpreter), and Go
 is not viable in-process on a live JVM.
 
 The Rust SDK remains the deepest path (ASM weaving, profiler); everything
-below it is now available to C, C++, Python, JS and Zig through
+below it is now available to C, C++, Python and JS through
 `cplug-sdk-c`.

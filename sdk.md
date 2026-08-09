@@ -50,11 +50,12 @@ threads are already attached).
 
 ## Not writing Rust?
 
-The same convenience layer is available to C, C++, Python, JavaScript and
-Zig modules through **`cplug-sdk-c`** — a thin C binding of the SDK
+The same convenience layer is available to C, C++, Python and JavaScript
+modules (or any C-ABI language) through **`cplug-sdk-c`** — a thin C
+binding of the SDK
 (pattern hooks, byte hooks, class lookup, main-thread dispatch, kernel
 logging) with one header and one library. Python modules drive it straight
-from `hello_sdk.py` via `ctypes`; C, C++ and Zig link it directly. You
+from `hello_sdk.py` via `ctypes`; C and C++ link it directly. You
 only write Rust if you need the bytecode weaving (`insert_call_at_start` /
 `redirect_calls`) or the profiler — see the [language pages](./modules/creating.html)
 for the full matrix.
