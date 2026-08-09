@@ -51,3 +51,21 @@ jobs:
             exit 1
           fi
           echo "OK: committed artifacts are up to date"
+
+  multilang:
+    name: build examples-multilang (c/cpp/go/js/python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc g++ python3 golang-go
+      - name: Build every language example
+        run: |
+          cd modules/examples-multilang
+          for lang in c cpp go js python; do
+            echo "== building $lang =="
+            bash $lang/build.sh
+            ls -1 "$lang"/lib*.so >/dev/null || { echo "::error::$lang build produced no lib*.so"; exit 1; }
+          done
