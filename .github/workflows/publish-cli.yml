@@ -1,0 +1,67 @@
+name: publish-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub release tag to attach binaries to (e.g. v2.0.0)"
+        required: true
+  push:
+    tags:
+      - "cli-*"
+
+jobs:
+  build:
+    name: build (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+          - os: windows-latest
+            arch: x64
+          - os: macos-latest
+            arch: arm64
+          - os: macos-13
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --manifest-path cli/Cargo.toml
+      - name: Stage binary
+        shell: bash
+        run: |
+          cd cli/target/release
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            mv crussty.exe crussty-${{ matrix.arch }}.exe
+          else
+            mv crussty crussty-${{ matrix.arch }}
+          fi
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crussty-${{ matrix.arch }}
+          path: cli/target/release/crussty*
+
+  release:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crussty-*
+          merge-multiple: true
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          files: |
+            crussty-x64
+            crussty-arm64
+            crussty-x64.exe
+            crussty-arm64.exe
+          fail_on_unmatched_files: false

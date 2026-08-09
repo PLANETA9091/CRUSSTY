@@ -69,3 +69,29 @@ jobs:
             bash $lang/build.sh
             ls -1 "$lang"/lib*.so >/dev/null || { echo "::error::$lang build produced no lib*.so"; exit 1; }
           done
+  cli:
+    name: cli build (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+          - os: windows-latest
+            arch: x64
+          - os: macos-latest
+            arch: arm64
+          - os: macos-13
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --manifest-path cli/Cargo.toml
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crussty-${{ matrix.arch }}
+          path: cli/target/release/crussty${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
