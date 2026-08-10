@@ -1,6 +1,12 @@
 name: publish-npm
 
 on:
+  push:
+    branches: ["master"]
+    tags: ["cli-*"]
+    paths:
+      - "cli/**"
+      - "!cli/npm/**"
   workflow_dispatch:
 
 permissions:
@@ -65,6 +71,29 @@ jobs:
             cp "$d"/crussty* "cli/npm/pkg/$tag/bin/"
             chmod +x "cli/npm/pkg/$tag/bin/"crussty*
           done
+      - name: Authenticate to npm
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+      - name: Bump versions (patch over the published version)
+        run: |
+          set -e
+          bump() {
+            dir=$1; pkg=$2
+            cur=$(npm view "$pkg" version 2>/dev/null || node -p "require('./$dir/package.json').version")
+            new=$(node -e "const [m,i,p]=process.argv[1].split('.');console.log(m+'.'+i+'.'+(+p+1))" "$cur")
+            (cd "$dir" && npm pkg set version="$new")
+            echo "$pkg: $cur -> $new"
+          }
+          for tag in linux-x64 linux-arm64 darwin-arm64 windows-x64; do
+            bump "cli/npm/pkg/$tag" "crussty-$tag"
+          done
+          PLATFORM_VERSION=$(node -p "require('./cli/npm/pkg/linux-x64/package.json').version")
+          bump "cli/npm" "crussty"
+          for tag in linux-x64 linux-arm64 darwin-arm64 windows-x64; do
+            (cd cli/npm && npm pkg set "optionalDependencies.crussty-$tag=$PLATFORM_VERSION")
+          done
+          echo "platform deps pinned to $PLATFORM_VERSION"
+          echo "PLATFORM_VERSION=$PLATFORM_VERSION" >> "$GITHUB_ENV"
       - name: Publish platform packages
         run: |
           for tag in linux-x64 linux-arm64 darwin-arm64 windows-x64; do
