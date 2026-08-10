@@ -5,13 +5,51 @@ nav_order: 2
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/bolt.svg" alt=""> Quick Start
 
-## Requirements
+## Fastest path — the CLI (5 minutes)
 
-- Rust (stable toolchain, tested on 1.8x+)
-- Java 21+ (JDK for `javac`/`jar`)
-- A Paper-family kernel jar, e.g. Purpur 1.21.10
+You only need the `crussty` CLI from npm and a Java 21+ runtime:
 
-## Build the platform
+```bash
+npm i -g crussty
+```
+
+Scaffold a server directory (this downloads the Purpur kernel, the native
+runtime and the launcher for you):
+
+```bash
+crussty init --dir my-server
+cd my-server
+```
+
+Start the server — the console is forwarded to your terminal, `stop` shuts
+it down cleanly:
+
+```bash
+crussty run
+```
+
+Install modules without leaving the terminal:
+
+```bash
+crussty search nbt                    # find modules on GitHub (repos with module.json)
+crussty install hello                 # install from the catalog
+crussty install PLANETA9091/c-hello   # or straight from a repo
+crussty ls                            # active / parked / disabled
+```
+
+Write your own module while the server runs — `crussty tui` gives you a
+full-screen menu: new module, build, auto-rebuild on file change, pack,
+GitHub search. Try [Creating a module](./modules/creating.html) or just
+`crussty module new hello`.
+
+## Building the platform from source
+
+You don't need to build anything — prebuilt `launcher.jar`,
+`libcrussty_runtime.so` and run scripts are attached to every
+[GitHub release](https://github.com/PLANETA9091/CRUSSTY/releases), and
+`crussty init` downloads them for you. Building from source is for hacking
+on the platform itself (runtime, launcher, SDK). Requirements: Rust
+(stable) and a Java 21+ JDK.
 
 ```bash
 # JVMTI runtime
@@ -22,19 +60,8 @@ cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 ./scripts/build-single-jar.sh
 ```
 
-## Install modules
-
-Clone example modules into `modules/`:
-
-```bash
-git clone https://github.com/PLANETA9091/c-hello modules/hello
-cd modules/hello && cargo build && cp target/debug/libhello.so libhello.so
-```
-
-Or drop a module zip (see [Distribution](./modules/zip.html)) into `modules/`
-— the runtime extracts and loads it.
-
-## Run — single-jar (recommended)
+Run what you built (modules still go into `modules/` — `crussty install hello`
+or drop a bundle in by hand):
 
 ```bash
 echo "eula=true" > eula.txt
@@ -42,16 +69,14 @@ cp dist/crussty-1.21.10.jar server.jar
 java -Xmx2G -jar server.jar --nogui
 ```
 
-The jar boots the kernel itself: no `-agentpath`, no launcher process.
-
 ## Verify
 
 Check the server log:
 
 ```
-[crussty-runtime] plugin hello -> init rc=0
-[hello-plugin] cplugin_init (native, before kernel boot)
-[crussty-runtime] pipeline ready: 3 plugin hook(s)
+[crussty-runtime] module hello -> init rc=0
+[hello-module] cplugin_init (native, before kernel boot)
+[crussty-runtime] pipeline ready: 3 module hook(s)
 [13:36:26 INFO]: hello from native c-plugin (v2 pipeline alive)
 ```
 

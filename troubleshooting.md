@@ -17,7 +17,7 @@ nav_order: 7
 
 ## Module not loaded
 
-- Does `cplugin.json` exist? Does `modules/` contain a `cplugin.json` in the
+- Does `module.json` exist? Does `modules/` contain a `module.json` in the
   module directory or a `*.zip` with a manifest inside?
 - Is it named `*.disabled`? That is honored.
 - Entry library missing → `lib<id>.so` not found next to the manifest, or
@@ -27,7 +27,7 @@ nav_order: 7
 
 ## Zip module never appears
 
-- The zip must contain `cplugin.json` at the top level — not inside a
+- The zip must contain `module.json` at the top level — not inside a
   folder. Peek check: archives without a manifest are ignored entirely.
 - Extract to `<temp>/cplug-cache/<stem>-<hash>/` — verify the cache was
   created (`ls /tmp/cplug-cache/`).

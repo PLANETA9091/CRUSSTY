@@ -6,6 +6,17 @@ nav_order: 1
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt="Module"> What a module is
 
+The easiest way to start a module is the CLI — it scaffolds the whole
+layout from a language template (Rust, C, C++, Go, JS, Python), builds and
+packs it, and can hot-reload it into a running server:
+
+```bash
+npm i -g crussty
+crussty module new hello          # scaffold from a template
+crussty module build              # build
+crussty tui                       # full-screen menu (build, watch, pack, search)
+```
+
 A Crussty module is a **shared library** that exports exactly one C-ABI
 function:
 
@@ -24,7 +35,7 @@ Rust, C, C++, Python, JavaScript, via shims — is a module.
 
 ## The lifecycle
 
-1. **Scan** — the runtime finds `cplugin.json` + the entry library
+1. **Scan** — the runtime finds `module.json` + the entry library
 2. **Load** — `dlopen`, resolve `cplugin_init`
 3. **Init** — called once, before the kernel boots; register hooks, stash
    state, **no JVM work here**

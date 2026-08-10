@@ -83,7 +83,7 @@ cc -shared -fPIC -O2 -I<repo>/cplug-sdk-c/include \
    -o libhello_sdk.so hello_sdk.c <repo>/target/release/libcplug_sdk_c.a
 ```
 
-Deploy `libhello_sdk.so` + `cplugin.json` (`{"id": "hello_sdk"}`) into `modules/`.
+Deploy `libhello_sdk.so` + `module.json` (`{"id": "hello_sdk"}`) into `modules/`.
 
 ## Using it from Python
 

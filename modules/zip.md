@@ -9,7 +9,7 @@ nav_order: 2
 Modules can be distributed as a single zip (or jar) file. The scan treats
 any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 
-1. The runtime opens the archive and peeks for `cplugin.json` at the top
+1. The runtime opens the archive and peeks for `module.json` at the top
    level of the zip.
 2. The archive is extracted into a cache directory
    (`<temp>/cplug-cache/<stem>-<hash>/`) the first time; the cache is keyed

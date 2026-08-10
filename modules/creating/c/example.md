@@ -46,7 +46,7 @@ int32_t cplugin_init(const CPluginApi* api, void* vm_ptr, const char* options) {
 }
 ```
 
-## 2. `cplugin.json`
+## 2. `module.json`
 
 ```json
 {"id": "hello_c"}
@@ -64,7 +64,7 @@ gcc -shared -fPIC -O2 \
 
 ## 4. Deploy
 
-Copy `libhello_c.so` + `cplugin.json` into `modules/` and start the server.
+Copy `libhello_c.so` + `module.json` into `modules/` and start the server.
 Expected log: `[hello-c] cplugin_init (C module, api v3)` then a hook log on
 the first kernel class load after boot.
 

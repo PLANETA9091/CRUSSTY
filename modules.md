@@ -7,14 +7,14 @@ has_children: true
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/archive.svg" alt=""> Modules
 
 A module is either a **directory** or a **zip archive** containing a
-`cplugin.json` manifest and an entry shared library. The scan is recursive:
-any `cplugin.json` under `modules/` marks a module directory; any `.zip` /
+`module.json` manifest and an entry shared library. The scan is recursive:
+any `module.json` under `modules/` marks a module directory; any `.zip` /
 `.jar` file (case-insensitive) is treated as an archive module.
 
 The name "module" is deliberately distinct from Paper's "plugin": Crussty
 modules are native Rust libraries loaded into the kernel process by the
 platform, not Java plugins loaded by the kernel itself. (The exported symbol
-is still `cplugin_init` and the manifest `cplugin.json` — naming from
+is still `cplugin_init` and the manifest `module.json` — naming from
 Crussty's earlier "c-plugin" design.)
 
 ## Directory structure
@@ -22,7 +22,7 @@ Crussty's earlier "c-plugin" design.)
 ```
 modules/
 └── hello/
-    ├── cplugin.json      # manifest
+    ├── module.json      # manifest
     ├── libhello.so       # entry library (Linux)
     ├── native/           # optional bundled libs (never dlopened as modules)
     └── anything-else/    # resources

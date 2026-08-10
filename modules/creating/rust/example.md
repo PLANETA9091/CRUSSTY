@@ -50,7 +50,7 @@ crussty/
 ├── runtime/          # the platform itself
 └── modules/
     └── hello/        # ← your module
-        ├── cplugin.json
+        ├── module.json
         ├── Cargo.toml
         └── src/
             └── lib.rs
@@ -60,7 +60,7 @@ crussty/
 <div class="ws-step">
 <h2><span class="step-no">2.</span> Write the manifest</h2>
 
-`cplugin.json` tells the runtime your module exists and what its entry library
+`module.json` tells the runtime your module exists and what its entry library
 is called:
 
 ```json
@@ -103,7 +103,7 @@ Three files make up the module body. Click the tabs:
 
 <div class="ws-tabs">
   <div class="ws-tabbar">
-    <button class="active" data-tab="tab-manifest">cplugin.json</button>
+    <button class="active" data-tab="tab-manifest">module.json</button>
     <button data-tab="tab-cargo">Cargo.toml</button>
     <button data-tab="tab-lib">src/lib.rs</button>
   </div>
@@ -181,7 +181,7 @@ You should now have three files in `modules/hello/`:
 
 ```text
 modules/hello/
-├── cplugin.json
+├── module.json
 ├── libhello.so
 └── src/lib.rs
 ```
@@ -189,7 +189,7 @@ modules/hello/
 To hand the module to someone who doesn't build, pack it:
 
 ```bash
-zip -r hello.zip cplugin.json libhello.so
+zip -r hello.zip module.json libhello.so
 ```
 </div>
 
@@ -207,7 +207,7 @@ or place the files directly:
 
 ```bash
 mkdir -p modules/hello
-cp libhello.so cplugin.json modules/hello/
+cp libhello.so module.json modules/hello/
 ```
 
 That's it — no config, no registration. The runtime rescans `modules/`
