@@ -383,3 +383,86 @@ fn urlencode(s: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_repo_owner_repo() {
+        assert_eq!(split_repo("owner/repo"), ("owner", "repo"));
+    }
+
+    #[test]
+    fn split_repo_full_url() {
+        assert_eq!(split_repo("https://github.com/owner/repo"), ("owner", "repo"));
+    }
+
+    #[test]
+    fn split_repo_trailing_slash() {
+        assert_eq!(split_repo("owner/repo/"), ("owner", "repo"));
+    }
+
+    #[test]
+    fn split_repo_git_suffix_is_kept() {
+        // the code only trims the https://github.com/ prefix and trailing
+        // slashes; ".git" is not stripped
+        assert_eq!(split_repo("https://github.com/owner/repo.git"), ("owner", "repo.git"));
+    }
+
+    #[test]
+    fn split_repo_no_slash() {
+        assert_eq!(split_repo("owner"), ("owner", ""));
+    }
+
+    #[test]
+    fn split_repo_first_path_segment_only() {
+        assert_eq!(split_repo("owner/repo/sub"), ("owner", "repo"));
+    }
+
+    #[test]
+    fn split_repo_whitespace_trimmed() {
+        assert_eq!(split_repo("  owner/repo  "), ("owner", "repo"));
+    }
+
+    #[test]
+    fn urlencode_spaces_to_plus() {
+        assert_eq!(urlencode("hello world"), "hello+world");
+    }
+
+    #[test]
+    fn urlencode_alphanumeric_untouched() {
+        assert_eq!(urlencode("abcXYZ0123-_.~"), "abcXYZ0123-_.~");
+    }
+
+    #[test]
+    fn urlencode_special_chars() {
+        assert_eq!(urlencode("a/b?c"), "a%2Fb%3Fc");
+        assert_eq!(urlencode("a+b"), "a%2Bb");
+    }
+
+    #[test]
+    fn urlencode_non_ascii_utf8() {
+        assert_eq!(urlencode("café"), "caf%C3%A9");
+        assert_eq!(urlencode("日本語"), "%E6%97%A5%E6%9C%AC%E8%AA%9E");
+    }
+
+    #[test]
+    fn urlencode_empty() {
+        assert_eq!(urlencode(""), "");
+    }
+
+    #[test]
+    fn platform_tag_shape() {
+        let tag = platform_tag();
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        match (os, arch) {
+            ("linux", "x86_64") => assert_eq!(tag, "linux-x64"),
+            ("linux", "aarch64") => assert_eq!(tag, "linux-arm64"),
+            ("macos", "aarch64") => assert_eq!(tag, "macos-arm64"),
+            ("macos", "x86_64") => assert_eq!(tag, "macos-x64"),
+            ("windows", _) => assert_eq!(tag, "win-x64"),
+            _ => assert_eq!(tag, format!("{os}-{arch}")),
+        }
+    }
+}

@@ -1,13 +1,45 @@
 # Quick Start
 
-## Requirements
+## Fastest path — the CLI (5 minutes)
 
-- Rust (stable toolchain, tested on 1.8x+)
-- Java 21+ (JDK for `javac`/`jar`) — the kernel needs 21+, but the platform's
-  committed Java helper classes are compiled with `--release 8` (class-file
-  target 52), so any modern JDK can rebuild them
+You only need the `crussty` CLI from npm and a Java 21+ runtime:
 
-## Build the platform
+```bash
+npm i -g crussty
+```
+
+Scaffold a server directory (this downloads the Purpur kernel, the native
+runtime and the launcher for you):
+
+```bash
+crussty init --dir my-server
+cd my-server
+```
+
+Start the server — the console is forwarded to your terminal, `stop` shuts
+it down cleanly:
+
+```bash
+crussty run
+```
+
+Install modules without leaving the terminal:
+
+```bash
+crussty search nbt       # find modules on GitHub (repos with module.json)
+crussty install hello    # install from the catalog
+crussty install PLANETA9091/c-hello   # or straight from a repo
+crussty ls               # see active / parked / disabled modules
+```
+
+Write your own module while the server runs — `crussty tui` gives you a
+menu: scaffold, build, auto-rebuild on file change, pack. See
+[Your first module](./first-module.md).
+
+## Building the platform from source
+
+If you want to hack on the runtime itself, clone the repository. You need
+Rust (stable) and a Java 21+ JDK.
 
 The Rust crates embed pre-built Java helper classes (committed); a fresh
 clone builds with zero Java toolchain. After editing a helper source, or for

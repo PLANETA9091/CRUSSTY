@@ -40,6 +40,51 @@ fn parse_tomlish(text: &str) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_section_with_quotes_stripped() {
+        let v = parse_tomlish("[server]\nkernel = \"purpur-1.21.10.jar\"\nmemory = \"2G\"\n");
+        assert_eq!(v["server"]["kernel"], "purpur-1.21.10.jar");
+        assert_eq!(v["server"]["memory"], "2G");
+    }
+
+    #[test]
+    fn skips_comments_and_empty_lines() {
+        let v = parse_tomlish("# comment\n\n   \n# another\n[server]\nmemory = \"2G\"\n");
+        assert_eq!(v["server"]["memory"], "2G");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn top_level_keys_without_section() {
+        let v = parse_tomlish("port = \"25565\"\nname = crussty\n");
+        assert_eq!(v["port"], "25565");
+        assert_eq!(v["name"], "crussty");
+    }
+
+    #[test]
+    fn unknown_sections_create_nested_objects() {
+        let v = parse_tomlish("[custom]\nfoo = \"bar\"\n");
+        assert_eq!(v["custom"]["foo"], "bar");
+    }
+
+    #[test]
+    fn section_name_is_trimmed() {
+        let v = parse_tomlish("[ server ]\nmemory = \"4G\"\n");
+        assert_eq!(v["server"]["memory"], "4G");
+    }
+
+    #[test]
+    fn lines_without_equals_are_skipped() {
+        let v = parse_tomlish("just text\n[server]\nmemory = \"2G\"\n");
+        assert_eq!(v["server"]["memory"], "2G");
+        assert_eq!(v.get("just").is_none(), true);
+    }
+}
+
 fn cfg_str(cfg: &serde_json::Value, section: &str, key: &str, fallback: &str) -> String {
     cfg.get(section)
         .and_then(|s| s.get(key))

@@ -38,6 +38,29 @@ changes behavior at class-load time.
 
 <img class="logo" src="./assets/crussty-logo.png" alt="Crussty logo" />
 
+## Install the CLI
+
+Everything you need fits in one command — no jars, no scripts, no manual
+downloads:
+
+```bash
+npm i -g crussty
+```
+
+The `crussty` CLI (Linux, macOS, Windows) downloads the correct binary for
+your platform automatically. From then on it handles the whole lifecycle:
+
+```bash
+crussty init --dir my-server   # scaffold a server: kernel, runtime, launcher
+crussty tui                    # full-screen menu: modules, search, build, pack
+crussty search <query>         # find modules on GitHub
+crussty install <id>           # install a module from the catalog
+crussty run                    # boot the server, console attached
+```
+
+The [CLI reference](./cli.md) covers every command; [Quick Start](./quickstart.md)
+walks through the first five minutes.
+
 ## What it does
 
 A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
