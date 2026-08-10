@@ -7,6 +7,12 @@ nav_order: 2
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf.svg" alt=""> Platform internals
 
+In plain words: the **bricks** (see [Platform bricks](./bricks.html)) are
+the runtime's internal building blocks — each one does one job (events,
+ticks, storage, crash safety, …). This page is a look under the hood: how
+each brick is implemented. Only needed if you're curious about or hacking
+on the runtime itself; module developers don't have to read it.
+
 The runtime ships twelve native primitives under `runtime/src/platform/`
 (11 of them are exposed through the C bridge — `barriers` stays runtime-side;
 see [Platform bricks](./bricks.html)).

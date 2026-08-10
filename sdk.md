@@ -6,6 +6,11 @@ has_children: true
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> Module SDK
 
+In plain words: **the comfortable way to write modules.** The bare
+contract (`cplugin_init` + the ABI) works, but the SDK gives you ready
+helpers for the common stuff — hooks, finding classes, running on the main
+thread, logging, patching methods — so you write less low-level code.
+
 `cplug-sdk` is the comfort layer on top of `cplug-abi`. Modules declare it
 as a dependency and get: hook registration, class lookup across loaders,
 main-thread dispatch, logging, and ASM method patching.

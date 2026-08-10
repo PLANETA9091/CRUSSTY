@@ -6,6 +6,11 @@ nav_order: 5
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/src.svg" alt=""> SDK in C (cplug-sdk-c)
 
+In plain words: **the same handy toolkit as the Rust SDK, but callable
+from C** (and from Python/JS through it). If you're writing a module in C,
+C++, Python or JavaScript, this is your friend — one header, one library,
+no JNI boilerplate.
+
 `cplug-sdk-c` is a thin **C binding** of the Rust SDK: one header, one
 library, plain `extern "C"` functions. It exposes the same convenience
 layer — pattern hooks, byte hooks, cross-loader class lookup, kernel-ready

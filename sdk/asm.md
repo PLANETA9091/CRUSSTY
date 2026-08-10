@@ -6,6 +6,11 @@ nav_order: 4
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/assembly.svg" alt=""> ASM weaving
 
+In plain words: **replace a Java method with your own native code.** You
+tell the SDK which Java method to swap, it rewrites the class so the server
+calls your Rust/C function instead. This is how modules make hot paths
+(worldgen, chunk encoding…) thousands of times faster.
+
 `cplug-sdk::asm` replaces a Java method's body with a call to your native
 bridge. The rewriting itself is done by a small injected Java helper
 (`SdkAsmHelper`, built on `org/objectweb/asm`) defined into the target

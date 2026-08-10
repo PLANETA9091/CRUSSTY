@@ -7,6 +7,12 @@ nav_order: 1
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf.svg" alt="Platform bricks"> Platform bricks
 
+In plain words: the runtime itself has a toolbox of ready-made parts —
+events, timers, storage, threads, crash protection. Your module doesn't
+need to reinvent them: the **platform bridge** hands the toolbox to any
+module that asks. This page lists what's in the toolbox and the rules for
+using it. Module developers only; end users can skip it.
+
 Platform bricks are the runtime's native primitives exposed to modules: an
 async event bus, tick routing, telemetry, crash isolation, storage, threads —
 eleven of them reachable through the C bridge, each owned by exactly one

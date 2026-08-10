@@ -6,6 +6,10 @@ parent: Modules
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/json.svg" alt=""> Manifest (module.json)
 
+In plain words: **the module's ID card.** A tiny JSON file telling the
+runtime who the module is, where its library lives, and what must load
+before it. Only `id` is required — the rest is optional.
+
 A JSON file at the top level of the module (directory or archive). Only `id`
 is required; the fields the runtime reads are:
 

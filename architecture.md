@@ -5,6 +5,13 @@ nav_order: 3
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/mcf_load.svg" alt=""> Architecture
 
+In plain words: a **runtime** (a small native library) attaches itself to
+your server's JVM while it boots. It watches every class the server loads,
+runs your modules against them, and applies their patches on the fly —
+before the server has even finished starting. This page is about how that
+runtime is built and how it talks to the JVM. If you just want to run
+something, start at [Quick Start](./quickstart.html) instead.
+
 ## Layers
 
 <div class="arch-diagram" markdown="0">

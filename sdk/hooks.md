@@ -6,6 +6,11 @@ nav_order: 1
 
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/function.svg" alt=""> Hooks
 
+In plain words: **your module's phone — the runtime calls it every time
+the server loads a class.** You register a pattern (`org/bukkit/**`),
+and every matching class triggers your callback. This is how modules watch
+the server boot and patch things along the way.
+
 Hooks are the primary interface: a callback invoked by the runtime for
 every class load.
 
