@@ -2,6 +2,7 @@
 
 - [Introduction](./intro.md)
 - [Quick Start](./quickstart.md)
+- [CLI](./cli.md)
 - [Modules](./modules.md)
   - [Manifest (module.json)](./manifest.md)
   - [Distribution as zip archives](./zip.md)

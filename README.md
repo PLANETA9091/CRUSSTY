@@ -8,22 +8,23 @@ API locks, no JNI boilerplate, no `-agentpath`.
 > **Documentation:** [planeta9091.github.io/CRUSSTY](https://planeta9091.github.io/CRUSSTY/)
 > — quickstart, module API, SDK reference, other languages, troubleshooting.
 >
-> **Downloads:** prebuilt `crussty-linux-x64` CLI, `launcher.jar`,
-> `libcrussty_runtime.so` and run scripts in
+> **Downloads:** the `crussty` CLI on
+> [npm](https://www.npmjs.com/package/crussty) (Linux, macOS, Windows),
+> plus `launcher.jar`, `libcrussty_runtime.so` and run scripts in
 > [Releases](https://github.com/PLANETA9091/CRUSSTY/releases).
 
 ## Quick start (5 minutes)
 
-You only need the `crussty-linux-x64` binary from the
-[latest release](https://github.com/PLANETA9091/CRUSSTY/releases/latest)
-and a Java 21+ runtime.
+You only need the `crussty` CLI from npm and a Java 21+ runtime:
 
 ```bash
+npm i -g crussty
+
 # 1. scaffold a server directory (downloads the kernel, runtime and launcher)
-crussty-linux-x64 init --dir my-server
+crussty init --dir my-server
 
 # 2. start the server (console is forwarded to your terminal)
-cd my-server && crussty-linux-x64 run
+cd my-server && crussty run
 ```
 
 That's it — the runtime boots with the kernel and loads whatever is in
@@ -45,12 +46,20 @@ my-server/
 ### Managing modules
 
 ```bash
-crussty-linux-x64 ls        # list modules: active / parked / disabled
-crussty-linux-x64 install <name>   # install from the module catalog
-crussty-linux-x64 enable <name>    # activate a parked/disabled module
-crussty-linux-x64 disable <name>   # park it (or --disabled to disable)
-crussty-linux-x64 reload    # hot-reload all modules (no server restart)
+crussty ls        # list modules: active / parked / disabled
+crussty search <query>   # find modules on GitHub (repos with module.json)
+crussty install <name>   # install from the module catalog
+crussty install <owner/repo>  # install straight from a GitHub repo
+crussty enable <name>    # activate a parked/disabled module
+crussty disable <name>   # park it (or --disabled to disable)
+crussty reload    # hot-reload all modules (no server restart)
 ```
+
+### The TUI
+
+`crussty tui` opens a full-screen menu: new module, build,
+auto-rebuild on file change, pack, GitHub search with one-keystroke
+install — and every action shows its output in the window.
 
 ## What is a module?
 
