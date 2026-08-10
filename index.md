@@ -7,33 +7,39 @@ nav_order: 1
 # <img class="page-icon" src="/CRUSSTY/assets/images/icons/datapacks.svg" alt=""> Crussty Platform
 
 
-Crussty is a **native injection platform** for Paper-family Minecraft kernels
-(Purpur, Paper, etc.). It attaches a JVMTI runtime to the kernel JVM and uses
-it to load **Rust modules** — shared libraries written entirely in Rust —
-directly into the server process, where they can intercept class loading,
-patch kernel bytecode, and replace hot paths with native code.
+Crussty is a **native module platform** for Minecraft servers (Purpur,
+Paper, etc.). Instead of Java plugins, you write modules in **Rust** (or C,
+C++, Python, JavaScript) — compiled native code that runs directly inside
+the server process. Modules can watch class loading, change server
+behaviour while it boots, and replace slow hot paths with fast native code.
 
-Call it what you like: an injector, a hot-patch engine, a native module
-platform. The distinguishing property is that Crussty does not fork the
-kernel and does not rebuild it — it injects itself into a stock jar and
-changes behavior at class-load time.
+The server itself stays a stock jar — nothing is rebuilt or forked. Crussty
+attaches itself at start and takes over from there.
 
 
-## What it does 
+## Getting started
 
-A JVMTI runtime (`libcrussty_runtime.so`) is attached to the kernel JVM with
-`-agentpath` (or loaded via `JNI_OnLoad` in the single-jar distribution). It:
+```bash
+npm i -g crussty        # install the CLI (Linux / macOS / Windows)
+crussty init --dir my-server   # create a server, everything is downloaded
+crussty run             # boot it — the console is right in your terminal
+crussty install hello   # grab a module and play
+```
 
-- scans a `modules/` directory for modules,
-- loads each module (`dlopen`, `RTLD_LOCAL`) in dependency order,
-- forwards every class load through the module hook pipeline
-  (`CLASS_FILE_LOAD_HOOK`), so modules can patch kernel bytecode on the fly
-  (hot-patching),
-- lets modules retransform already-loaded classes.
+Five minutes, no build toolchain, no jars to hunt for. Full walkthrough:
+[Quick Start](./quickstart.html).
 
-Modules get a `JavaVM*` and can do anything JNI/JVMTI allows: resolve classes,
-run code on the server main thread, call Bukkit APIs, rewrite bytecode with
-ASM.
+## What it does
+
+Crussty loads native modules straight into the server process:
+
+- **scans** the `modules/` folder for modules (a directory or zip with a
+  `module.json` manifest),
+- **loads** them in dependency order,
+- **hooks** every class load, so a module can patch server code on the fly
+  while it starts,
+- lets modules talk to the server: run code on the main thread, use Bukkit
+  APIs, replace bytecode.
 
 ## Why native
 

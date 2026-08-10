@@ -12,8 +12,8 @@ any `module.json` under `modules/` marks a module directory; any `.zip` /
 `.jar` file (case-insensitive) is treated as an archive module.
 
 The name "module" is deliberately distinct from Paper's "plugin": Crussty
-modules are native Rust libraries loaded into the kernel process by the
-platform, not Java plugins loaded by the kernel itself. (The exported symbol
+modules are native libraries loaded into the server process by the
+platform, not Java plugins loaded by the server itself. (The exported symbol
 is still `cplugin_init` and the manifest `module.json` — naming from
 Crussty's earlier "c-plugin" design.)
 
