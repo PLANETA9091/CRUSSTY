@@ -13,6 +13,8 @@ API locks, no JNI boilerplate, no `-agentpath`.
 > plus `launcher.jar`, `libcrussty_runtime.so` and run scripts in
 > [Releases](https://github.com/PLANETA9091/CRUSSTY/releases).
 
+![CRUSSTY demo](assets/demo.gif)
+
 ## Quick start (5 minutes)
 
 You only need the `crussty` CLI from npm and a Java 21+ runtime:
