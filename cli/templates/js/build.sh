@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the JS module (QuickJS shim).
-# Links against a locally built libqjs (see modules/examples-multilang/js/qjs
-# in the Crussty repo, or build quickjs-ng yourself); QJS_DIR points at the
-# directory containing libqjs.so and quickjs.h.
+# Links against a locally built libqjs (see c-hello@multilang/examples/js/qjs
+# in the Crussty module repos, or build quickjs-ng yourself); QJS_DIR points
+# at the directory containing libqjs.so and quickjs.h.
 set -euo pipefail
 cd "$(dirname "$0")"
 NAME=__NAME__
@@ -23,12 +23,16 @@ fi
 
 QJS_DIR="${QJS_DIR:-}"
 if [ -z "$QJS_DIR" ]; then
-  for c in ./qjs ../../../modules/examples-multilang/js/qjs; do
+  for c in ./qjs ../../../target/crussty-qjs; do
     if [ -f "$c/libqjs.so" ] || [ -f "$c/libqjs.so.0" ]; then QJS_DIR="$c"; break; fi
   done
   if [ -z "$QJS_DIR" ]; then
-    echo "libqjs not found; set QJS_DIR=<dir with libqjs.so + quickjs.h>" >&2
-    exit 1
+    QJS_DIR="$(mktemp -d)/crussty-qjs"
+    git clone -q --depth 1 -b multilang --sparse \
+      https://github.com/PLANETA9091/c-hello.git "$QJS_DIR" 2>/dev/null || true
+    (cd "$QJS_DIR" && git sparse-checkout set examples/js/qjs >/dev/null 2>&1 || true)
+    QJS_DIR="$QJS_DIR/examples/js/qjs"
+    test -f "$QJS_DIR/libqjs.so.0" || { echo "libqjs not found; set QJS_DIR=<dir with libqjs.so + quickjs.h>" >&2; exit 1; }
   fi
 fi
 test -f "$QJS_DIR/quickjs.h" || { echo "quickjs.h not found in QJS_DIR=$QJS_DIR" >&2; exit 1; }

@@ -27,20 +27,20 @@ signature, and JNI bindings for your language.
 | Language | Ease | Notes |
 |---|---|---|
 | **Rust** | Native | `cplug-sdk` — hooks, classes, main thread, ASM. Reference path. |
-| **C** | ✅ Verified | `examples-multilang/c` — raw JNI headers; `CPluginApi` is already plain C. |
-| **C++** | ✅ Verified | `examples-multilang/cpp` — same as C; RAII wrapper. |
-| **Go (cgo)** | ⚠️ Harness-only | `examples-multilang/go` works in a test harness, but the Go runtime hijacks signal handlers and **crashes the JVM** (SIGABRT) — see [golang/go#13042]. Ship as a separate process, not a JVM in-process module. |
-| **Python** | ✅ Verified | `examples-multilang/python` — C shim embeds CPython; module body is `.py`. |
-| **JavaScript** | ✅ Verified | `examples-multilang/js` — C shim embeds QuickJS; module body is `.js`. |
+| **C** | ✅ Verified | `c-hello@multilang `examples/c`` — raw JNI headers; `CPluginApi` is already plain C. |
+| **C++** | ✅ Verified | `c-hello@multilang `examples/c`pp` — same as C; RAII wrapper. |
+| **Go (cgo)** | ⚠️ Harness-only | `c-hello@multilang `examples/go`` works in a test harness, but the Go runtime hijacks signal handlers and **crashes the JVM** (SIGABRT) — see [golang/go#13042]. Ship as a separate process, not a JVM in-process module. |
+| **Python** | ✅ Verified | `c-hello@multilang `examples/python`` — C shim embeds CPython; module body is `.py`. |
+| **JavaScript** | ✅ Verified | `c-hello@multilang `examples/js`` — C shim embeds QuickJS; module body is `.js`. |
 | **Zig** | Straightforward | `@cImport` the JNI headers; export `cplugin_init`. |
 | **Nim / D / Odin** | Possible | Compile a `dylib`/`cdylib` and export the symbol. |
 
 [golang/go#13042]: https://github.com/golang/go/issues/13042
 
-## Verified examples (`examples-multilang/`)
+## Verified examples (c-hello `multilang` branch)
 
 Each of `c`, `cpp`, `python`, `js` ships a `build.sh` that links against
-`../../cplug-abi/cplug-abi.h`, a `module.json`, and a module body. All four
+the vendored `cplug-sdk-c/include`, a `module.json`, and a module body. All four
 were exercised end-to-end on a live Purpur 1.21.10 server: the runtime loads
 the four `.so`s, and every class load fires all four hooks (16,000+ hook
 invocations per module per boot with no errors). The Go module additionally

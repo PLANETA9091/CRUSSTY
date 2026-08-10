@@ -1,7 +1,6 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, poll};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::tty::IsTty;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,10 +15,9 @@ const LOGO: &str = include_str!("../assets/logo.txt");
 const MENU: &[&str] = &[
     "New module",
     "Build",
-    "Auto-rebuild on file change",
+    "Rebuild automatically",
     "Pack",
     "Search modules on GitHub",
-    "Install module",
     "Exit",
 ];
 
@@ -30,6 +28,7 @@ struct App {
     screen: usize,
     selected: usize,
     results: Vec<crate::search::Hit>,
+    output: Option<(bool, String)>,
     input: Option<(String, String)>,
     status: Option<String>,
 }
@@ -40,6 +39,7 @@ impl App {
             screen: 0,
             selected: 0,
             results: Vec::new(),
+            output: None,
             input: None,
             status: None,
         }
@@ -70,6 +70,66 @@ fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     let [main, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+
+    if app.screen == 2 {
+        if let Some((ok, text)) = &app.output {
+            let w = 72u16.min(main.width.saturating_sub(4));
+            let h = (main.height.saturating_sub(2)).min(20);
+            let output_area = Rect::new(
+                main.x + main.width.saturating_sub(w) / 2,
+                main.y + (main.height.saturating_sub(h)) / 2,
+                w,
+                h,
+            );
+            let (title, color) = if *ok {
+                (" OK ", Color::Green)
+            } else {
+                (" FAILED ", Color::Red)
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color))
+                .title(Line::from(Span::styled(
+                    format!(" OUTPUT {title}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )))
+                .title_alignment(Alignment::Center);
+            let limit = (h as usize).saturating_sub(2);
+            let lines: Vec<String> = text
+                .trim_end_matches('\n')
+                .lines()
+                .rev()
+                .take(limit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|s| s.to_string())
+                .collect();
+            f.render_widget(
+                Paragraph::new(lines.join("\n"))
+                    .block(block)
+                    .style(Style::default().fg(WHITE)),
+                output_area,
+            );
+        }
+        let left = "Esc — back to menu    Q — quit".to_string();
+        let right = format!("crussty {}", env!("CARGO_PKG_VERSION"));
+        let right_w = right.chars().count() as u16;
+        let pad = main
+            .width
+            .saturating_sub(left.chars().count() as u16 + right_w);
+        f.render_widget(
+            Paragraph::new(
+                Line::from(Span::styled(
+                    format!("{left}{}{right}", " ".repeat(pad as usize)),
+                    Style::default().fg(GRAY),
+                )),
+            ),
+            footer,
+        );
+        return;
+    }
 
     let logo_w = LOGO.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let logo_h = LOGO.lines().count() as u16;
@@ -193,21 +253,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(left_span), footer);
 }
 
-fn run_command(argv: &[String]) -> i32 {
+fn run_capture(argv: &[String]) -> (bool, String) {
     let exe = std::env::current_exe().unwrap_or_else(|_| "crussty".into());
-    let code = match Command::new(&exe).args(argv).status() {
-        Ok(s) => s.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("crussty: {e}");
-            1
+    match Command::new(&exe).args(argv).output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), text)
         }
-    };
-    let _ = io::stdout().flush();
-    println!();
-    println!("[press Enter to return to the menu]");
-    let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
-    code
+        Err(e) => (false, format!("crussty: {e}")),
+    }
 }
 
 pub fn run() {
@@ -249,16 +304,9 @@ pub fn run() {
                                 0 => vec!["module".into(), "new".into(), buf],
                                 _ => vec!["install".into(), buf],
                             };
-                            let code = run_command(&argv);
-                            app.status = Some(if code == 0 {
-                                if app.selected == 0 {
-                                    "✓ module created — set your server jar version in version (module.json)".to_string()
-                                } else {
-                                    "✓ done".to_string()
-                                }
-                            } else {
-                                format!("✗ command failed with code {code}")
-                            });
+                            let (ok, text) = run_capture(&argv);
+                            app.output = Some((ok, text));
+                            app.screen = 2;
                         }
                     }
                     KeyCode::Esc => {
@@ -297,9 +345,10 @@ pub fn run() {
                         KeyCode::Down => {
                             app.selected = (app.selected + 1).min(items_len - 1);
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if app.screen == 1 && k.code == KeyCode::Esc {
+                        KeyCode::Esc => {
+                            if app.screen == 1 || app.screen == 2 {
                                 app.screen = 0;
+                                app.output = None;
                                 app.selected = 0;
                             } else {
                                 return;
@@ -324,32 +373,43 @@ pub fn run() {
                                     2 => argv = Some(vec!["module".into(), "watch".into()]),
                                     3 => argv = Some(vec!["module".into(), "pack".into()]),
                                     4 => app.input = Some(("Search".into(), String::new())),
-                                    5 => app.input = Some(("Module (id or owner/repo)".into(), String::new())),
                                     _ => return,
                                 }
                             }
                             if let Some(argv) = argv {
-                                advanced = true;
-                                let _ = execute!(
-                                    io::stdout(),
-                                    LeaveAlternateScreen,
-                                    crossterm::cursor::Show
-                                );
-                                let _ = crossterm::terminal::disable_raw_mode();
-                                let _ = io::stdout().flush();
-                                let code = run_command(&argv);
-                                let _ = execute!(
-                                    io::stdout(),
-                                    EnterAlternateScreen,
-                                    crossterm::cursor::Hide
-                                );
-                                let _ = crossterm::terminal::enable_raw_mode();
-                                let _ = terminal.clear();
-                                app.status = Some(if code == 0 {
-                                    "✓ done".to_string()
+                                if argv.get(1).map(|s| s.as_str()) == Some("watch") {
+                                    advanced = true;
+                                    let _ = execute!(
+                                        io::stdout(),
+                                        LeaveAlternateScreen,
+                                        crossterm::cursor::Show
+                                    );
+                                    let _ = crossterm::terminal::disable_raw_mode();
+                                    let _ = io::stdout().flush();
+                                    let exe = std::env::current_exe()
+                                        .unwrap_or_else(|_| "crussty".into());
+                                    let code = Command::new(&exe)
+                                        .args(&argv)
+                                        .status()
+                                        .map(|s| s.code().unwrap_or(1))
+                                        .unwrap_or(1);
+                                    let _ = execute!(
+                                        io::stdout(),
+                                        EnterAlternateScreen,
+                                        crossterm::cursor::Hide
+                                    );
+                                    let _ = crossterm::terminal::enable_raw_mode();
+                                    let _ = terminal.clear();
+                                    app.status = Some(if code == 0 {
+                                        "✓ done".to_string()
+                                    } else {
+                                        format!("✗ exited with code {code}")
+                                    });
                                 } else {
-                                    format!("✗ command failed with code {code}")
-                                });
+                                    let (ok, text) = run_capture(&argv);
+                                    app.output = Some((ok, text));
+                                    app.screen = 2;
+                                }
                             }
                         }
                         _ => {}
@@ -364,6 +424,3 @@ pub fn run() {
     }
 }
 
-pub fn needs_tty() -> bool {
-    io::stdin().is_tty()
-}

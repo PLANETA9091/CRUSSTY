@@ -56,6 +56,8 @@ enum Command {
         #[command(subcommand)]
         cmd: ModuleCmd,
     },
+    /// Launch the interactive TUI menu.
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -74,17 +76,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = match cli.command {
         None => {
-            if tui::needs_tty() {
-                tui::run();
-                0
-            } else {
-                use clap::CommandFactory;
-                let mut cmd = Cli::command();
-                let _ = cmd.print_help();
-                0
-            }
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let _ = cmd.print_help();
+            0
         }
         Some(command) => match command {
+            Command::Tui => {
+                tui::run();
+                0
+            }
             Command::Init(args) => init::run(args),
             Command::Run => server::run(),
             Command::Stop => server::stop(),

@@ -24,7 +24,7 @@ pub fn fetch_hits(query: &str) -> Vec<Hit> {
         return Vec::new();
     }
     let mut seen: Vec<String> = Vec::new();
-    let mut out: Vec<Hit> = Vec::new();
+    let mut candidates: Vec<(String, u64, String)> = Vec::new();
     for item in &hits {
         let full = item
             .get("full_name")
@@ -45,23 +45,31 @@ pub fn fetch_hits(query: &str) -> Vec<Hit> {
             .unwrap_or("")
             .trim()
             .to_string();
-        let (owner, repo) = split_repo(&full);
-        match fetch_manifest(owner, repo) {
-            Some(m) => out.push(Hit {
-                version: m.get("version").and_then(|x| x.as_str()).map(String::from),
-                full,
-                stars,
-                desc,
-            }),
-            None => out.push(Hit {
-                version: None,
-                full,
-                stars,
-                desc,
-            }),
-        }
+        candidates.push((full, stars, desc));
     }
-    out
+    std::thread::scope(|s| {
+        let handles: Vec<_> = candidates
+            .into_iter()
+            .map(|(full, stars, desc)| {
+                s.spawn(move || {
+                    let (owner, repo) = split_repo(&full);
+                    fetch_manifest(owner, repo).map(|m| Hit {
+                        version: m
+                            .get("version")
+                            .and_then(|x| x.as_str())
+                            .map(String::from),
+                        full,
+                        stars,
+                        desc,
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    })
 }
 
 pub fn search(query: &str) -> i32 {
@@ -89,7 +97,7 @@ pub fn search(query: &str) -> i32 {
 
 /// GitHub code search over module.json contents — needs a token.
 fn code_search(query: &str, token: &str) -> Option<Vec<Value>> {
-    let q = format!("{} filename:module.json OR filename:cplugin.json", urlencode(query));
+    let q = format!("{} filename:module.json", urlencode(query));
     let url = format!(
         "https://api.github.com/search/code?q={q}&per_page=10"
     );
@@ -254,13 +262,11 @@ fn find_bundle(owner: &str, repo: &str, id: &str, platform: &str) -> Option<Stri
 
 fn fetch_manifest(owner: &str, repo: &str) -> Option<Value> {
     for branch in ["main", "master"] {
-        for name in ["module.json", "cplugin.json"] {
-            let url = format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{name}");
-            if let Ok(resp) = lib::http().get(&url).call() {
-                if let Ok(text) = resp.into_body().read_to_string() {
-                    if let Ok(v) = serde_json::from_str(&text) {
-                        return Some(v);
-                    }
+        let url = format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/module.json");
+        if let Ok(resp) = lib::http().get(&url).call() {
+            if let Ok(text) = resp.into_body().read_to_string() {
+                if let Ok(v) = serde_json::from_str(&text) {
+                    return Some(v);
                 }
             }
         }
@@ -295,15 +301,13 @@ fn fetch_monorepo_manifest(owner: &str, repo: &str) -> Option<Value> {
             .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("dir"))
             .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from));
         for dir in dirs {
-            for name in ["module.json", "cplugin.json"] {
-                let url = format!(
-                    "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/modules/{dir}/{name}"
-                );
-                if let Ok(resp) = lib::http().get(&url).call() {
-                    if let Ok(text) = resp.into_body().read_to_string() {
-                        if let Ok(m) = serde_json::from_str(&text) {
-                            return Some(m);
-                        }
+            let url = format!(
+                "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/modules/{dir}/module.json"
+            );
+            if let Ok(resp) = lib::http().get(&url).call() {
+                if let Ok(text) = resp.into_body().read_to_string() {
+                    if let Ok(m) = serde_json::from_str(&text) {
+                        return Some(m);
                     }
                 }
             }

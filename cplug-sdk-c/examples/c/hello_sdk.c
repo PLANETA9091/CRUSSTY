@@ -1,6 +1,6 @@
 // hello_sdk — Crussty module skeleton on the SDK C binding.
 //
-// The same shape as hello.c from examples-multilang, but using the SDK's
+// The same shape as hello.c from c-hello@multilang examples, but using the SDK's
 // convenience layer instead of raw JNI/JVMTI: pattern hooks (no manual
 // name matching), kernel-ready notification, main-thread dispatch, logging
 // and cross-loader class resolution.
