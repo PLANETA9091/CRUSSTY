@@ -9,9 +9,9 @@ pub struct InitArgs {
     /// Kernel jar to download (Purpur version).
     #[arg(long, default_value = "1.21.10")]
     pub version: String,
-    /// Runtime/launcher release tag on GitHub.
-    #[arg(long, default_value = "v2.0.0")]
-    pub release: String,
+    /// Runtime/launcher release tag on GitHub (default: latest release).
+    #[arg(long)]
+    pub release: Option<String>,
     /// Skip downloading the kernel jar.
     #[arg(long)]
     pub no_kernel: bool,
@@ -19,7 +19,43 @@ pub struct InitArgs {
 
 const RELEASE_BASE: &str = "https://github.com/PLANETA9091/CRUSSTY/releases/download";
 
+/// Fallback when the GitHub API is unreachable; kept in sync with the latest
+/// known tag so init never falls back to a manifest-incompatible runtime.
+const FALLBACK_RELEASE: &str = "v2.2.5";
+
+/// Resolve the runtime release tag: an explicit `--release` wins, otherwise
+/// the latest published release via the GitHub API.
+fn resolve_release(explicit: Option<&str>) -> String {
+    if let Some(tag) = explicit {
+        return tag.to_string();
+    }
+    let url = "https://api.github.com/repos/PLANETA9091/CRUSSTY/releases/latest";
+    match crate::lib::http().get(url).call() {
+        Ok(resp) => match resp.into_body().with_config().limit(1 << 20).read_to_vec() {
+            Ok(body) => {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                match v.get("tag_name").and_then(|t| t.as_str()) {
+                    Some(tag) if !tag.is_empty() => tag.to_string(),
+                    _ => {
+                        eprintln!("crussty: could not read latest release tag; using {FALLBACK_RELEASE}");
+                        FALLBACK_RELEASE.to_string()
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("crussty: could not reach GitHub API; using {FALLBACK_RELEASE}");
+                FALLBACK_RELEASE.to_string()
+            }
+        },
+        Err(_) => {
+            eprintln!("crussty: could not reach GitHub API; using {FALLBACK_RELEASE}");
+            FALLBACK_RELEASE.to_string()
+        }
+    }
+}
+
 pub fn run(args: InitArgs) -> i32 {
+    let release = resolve_release(args.release.as_deref());
     let cwd = std::env::current_dir().unwrap_or_default();
     let server = if args.dir == "." {
         cwd
@@ -39,7 +75,7 @@ pub fn run(args: InitArgs) -> i32 {
     let mut failed: Vec<String> = Vec::new();
 
     let mut dl = |name: &str, dest: &std::path::Path| -> bool {
-        let url = format!("{RELEASE_BASE}/{}/{}", args.release, name);
+        let url = format!("{RELEASE_BASE}/{}/{}", release, name);
         if dest.exists() {
             println!("crussty:   {name} already present, skipping");
             return true;
@@ -108,4 +144,23 @@ fn download(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let resp = crate::lib::http().get(url).call().map_err(|e| e.to_string())?;
     let body = resp.into_body().with_config().limit(1 << 30).read_to_vec().map_err(|e| e.to_string())?;
     fs::write(dest, body).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_release_wins() {
+        assert_eq!(resolve_release(Some("v9.9.9")), "v9.9.9");
+        assert_eq!(resolve_release(Some("v2.0.0")), "v2.0.0");
+    }
+
+    #[test]
+    fn fallback_is_not_v2_0_0() {
+        // The whole point of the fix: the default must never silently resolve
+        // to the pre-module.json runtime (v2.0.0 era manifests are cplugin.json).
+        assert_ne!(FALLBACK_RELEASE, "v2.0.0");
+        assert!(FALLBACK_RELEASE.starts_with('v'));
+    }
 }
