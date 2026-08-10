@@ -1,7 +1,17 @@
 # Building from source
 
-For hacking on the runtime itself or running the platform directly (no
-npm CLI). You need Rust (stable) and a Java 21+ JDK.
+**You don't need to build anything.** Prebuilt platform artifacts
+(`launcher.jar`, `libcrussty_runtime.so`, `run.sh`, `run.bat`) are attached
+to every [GitHub release](https://github.com/PLANETA9091/CRUSSTY/releases),
+and `crussty init` downloads them automatically along with the kernel:
+
+```bash
+npm i -g crussty
+crussty init --dir my-server
+```
+
+Building from source is only for hacking on the platform itself — the
+runtime, the launcher, the SDK. You need Rust (stable) and a Java 21+ JDK.
 
 ## Requirements
 
@@ -35,19 +45,9 @@ javac -encoding UTF-8 -d launcher/out launcher/src/main/java/dev/dist/launcher/M
 jar cfe launcher/launcher.jar dev.dist.launcher.Main -C launcher/out .
 ```
 
-## Install modules
+## Run what you built
 
-Clone example modules into `modules/`:
-
-```bash
-git clone https://github.com/PLANETA9091/c-hello modules/hello
-cd modules/hello && cargo build && cp target/debug/libhello.so libhello.so
-```
-
-Or drop a module zip (see [Distribution](./zip.md)) into `modules/` — the
-runtime extracts and loads it.
-
-## Run — single-jar (recommended)
+For a launcher-style run, point `run.sh` at the built artifacts:
 
 ```bash
 mkdir -p versions
@@ -55,17 +55,20 @@ cp /path/to/purpur-1.21.10.jar versions/
 # accept the EULA on first boot
 echo "eula=true" > eula.txt
 
+./run.sh
+```
+
+For a single-jar run (no launcher process, no `-agentpath`):
+
+```bash
 cp dist/crussty-1.21.10.jar server.jar
 java -Xmx2G -jar server.jar --nogui
 ```
 
-The jar boots the kernel itself: no `-agentpath`, no launcher process.
-
-## Run — launcher
-
-```bash
-./run.sh
-```
+The jar boots the kernel itself. Either way, modules go into `modules/` —
+install them with `crussty install hello` (see
+[Quick Start](./quickstart.md)) or drop a bundle in by hand
+([Distribution](./zip.md)).
 
 ## E2E smoke test
 
