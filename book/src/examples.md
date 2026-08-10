@@ -3,7 +3,29 @@
 All examples are standalone repositories; each demonstrates one layer of the
 platform.
 
+> **Easiest way to try them: the CLI.** No manual cloning, building or
+> copying — `crussty install` fetches the prebuilt bundle and drops it into
+> `modules/`:
+>
+> ```bash
+> npm i -g crussty          # once
+> cd my-server
+> crussty install hello     # from the catalog (PLANETA9091/crussty-catalog)
+> crussty install PLANETA9091/c-dist    # or straight from a repo's releases
+> crussty ls                # see it listed as active
+> crussty run               # boot and watch the expected log lines below
+> ```
+>
+> Not sure what to install? `crussty search <query>` lists modules found on
+> GitHub. Everything above also lives in the `crussty tui` menu.
+
 ## c-hello — the minimal module
+
+```bash
+crussty install hello
+```
+
+Or, for the source:
 
 ```bash
 git clone https://github.com/PLANETA9091/c-hello modules/hello
@@ -18,6 +40,12 @@ The hello module is the e2e smoke test: if it prints, the whole pipeline
 (scan → load → hook → main-thread bridge → JNI) is alive.
 
 ## c-dist — the distributed region engine as a module
+
+```bash
+crussty install dist
+```
+
+Or, for the source:
 
 ```bash
 git clone https://github.com/PLANETA9091/c-dist modules/dist
@@ -36,6 +64,12 @@ Expected log: `[dist] lease granted region=0`, `[dist] commit region=...`.
 ## c-crussty — the Crussty CE native surface
 
 ```bash
+crussty install crussty
+```
+
+Or, for the source:
+
+```bash
 git clone https://github.com/PLANETA9091/c-crussty modules/crussty
 ```
 
@@ -51,7 +85,10 @@ improved worldgen noise pipeline (hot-path replacement via ASM weaving).
 
 The `modules/` directory in the platform repo documents the convention:
 clone one of these into `modules/<name>`, build, copy `lib<name>.so`
-next to the manifest, and the runtime picks it up on the next boot.
+next to the manifest, and the runtime picks it up on the next boot. With
+the CLI you skip the clone/build/copy entirely — `crussty install <id>`
+does all three (downloading the prebuilt bundle from the module's
+releases).
 
 ## c-hello @ multilang — module written in C, C++, Python, JS
 
