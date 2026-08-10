@@ -24,6 +24,7 @@
   }
 
   function copyText(text, btn) {
+    text = text.replace(/\u258c/g, "");
     function done() {
       btn.textContent = "Copied!";
       btn.classList.add("copied");
@@ -67,24 +68,49 @@
     });
   }
 
-  function initAnimations() {
+  function initTyping() {
     var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduce) return;
-    document.documentElement.classList.add("ws-anim");
-    var els = document.querySelectorAll(".ws-code, .ws-try, .ws-step");
-    if ("IntersectionObserver" in window) {
-      var io = new IntersectionObserver(function (entries) {
-        entries.forEach(function (entry) {
-          if (entry.isIntersecting) {
-            entry.target.classList.add("ws-in");
-            io.unobserve(entry.target);
+    document.querySelectorAll("pre.ws-term, .ws-term pre").forEach(function (pre) {
+      if (pre.dataset.typed) return;
+      pre.dataset.typed = "1";
+      var full = pre.innerText;
+      if (reduce) { pre.textContent = full; return; }
+      var started = false;
+      function start() {
+        if (started) return;
+        started = true;
+        var i = 0;
+        pre.textContent = "\u258c";
+        function step() {
+          if (i >= full.length) {
+            pre.textContent = full;
+            var c = document.createElement("span");
+            c.className = "ws-cursor";
+            c.textContent = "\u258c";
+            pre.appendChild(c);
+            return;
           }
-        });
-      }, { threshold: 0.05 });
-      els.forEach(function (el) { io.observe(el); });
-    } else {
-      els.forEach(function (el) { el.classList.add("ws-in"); });
-    }
+          i++;
+          pre.textContent = full.slice(0, i) + "\u258c";
+          var ch = full.charAt(i - 1);
+          setTimeout(step, ch === "\n" ? 90 : 6);
+        }
+        setTimeout(step, 300);
+      }
+      if ("IntersectionObserver" in window) {
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              io.disconnect();
+              start();
+            }
+          });
+        }, { threshold: 0.3 });
+        io.observe(pre);
+      } else {
+        start();
+      }
+    });
   }
 
   function initSoftNav() {
@@ -141,7 +167,7 @@
       window.scrollTo(0, 0);
       addCopyButtons();
       initTabs();
-      initAnimations();
+      initTyping();
     }
 
     document.addEventListener("click", function (e) {
@@ -194,7 +220,7 @@
   ready(function () {
     addCopyButtons();
     initTabs();
-    initAnimations();
+    initTyping();
     initSoftNav();
   });
 
