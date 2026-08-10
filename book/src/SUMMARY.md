@@ -8,6 +8,7 @@
   - [Manifest (module.json)](./manifest.md)
   - [Distribution as zip archives](./zip.md)
 - [Configuration (crussty.toml)](./config.md)
+- [Building from source](./dev.md)
 - [Architecture](./architecture.md)
 - [Platform bricks](./platform.md)
 - [Module SDK](./sdk.md)

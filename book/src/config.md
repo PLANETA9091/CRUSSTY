@@ -28,7 +28,7 @@ The config is parsed by `crussty run` (kernel + memory) and by
 are ignored; values may be quoted or bare. Sections not listed here are
 preserved but currently unused by the CLI — the runtime itself reads its
 own options from the launcher command line (see
-[Env options](./quickstart.md#env-options)).
+[Env options](./dev.md#env-options)).
 
 ## Editing
 
