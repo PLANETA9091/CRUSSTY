@@ -25,7 +25,6 @@ crussty init --dir my-server   # create a server, everything is downloaded
 crussty run             # boot it — the console is right in your terminal
 crussty install hello   # grab a module and play
 ```
-{: .ws-term}
 
 Five minutes, no build toolchain, no jars to hunt for. Full walkthrough:
 [Quick Start](./quickstart.html).
