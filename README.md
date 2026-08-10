@@ -69,13 +69,13 @@ A module is a directory (or `.zip`/`.jar` archive) with a
 bytecode, run code on the server's main thread, and use the platform's
 twelve native bricks (events, storage, hot reload, …) — see
 [the docs](https://planeta9091.github.io/CRUSSTY/) for the full contract
-and the [`hello` module](https://github.com/PLANETA9091/hello) for the
+and the [`hello` module](https://github.com/PLANETA9091/c-hello) for the
 smallest working example.
 
 Modules are not limited to Rust: the
 [`cplug-sdk-c`](cplug-sdk-c/) binding exposes the same platform to C, C++,
 Python and JavaScript — see
-[other languages](https://planeta9091.github.io/CRUSSTY/modules/creating/other-languages.html).
+[Creating a module](https://planeta9091.github.io/CRUSSTY/modules/creating.html).
 
 ## Building from source
 
