@@ -1,5 +1,9 @@
 # Distribution as zip archives
 
+In plain words: **share your module as one file.** Instead of copying a
+folder, users drop a single `.zip`/`.jar` into `modules/` — the runtime
+unpacks it automatically and runs it exactly like a folder module.
+
 Modules can be distributed as a single zip (or jar) file. The scan treats
 any `*.zip` / `*.jar` (case-insensitive) in `modules/` as an archive module.
 

@@ -1,5 +1,11 @@
 # Platform bricks
 
+In plain words: the runtime itself has a toolbox of ready-made parts —
+events, timers, storage, threads, crash protection. Your module doesn't
+need to reinvent them: the **platform bridge** hands the toolbox to any
+module that asks. This page lists what's in the toolbox and the rules for
+using it. Module developers only; end users can skip it.
+
 The runtime ships twelve native primitives under `runtime/src/platform/`.
 They are the building blocks every module builds on: instead of reinventing
 event buses, tick routing or persistence in each module, a module uses the

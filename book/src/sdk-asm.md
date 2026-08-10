@@ -1,5 +1,10 @@
 # ASM weaving
 
+In plain words: **replace a Java method with your own native code.** You
+tell the SDK which Java method to swap, it rewrites the class so the server
+calls your Rust/C function instead. This is how modules make hot paths
+(worldgen, chunk encoding…) thousands of times faster.
+
 `cplug-sdk::asm` provides prebuilt bytecode surgery with `wee_alloc`-free,
 zero-dependency ASM — a small hand-rolled bytecode writer tuned for the
 patterns native modules need:

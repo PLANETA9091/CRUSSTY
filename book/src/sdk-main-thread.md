@@ -1,5 +1,11 @@
 # Main thread
 
+In plain words: **the server only "thinks" on its main thread** — that's
+where the game tick, Bukkit calls and most server code run. Anything your
+module wants the server to do must be handed to this thread; doing it from
+another thread is unsafe. The SDK's `run_on_main_thread` queues your code
+there.
+
 Most kernel work must happen on the server main thread. The SDK delivers a
 `Runnable` there:
 

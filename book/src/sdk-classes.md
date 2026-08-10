@@ -1,5 +1,13 @@
 # Classes & JNI
 
+In plain words: **find and poke server classes from your module.** The
+server loads its code through its own class loaders, so the normal JNI
+lookup often can't see them — the SDK can. Two helpers:
+
+- `find_class` — get a class that's already loaded,
+- `wait_class` — wait until the server has loaded it (the server is still
+  booting while your module initializes!).
+
 ## find_class
 
 ```rust
