@@ -66,20 +66,20 @@ jobs:
         run: mdbook build book
 
   multilang:
-    name: build multilang examples (c-hello@multilang)
+    name: build multilang examples (c-hello@multilang, c/cpp/go/js/lua/python)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchains
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc g++ python3 python3-dev golang-go
+          sudo apt-get install -y -qq gcc g++ python3 python3-dev golang-go lua5.4 liblua5.4-dev
       - name: Clone module examples (c-hello multilang branch)
         run: git clone --depth 1 -b multilang https://github.com/PLANETA9091/c-hello.git /tmp/c-hello-multilang
       - name: Build every language example
         run: |
           cd /tmp/c-hello-multilang/examples
-          for lang in c cpp go js python; do
+          for lang in c cpp go js lua python; do
             echo "== building $lang =="
             bash $lang/build.sh
             ls -1 "$lang"/lib*.so >/dev/null || { echo "::error::$lang build produced no lib*.so"; exit 1; }
