@@ -400,7 +400,11 @@ pub fn reload_module(id: &str) -> Result<(), String> {
 /// The platform hook dispatcher MUST pair every call into module code with
 /// [`leave_module`] (or use [`guard_module`] for panic safety).
 pub fn enter_module(id: &str) -> bool {
-    let mut reg = registry().lock().unwrap();
+    // TASK-46-class hardening (S7-8): reachable from the JVMTI dispatch loop
+    // (guard_module per event); poison must not panic the callback thread.
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match reg.get_mut(id) {
         Some(e) if !e.swapping => {
             e.active += 1;
@@ -413,7 +417,11 @@ pub fn enter_module(id: &str) -> bool {
 /// Mark exit from a module's code; releases one [`enter_module`] slot.
 /// Unknown ids are a no-op.
 pub fn leave_module(id: &str) {
-    if let Some(e) = registry().lock().unwrap().get_mut(id) {
+    if let Some(e) = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(id)
+    {
         e.active = e.active.saturating_sub(1);
     }
 }

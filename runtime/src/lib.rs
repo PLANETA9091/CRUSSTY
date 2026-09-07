@@ -357,7 +357,12 @@ impl Agent for CrusstyRuntime {
         } else {
             read_bounded_cstr(name)
         };
-        let registered = hooks().lock().unwrap().clone();
+        // TASK-46-class hardening (S7-8): JVMTI-callback-reachable lock; a
+        // poisoned mutex must not unwind across the trampoline (= VM abort).
+        let registered = hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
 
         let mut current: *const u8 = class_data;
         let mut current_len = class_data_len as usize;
