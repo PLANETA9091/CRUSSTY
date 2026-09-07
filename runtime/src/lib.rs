@@ -338,21 +338,24 @@ impl Agent for CrusstyRuntime {
         new_class_data_len: *mut jni::jint,
         new_class_data: *mut *mut u8,
     ) {
-        let name = if name.is_null() {
-            "<unknown>".to_string()
+        // The VM-provided `name` pointer is NOT reliably NUL-terminated on
+        // HotSpot: it can point into the interned-symbol arena where the
+        // next symbol's bytes follow immediately ("ImprovedNoise" ->
+        // "ImprovedNoisejaE"). Every consumer that pattern-matches against
+        // that string (platform transform rules, plugin hooks) silently
+        // misses its targets. The class file itself is the source of truth:
+        // parse this_class from its constant pool and prefer that.
+        let name = if !class_data.is_null() && class_data_len > 10 {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(class_data, class_data_len as usize) };
+            // A panic unwinding through this extern "C" callback is fatal
+            // (abort) — the parser must never take the JVM down with it.
+            std::panic::catch_unwind(|| class_file_name(bytes))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| read_bounded_cstr(name))
         } else {
-            // The VM's name buffer is not guaranteed NUL-terminated right
-            // after the name (it can be reused with leftovers) — bound the
-            // read to 128 bytes.
-            let mut end = 0usize;
-            unsafe {
-                while end < 128 && *name.add(end) != 0 {
-                    end += 1;
-                }
-                std::str::from_utf8(std::slice::from_raw_parts(name.cast::<u8>(), end))
-                    .unwrap_or("<bad-utf8>")
-                    .to_string()
-            }
+            read_bounded_cstr(name)
         };
         let registered = hooks().lock().unwrap().clone();
 
@@ -482,6 +485,170 @@ impl Agent for CrusstyRuntime {
 }
 
 export_runtime!(CrusstyRuntime);
+
+/// Bounded C-string read of the VM-provided event name (last-resort
+/// fallback when the class bytes cannot be parsed). The buffer is not
+/// guaranteed NUL-terminated — cap the read at 128 bytes.
+fn read_bounded_cstr(name: *const c_char) -> String {
+    if name.is_null() {
+        return "<unknown>".to_string();
+    }
+    let mut end = 0usize;
+    unsafe {
+        while end < 128 && *name.add(end) != 0 {
+            end += 1;
+        }
+        std::str::from_utf8(std::slice::from_raw_parts(name.cast::<u8>(), end))
+            .unwrap_or("<bad-utf8>")
+            .to_string()
+    }
+}
+
+/// Extract the true internal class name from class-file bytes: walk the
+/// constant pool, read this_class -> name_index -> Utf8. O(pool size),
+/// zero allocation beyond the returned String, no panics on malformed
+/// input (returns None instead — callers fall back to the VM name).
+fn class_file_name(data: &[u8]) -> Option<String> {
+    if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+        return None;
+    }
+    let u16_at = |i: usize| -> Option<u16> {
+        if i + 2 > data.len() {
+            return None;
+        }
+        Some(u16::from_be_bytes([data[i], data[i + 1]]))
+    };
+    let cp_count = u16_at(8)? as usize;
+    if cp_count == 0 {
+        return None;
+    }
+    // constant pool entries are indexed 1..cp_count; entries may be None
+    // only for tag shapes we must skip correctly to stay aligned.
+    let mut idx = 10usize;
+    let mut cp_utf8: Vec<Option<&[u8]>> = vec![None; cp_count];
+    let mut cp_class_name_idx: Vec<Option<usize>> = vec![None; cp_count];
+    let mut i = 1usize;
+    while i < cp_count {
+        let tag = *data.get(idx)?;
+        match tag {
+            1 => {
+                // Utf8: u2 length + bytes
+                let len = u16_at(idx + 1)? as usize;
+                let start = idx + 3;
+                if start + len > data.len() {
+                    return None;
+                }
+                cp_utf8[i] = Some(&data[start..start + len]);
+                idx = start + len;
+                i += 1;
+            }
+            7 => {
+                // Class: u2 name_index
+                let ni = u16_at(idx + 1)? as usize;
+                if ni < cp_count {
+                    cp_class_name_idx[i] = Some(ni);
+                }
+                idx += 3;
+                i += 1;
+            }
+            8 | 16 | 19 | 20 => {
+                idx += 3;
+                i += 1;
+            }
+            15 => {
+                idx += 4;
+                i += 1;
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
+                idx += 5;
+                i += 1;
+            }
+            5 | 6 => {
+                // long/double take two slots
+                idx += 9;
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    // access_flags(2) this_class(2): this_class is a CONSTANT_Class index
+    let this_idx = u16_at(idx + 2)? as usize;
+    let name_idx = cp_class_name_idx.get(this_idx).copied().flatten()?;
+    let raw = cp_utf8.get(name_idx).copied().flatten()?;
+    String::from_utf8(raw.to_vec()).ok()
+}
+
+#[cfg(test)]
+mod class_name_tests {
+    use super::class_file_name;
+
+    /// Build a minimal valid class file with the given internal name and
+    /// optional trailing junk after the constant pool (the parser must stop
+    /// exactly at the pool end and read this_class).
+    fn minimal_class(name: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
+        b.extend_from_slice(&[0, 0]); // minor
+        b.extend_from_slice(&[0, 52]); // major 8
+        b.extend_from_slice(&[0, 3]); // cp_count = 2 entries + sentinel
+        b.push(1); // Utf8
+        b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        b.extend_from_slice(name);
+        b.push(7); // Class
+        b.extend_from_slice(&[0, 1]); // -> utf8 #1
+        b.extend_from_slice(&[0, 0x21]); // access: public super
+        b.extend_from_slice(&[0, 2]); // this_class -> #2
+        b.extend_from_slice(&[0, 0]); // super = null
+        b
+    }
+
+    #[test]
+    fn parses_simple_name() {
+        let data = minimal_class(b"foo/Bar");
+        assert_eq!(class_file_name(&data).as_deref(), Some("foo/Bar"));
+    }
+
+    #[test]
+    fn parses_name_with_long_and_double_pool_entries() {
+        // long entry occupies two pool slots — the walk must skip both.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(&[0, 52]); // major
+        b.extend_from_slice(&[0, 5]); // slots: 1..=4
+        b.push(5); // long (two slots: #1,#2)
+        b.extend_from_slice(&[0; 8]);
+        b.push(1); // Utf8 #3
+        b.extend_from_slice(&[0, 4]);
+        b.extend_from_slice(b"Test");
+        b.push(7); // Class #4
+        b.extend_from_slice(&[0, 3]);
+        b.extend_from_slice(&[0, 0x21]);
+        b.extend_from_slice(&[0, 4]);
+        b.extend_from_slice(&[0, 0]);
+        assert_eq!(class_file_name(&b).as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn rejects_truncated_and_garbage() {
+        assert_eq!(class_file_name(&[]), None);
+        assert_eq!(class_file_name(&[1, 2, 3]), None);
+        assert_eq!(class_file_name(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0]), None);
+        let mut magic_only = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 5];
+        magic_only.push(99); // invalid tag
+        assert_eq!(class_file_name(&magic_only), None);
+    }
+
+    #[test]
+    fn survives_pool_larger_than_data() {
+        // cp_count claims 1000 entries but data ends right after — must
+        // return None (not panic / not read OOB).
+        let mut b = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        b.extend_from_slice(&[0x03, 0xE8]); // 1000
+        b.push(1);
+        assert_eq!(class_file_name(&b), None);
+    }
+}
 
 /// Publish the `platform.class_loaded` lifecycle event for a class load.
 /// Zero-weight on the class-load path: the payload is only built when the
