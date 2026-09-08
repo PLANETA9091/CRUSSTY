@@ -359,10 +359,33 @@ impl Agent for CrusstyRuntime {
         };
         // TASK-46-class hardening (S7-8): JVMTI-callback-reachable lock; a
         // poisoned mutex must not unwind across the trampoline (= VM abort).
-        let registered = hooks()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        //
+        // JVMTI-PHASE GATE (shutdown-crash family, hs_err "Signal Dispatcher"
+        // 2026-09-07/08, 4 occurrences): the JVM keeps LOADING classes while
+        // it dies — shutdown-hook classes load on the "Signal Dispatcher"
+        // thread after VMDeath begins — and this hook fires for them. Plugin
+        // hooks are module-owned closures doing arbitrary JNI and allocator
+        // work; driving them against a dying VM is the crash chain (CFLH
+        // dispatch `call *0x20(%rbp)` landing in the module's .rodata strings
+        // / NULL — addr2line-proven against build e830e7b9). Gate the snapshot
+        // to an EMPTY table for everything but LIVE: a get_phase error means
+        // the env is already in trouble, and skipping is the documented
+        // degrade direction. The byte-transform engine below stays
+        // unconditional on purpose (pure byte work, degrades to
+        // "class runs untransformed"), so engine rules still apply on dying-VM
+        // loads while module code never runs there.
+        let registered = if jvmti_env()
+            .and_then(|env| env.get_phase().ok())
+            .map(|phase| phase == jvmti_bindings::sys::jvmti::JVMTI_PHASE_LIVE)
+            .unwrap_or(false)
+        {
+            hooks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        } else {
+            Vec::new()
+        };
 
         let mut current: *const u8 = class_data;
         let mut current_len = class_data_len as usize;
@@ -409,7 +432,9 @@ impl Agent for CrusstyRuntime {
         }
 
         // 2. Plugin hooks chain in registration order: each sees the previous
-        //    output (the engine's included).
+        //    output (the engine's included). NOTE: `registered` is
+        //    phase-gated above (empty unless JVMTI phase == LIVE) — the
+        //    shutdown-crash family fix lives there, this loop is untouched.
         let trace = std::env::var_os("CRUSSTY_TRACE_HOOKS").is_some();
         let trace_filter = std::env::var("CRUSSTY_TRACE_CLASS").ok();
         let want_trace = trace
