@@ -387,6 +387,12 @@ impl Agent for CrusstyRuntime {
             Vec::new()
         };
 
+        // NUL-terminated copy of the class name for the C-ABI plugin hook
+        // (class names never contain interior NULs, so this is infallible in
+        // practice; None only if the name somehow embedded one, in which case
+        // plugin hooks are skipped for this class rather than reading garbage).
+        let cname = std::ffi::CString::new(name.as_str()).ok();
+
         let mut current: *const u8 = class_data;
         let mut current_len = class_data_len as usize;
         // Holds the chained replacement bytes; kept alive by binding until the
@@ -468,14 +474,27 @@ impl Agent for CrusstyRuntime {
                 );
             }
             let rc = unsafe {
-                (entry.func)(
-                    entry.ctx as *mut c_void,
-                    name.as_ptr() as *const c_char,
-                    current,
-                    current_len,
-                    &mut out,
-                    &mut out_len,
-                )
+                // CRITICAL BUG FIX (agent-7625532f, 2026-09-08): `name` is a
+                // Rust String — NOT NUL-terminated. Passing `name.as_ptr()`
+                // to the C-ABI plugin hook made every consumer's C-string
+                // scan run past the end into unrelated heap bytes, so the
+                // effective hook name was heap-layout-dependent: some classes
+                // (e.g. net/minecraft/world/level/levelgen/synth/PerlinNoise)
+                // matched, others (e.g. net/minecraft/world/entity/Entity)
+                // silently missed their hooks — whole-body patches silently
+                // became no-ops with retransform rc=0. Always pass a
+                // properly NUL-terminated copy.
+                match cname.as_deref() {
+                    Some(p) => (entry.func)(
+                        entry.ctx as *mut c_void,
+                        p.as_ptr() as *const c_char,
+                        current,
+                        current_len,
+                        &mut out,
+                        &mut out_len,
+                    ),
+                    None => 1,
+                }
             };
             drop(guard);
             if rc == 0 && !out.is_null() {
