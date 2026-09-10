@@ -253,6 +253,10 @@ impl CrusstyRuntime {
         if let Err(e) = platform::storage::install_default_rules() {
             eprintln!("[crussty-runtime] storage default rules failed: {e}");
         }
+        // Native RCON repair lane: watcher + (reflective swap | native serve).
+        // The watcher stands down until the kernel's game port is up, so
+        // arming it here (before the kernel boots) races nothing.
+        platform::rcon::install();
         eprintln!(
             "[crussty-runtime] transform engine: {} rule(s) registered",
             platform::transform::global_engine().rules().len()

@@ -740,4 +740,179 @@ mod tests {
             assert!(helpers.iter().any(|h| h.ends_with(name)), "missing {name} rule");
         }
     }
+
+    // ------------------------------------------------------- hotpath benches
+    //
+    // Release-only A/B benches: `cargo test --release -- --ignored --nocapture
+    // bench_`. Same-process, min-of-rounds ns/op. Each bench cleans up its
+    // registry rows so ordinary tests stay independent of run order.
+
+    /// Attach every id in `0..range` (ignoring pre-existing rows), used to
+    /// force a full table. Drives each conn to Play through the legal
+    /// Handshake -> Login -> Play path so later `set_conn_state` touches are
+    /// legal self-transitions (the touch code must actually run).
+    fn bench_fill(range: u64) {
+        for i in 0..range {
+            attach_conn(i, None);
+            set_conn_state(i, ProtocolState::Login.code());
+            set_conn_state(i, ProtocolState::Play.code());
+        }
+    }
+
+    /// Detach every id in `0..range` so later tests see an empty registry.
+    fn bench_drain(range: u64) {
+        for i in 0..range {
+            detach_conn(i);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_run_hooks_packet_path() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        // one registered no-op hook (payload-gated pass so it never drops)
+        add_hook(Arc::new(|_p: &mut Packet| Verdict::Pass));
+        bench_fill(64);
+        // warmup
+        for i in 0..10_000u64 {
+            let _ = run_hooks(packet(Direction::Inbound, i % 64, 0, &[1, 2, 3]));
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = run_hooks(packet(Direction::Inbound, i % 64, 0, &[1, 2, 3]));
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        bench_drain(64);
+        println!(
+            "BENCH run_hooks: {:.0} ns/op (1 hook, 64 conns, min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_registry_full_table() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        let table = MAX_CONNS as u64;
+        // start clean: earlier tests (e.g. the LRU eviction census) may have
+        // left rows in Handshake state that would make the touch loop hit its
+        // illegal-transition early return instead of the real touch path.
+        bench_drain(table + 32);
+        bench_fill(table);
+        // warmup
+        for i in 0..10_000u64 {
+            let _ = state_of(i % table);
+        }
+        let mut best_state = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = state_of(i % table);
+            }
+            best_state = best_state.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        // touch path: legal self-transition Play -> Play on the full table
+        let mut best_touch = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = set_conn_state(i % table, ProtocolState::Play.code());
+            }
+            best_touch = best_touch.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_detach = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                detach_conn(i % table);
+                attach_conn(i % table, None);
+            }
+            best_detach = best_detach.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        // random-access touch: xorshift ids. Sequential ids hide the scan cost
+        // (each sequential touch finds its row at the deque front); a random
+        // pattern is the realistic churn shape (many conns, arbitrary order).
+        // Re-drive rows to Play first: the detach bench above re-created every
+        // row as Handshake, which would early-return on the transition check.
+        for i in 0..table {
+            set_conn_state(i, ProtocolState::Login.code());
+            set_conn_state(i, ProtocolState::Play.code());
+        }
+        let mut xs = 0x9E37_79B9_7F4A_7C15u64;
+        let mut best_rand_touch = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters as u64 {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                let _ = set_conn_state(xs % table, ProtocolState::Play.code());
+            }
+            best_rand_touch = best_rand_touch.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_rand_detach = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters as u64 {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                let id = xs % table;
+                detach_conn(id);
+                attach_conn(id, None);
+            }
+            best_rand_detach = best_rand_detach.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        bench_drain(table);
+        println!(
+            "BENCH registry: state_of {:.0} ns/op, touch seq {:.0} ns/op, touch rand {:.0} ns/op, detach+reattach seq {:.0} ns/op, detach+reattach rand {:.0} ns/op (full {MAX_CONNS}-conn table, min of {rounds}x{iters})",
+            best_state * 1e9,
+            best_touch * 1e9,
+            best_rand_touch * 1e9,
+            best_detach * 1e9,
+            best_rand_detach * 1e9
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_run_hooks_concurrent_4t() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 50_000u32;
+        let threads = 4;
+        let rounds = 5;
+        add_hook(Arc::new(|_p: &mut Packet| Verdict::Pass));
+        bench_fill(64);
+        // warmup
+        let _ = run_hooks(packet(Direction::Inbound, 0, 0, &[1, 2, 3]));
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        for i in 0..iters as u64 {
+                            let _ = run_hooks(packet(Direction::Inbound, i % 64, 0, &[1, 2, 3]));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters * threads));
+        }
+        bench_drain(64);
+        println!(
+            "BENCH run_hooks concurrent x{threads}: {:.0} ns/op (per-op wall, 1 hook, 64 conns, min of {rounds}x{iters}/t)",
+            best * 1e9
+        );
+    }
 }
