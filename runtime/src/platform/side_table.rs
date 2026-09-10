@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak as StdWeak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak as StdWeak};
 use std::time::Duration;
 
 use jni::errors;
@@ -233,14 +233,20 @@ fn tables_registry() -> &'static Mutex<HashMap<u64, GcTableWeak>> {
 
 /// Shared state of a [`SideTable`]. Kept behind an [`Arc`] so the sweep can
 /// hold the table alive briefly while it notifies.
+///
+/// Hotpath note (TASK-161): the map is an RwLock, not a Mutex — side tables
+/// are read-mostly (per-entity per-tick lookups dominate writes), so reads
+/// share the lock instead of serializing. (RwLock<T>: Sync needs T: Send +
+/// Sync, hence the tighter `V: Sync` bound on the table; every real value
+/// type — counters, ids, small structs — is Sync.)
 struct SideTableInner<V> {
-    map: Mutex<HashMap<ObjectKey, V>>,
+    map: RwLock<HashMap<ObjectKey, V>>,
     on_collect: Mutex<Option<OnCollect>>,
 }
 
-impl<V: Send + 'static> GcNotifiable for SideTableInner<V> {
+impl<V: Send + Sync + 'static> GcNotifiable for SideTableInner<V> {
     fn notify_collected(&self, key: ObjectKey) {
-        let removed = self.map.lock().unwrap_or_else(|p| p.into_inner()).remove(&key).is_some();
+        let removed = self.map.write().unwrap_or_else(|p| p.into_inner()).remove(&key).is_some();
         if !removed {
             return;
         }
@@ -259,10 +265,10 @@ pub struct SideTable<V> {
     inner: Arc<SideTableInner<V>>,
 }
 
-impl<V: Clone + Send + 'static> SideTable<V> {
+impl<V: Clone + Send + Sync + 'static> SideTable<V> {
     pub fn new() -> Self {
         let inner: Arc<SideTableInner<V>> = Arc::new(SideTableInner {
-            map: Mutex::new(HashMap::new()),
+            map: RwLock::new(HashMap::new()),
             on_collect: Mutex::new(None),
         });
         let id = NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed);
@@ -283,7 +289,7 @@ impl<V: Clone + Send + 'static> SideTable<V> {
     /// Return the value for `k`, or insert `default_fn()`'s result and
     /// return it. `default_fn` runs only when the key is absent.
     pub fn get_or_insert(&self, k: ObjectKey, default_fn: impl FnOnce() -> V) -> V {
-        let mut map = self.inner.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.inner.map.write().unwrap_or_else(|p| p.into_inner());
         if let Some(v) = map.get(&k) {
             return v.clone();
         }
@@ -295,23 +301,23 @@ impl<V: Clone + Send + 'static> SideTable<V> {
 
 impl<V: Clone> SideTable<V> {
     pub fn insert(&self, k: ObjectKey, v: V) {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).insert(k, v);
+        self.inner.map.write().unwrap_or_else(|p| p.into_inner()).insert(k, v);
     }
 
     pub fn get(&self, k: &ObjectKey) -> Option<V> {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).get(k).cloned()
+        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).get(k).cloned()
     }
 
     pub fn remove(&self, k: &ObjectKey) -> Option<V> {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).remove(k)
+        self.inner.map.write().unwrap_or_else(|p| p.into_inner()).remove(k)
     }
 
     pub fn contains(&self, k: &ObjectKey) -> bool {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).contains_key(k)
+        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).contains_key(k)
     }
 
     pub fn len(&self) -> usize {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -320,11 +326,11 @@ impl<V: Clone> SideTable<V> {
 
     /// Snapshot of all current values (clone).
     pub fn values(&self) -> Vec<V> {
-        self.inner.map.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
+        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
     }
 }
 
-impl<V: Clone + Send + 'static> Default for SideTable<V> {
+impl<V: Clone + Send + Sync + 'static> Default for SideTable<V> {
     fn default() -> Self {
         Self::new()
     }
@@ -580,5 +586,63 @@ mod tests {
     #[test]
     fn named_table_returns_none_when_unregistered() {
         assert_eq!(named_table("entities"), None);
+    }
+}
+
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_side_table`.
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_side_table_get_churn() {
+        let t = SideTable::<u64>::new();
+        let n = 4096u64;
+        for i in 0..n {
+            t.insert(ObjectKey(i + 1), i);
+        }
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut xs = 0x9E37_79B9_7F4A_7C15u64;
+
+        // random-key get (read path dominates per-entity per-tick access)
+        for _ in 0..10_000u32 {
+            xs ^= xs << 13;
+            xs ^= xs >> 7;
+            xs ^= xs << 17;
+            let key = ObjectKey(xs % n + 1);
+            let _ = t.get(&key);
+        }
+        let mut best_get = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                let key = ObjectKey(xs % n + 1);
+                let _ = t.get(&key);
+            }
+            best_get = best_get.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // insert+remove churn (write path)
+        let mut best_churn = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for i in 0..iters as u64 {
+                let k = ObjectKey(i % n + 1);
+                t.insert(k, i);
+                let _ = t.remove(&k);
+            }
+            best_churn = best_churn.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH side_table: get rand(4096) {:.0} ns/op, insert+remove {:.0} ns/op (min of {rounds}x{iters})",
+            best_get * 1e9,
+            best_churn * 1e9
+        );
     }
 }

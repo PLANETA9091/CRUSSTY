@@ -104,7 +104,7 @@ use crate::platform::events::lifecycle::TICK_BOUNDARY;
 use crate::platform::transform::{global_engine, Injection, Rule};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 /// A unit of work the kernel scheduled (identified opaquely by the module).
@@ -131,17 +131,30 @@ pub enum Routing {
 
 pub type RouterFn = Arc<dyn Fn(&ScheduledTask) -> Routing + Send + Sync>;
 
-static ROUTERS: OnceLock<Mutex<Vec<RouterFn>>> = OnceLock::new();
+/// Hotpath note (TASK-161): `route_task` runs per task submission (Bukkit/
+/// Paper schedulers submit hundreds of tasks per second). The router list is
+/// an immutable snapshot behind an RwLock — the read path clones one `Arc`
+/// (guard dropped before routers run, so a router may safely `add_router`),
+/// instead of cloning a whole `Vec<RouterFn>` per submission.
+static ROUTERS: OnceLock<RwLock<Arc<[RouterFn]>>> = OnceLock::new();
+
+fn routers() -> &'static RwLock<Arc<[RouterFn]>> {
+    ROUTERS.get_or_init(|| RwLock::new(Arc::from(Vec::new())))
+}
 
 /// Register a router; all routers are consulted in order until one returns
 /// something other than KeepKernel (first non-keep wins).
 pub fn add_router(f: RouterFn) {
-    ROUTERS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(f);
+    let mut w = routers().write().unwrap_or_else(|p| p.into_inner());
+    let mut v: Vec<RouterFn> = w.to_vec();
+    v.push(f);
+    *w = v.into();
 }
 
 /// The kernel adapter calls this for every scheduled task (via transform).
 pub fn route_task(task: &ScheduledTask) -> Routing {
-    for r in ROUTERS.get().map(|m| m.lock().unwrap().clone()).unwrap_or_default() {
+    let snapshot: Arc<[RouterFn]> = routers().read().unwrap_or_else(|p| p.into_inner()).clone();
+    for r in snapshot.iter() {
         let d = r(task);
         if d != Routing::KeepKernel {
             return d;
@@ -168,14 +181,22 @@ type InjectedTask = Box<dyn FnOnce() + Send>;
 static KERNEL_QUEUE: OnceLock<Mutex<Vec<InjectedTask>>> = OnceLock::new();
 
 /// Called by the kernel adapter on the main thread each tick: runs all
-/// injected tasks.
+/// injected tasks. Tasks run OUTSIDE the queue mutex (a long task must not
+/// block `inject` callers, and a task may itself `inject` without
+/// deadlocking); anything enqueued mid-drain is picked up next tick.
 pub fn drain_injected() -> usize {
-    let mut q = match KERNEL_QUEUE.get() {
-        Some(m) => m.lock().unwrap(),
+    let batch: Vec<InjectedTask> = match KERNEL_QUEUE.get() {
+        Some(m) => {
+            let mut q = m.lock().unwrap_or_else(|p| p.into_inner());
+            if q.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *q)
+        }
         None => return 0,
     };
-    let n = q.len();
-    for f in q.drain(..) {
+    let n = batch.len();
+    for f in batch {
         f();
     }
     n
@@ -267,9 +288,13 @@ static LEVEL_TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Synthetic token for probe tasks stashed for modules.
 static ROUTED_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Wall clock of the previous tick boundary; the duration between two
-/// boundaries is the tick duration fed to the telemetry TPS estimator.
-static LAST_BOUNDARY: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// Wall clock of the previous tick boundary in nanoseconds since the
+/// [`MONO_EPOCH`] instant; `u64::MAX` is the "no baseline yet" sentinel. The
+/// duration between two boundaries is the tick duration fed to the telemetry
+/// TPS estimator. A plain atomic: single-writer (main tick thread), zero
+/// locking on the per-tick path.
+static LAST_BOUNDARY_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// The current server tick estimate (monotonic, bumped per main tick).
 pub fn current_tick() -> u64 {
@@ -285,14 +310,33 @@ pub fn current_tick() -> u64 {
 pub fn on_tick_boundary() -> usize {
     let tick = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     let drained = drain_injected();
-    crate::platform::events::global().publish(TICK_BOUNDARY, &json!({ "tick": tick, "drained": drained }));
-    let now = Instant::now();
-    let mut last = LAST_BOUNDARY.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(prev) = *last {
-        push_tick_sample(now.duration_since(prev).as_nanos() as u64);
+    // Fast path (TASK-161): skip the payload allocation and the publish
+    // entirely when nothing listens — the steady state for `tick_boundary`
+    // in default deployments. One cached bus lookup instead of a five-Arc
+    // clone per tick.
+    let bus = tick_bus();
+    if bus.has_subscribers(TICK_BOUNDARY) {
+        bus.publish(TICK_BOUNDARY, &json!({ "tick": tick, "drained": drained }));
     }
-    *last = Some(now);
+    let epoch = *MONO_EPOCH.get_or_init(Instant::now);
+    let now_ns = u64::try_from(now().duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+    let prev = LAST_BOUNDARY_NS.swap(now_ns, Ordering::Relaxed);
+    if prev != u64::MAX {
+        push_tick_sample(now_ns.saturating_sub(prev));
+    }
     drained
+}
+
+/// Cached clone of the global event bus (the bus is a bag of Arcs; cloning
+/// it per tick costs five atomic increments).
+fn tick_bus() -> &'static crate::platform::events::EventBus {
+    static BUS: OnceLock<crate::platform::events::EventBus> = OnceLock::new();
+    BUS.get_or_init(crate::platform::events::global)
+}
+
+/// Monotonic clock, factored for test seams.
+fn now() -> Instant {
+    Instant::now()
 }
 
 /// Feed one tick duration into the telemetry TPS window. Split from
@@ -309,7 +353,7 @@ fn push_tick_sample(ns: u64) {
 }
 
 #[cfg(test)]
-static TICK_SAMPLES: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+pub(super) static TICK_SAMPLES: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
 
 /// Called by the injected Java helper at the start of every dimension tick
 /// (`ServerLevel.tick`). Returns the new level-tick counter value.
@@ -322,6 +366,12 @@ pub fn on_level_tick() -> u64 {
 static MODULE_QUEUE: OnceLock<Mutex<Vec<ScheduledTask>>> = OnceLock::new();
 
 fn route_probe(tag: &str) -> Option<ScheduledTask> {
+    // Zero-alloc fast path (TASK-161): with no router registered — the
+    // production default — a scheduling-surface probe must not allocate a
+    // task, a tag String, or touch any queue.
+    if routers().read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+        return None;
+    }
     let task = ScheduledTask {
         kernel_token: ROUTED_TOKEN.fetch_add(1, Ordering::Relaxed),
         scheduled_tick: Some(current_tick()),
@@ -371,15 +421,15 @@ mod tests {
     /// Serializes the scheduler tests: they share process-global state
     /// (router list, tick counters, queues), the same pattern as
     /// telemetry's `TEST_LOCK`.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn reset_routers() {
+    pub(super) fn reset_routers() {
         if let Some(m) = ROUTERS.get() {
-            m.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            *m.write().unwrap_or_else(|p| p.into_inner()) = Arc::from(Vec::new());
         }
     }
 
-    fn reset_queues() {
+    pub(super) fn reset_queues() {
         if let Some(q) = KERNEL_QUEUE.get() {
             q.lock().unwrap_or_else(|p| p.into_inner()).clear();
         }
@@ -539,5 +589,101 @@ mod tests {
         let before = LEVEL_TICK_COUNTER.load(Ordering::SeqCst);
         assert_eq!(on_level_tick(), before + 1);
         assert_eq!(on_level_tick(), before + 2);
+    }
+}
+
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_scheduler`.
+    //! Per-task-submission probe path + the steady-state main-tick boundary.
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_scheduler_hotpath() {
+        let _guard = tests::TEST_LOCK.lock().unwrap();
+        tests::reset_routers();
+        tests::reset_queues();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // route_task with 2 registered routers, both deferring (steady state)
+        add_router(Arc::new(|_: &ScheduledTask| Routing::KeepKernel));
+        add_router(Arc::new(|_: &ScheduledTask| Routing::KeepKernel));
+        let t = ScheduledTask { kernel_token: 7, scheduled_tick: None, tag: "kernel".into() };
+        for _ in 0..10_000u32 {
+            let _ = route_task(&t);
+        }
+        let mut best_route = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = route_task(&t);
+            }
+            best_route = best_route.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // probe path with routers registered
+        for _ in 0..10_000u32 {
+            let _ = on_task_scheduled();
+        }
+        let mut best_probe = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = on_task_scheduled();
+            }
+            best_probe = best_probe.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        tests::reset_routers();
+
+        // probe path, empty router table (production default — must be free)
+        for _ in 0..10_000u32 {
+            let _ = on_task_scheduled();
+        }
+        let mut best_probe_empty = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = on_task_scheduled();
+            }
+            best_probe_empty = best_probe_empty.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // steady-state tick boundary: empty injected queue, no subscribers
+        for _ in 0..1_000u32 {
+            let _ = on_tick_boundary();
+        }
+        let mut best_tick = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = on_tick_boundary();
+            }
+            best_tick = best_tick.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // teardown: restore the pristine baseline state so the unit tests'
+        // assertions (TICK_SAMPLES len, baseline-first-sample) hold even under
+        // --include-ignored runs.
+        tests::reset_routers();
+        tests::reset_queues();
+        if let Some(s) = TICK_SAMPLES.get() {
+            s.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+        reset_last_boundary_for_tests();
+        println!(
+            "BENCH scheduler: route_task(2 defer) {:.0} ns/op, probe(2 routers) {:.0} ns/op, probe(empty) {:.0} ns/op, tick_boundary {:.0} ns/op (min of {rounds}x{iters})",
+            best_route * 1e9,
+            best_probe * 1e9,
+            best_probe_empty * 1e9,
+            best_tick * 1e9
+        );
+    }
+
+    /// Reset the last-boundary baseline (u64::MAX sentinel = no baseline).
+    fn reset_last_boundary_for_tests() {
+        LAST_BOUNDARY_NS.store(u64::MAX, Ordering::Relaxed);
     }
 }

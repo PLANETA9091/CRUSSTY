@@ -147,6 +147,7 @@ impl Registry {
     fn snapshot(&self, event: &str) -> Vec<(Option<(String, u64)>, Handler)> {
         let mut out = Vec::new();
         if let Some(list) = self.exact.get(event) {
+            out.reserve(list.entries.len());
             out.extend(
                 list.entries
                     .iter()
@@ -155,6 +156,7 @@ impl Registry {
         }
         for (pattern, list) in &self.patterns {
             if glob_match(pattern, event) {
+                out.reserve(list.entries.len());
                 out.extend(
                     list.entries
                         .iter()
@@ -224,13 +226,26 @@ impl Registry {
 }
 
 /// Topic filter matching — see the grammar in the module docs.
+/// Zero-alloc (TASK-161): segment-by-segment iterator compare — the previous
+/// version allocated two `Vec<&str>` per call, and this runs on hot publish /
+/// has_subscribers paths.
 fn glob_match(pattern: &str, event: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    let p: Vec<&str> = pattern.split('.').collect();
-    let e: Vec<&str> = event.split('.').collect();
-    p.len() == e.len() && p.iter().zip(&e).all(|(p, e)| *p == "*" || *p == *e)
+    let mut p = pattern.split('.');
+    let mut e = event.split('.');
+    loop {
+        match (p.next(), e.next()) {
+            (None, None) => return true,
+            (Some(ps), Some(es)) => {
+                if ps != "*" && ps != es {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn has_glob(pattern: &str) -> bool {
@@ -374,6 +389,10 @@ pub struct EventBus {
     pool: Arc<AsyncPool>,
     next_id: Arc<AtomicU64>,
     emitting_lifecycle: Arc<AtomicBool>,
+    /// Live async subscription count (TASK-161): lets `publish` skip the
+    /// async-registry lock + snapshot entirely in the common no-async case.
+    /// Maintained by `subscribe_async` / `unsubscribe` / `purge_owner`.
+    async_count: Arc<AtomicUsize>,
 }
 
 static GLOBAL: OnceLock<EventBus> = OnceLock::new();
@@ -418,6 +437,7 @@ impl EventBus {
                 owner,
             )
         };
+        self.async_count.fetch_add(1, Ordering::SeqCst);
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
     }
@@ -427,8 +447,12 @@ impl EventBus {
     /// dlcloses the replaced library, so no publish can ever invoke an
     /// unloaded callback. Returns the number of subscriptions removed.
     pub fn purge_owner(&self, owner: &(String, u64)) -> usize {
-        let removed =
-            lock(&self.handlers).purge_owner(owner) + lock(&self.async_handlers).purge_owner(owner);
+        let removed_sync = lock(&self.handlers).purge_owner(owner);
+        let removed_async = lock(&self.async_handlers).purge_owner(owner);
+        if removed_async > 0 {
+            self.async_count.fetch_sub(removed_async, Ordering::SeqCst);
+        }
+        let removed = removed_sync + removed_async;
         if removed > 0 {
             eprintln!(
                 "[crussty:events] purge: dropped {removed} subscription(s) owned by '{}' gen {}",
@@ -455,8 +479,16 @@ impl EventBus {
     /// stale (never emitted on this bus, already removed, or its list was
     /// mutated since).
     pub fn unsubscribe(&self, event: &str, token: &Subscription) -> bool {
-        let removed =
-            lock(&self.handlers).remove(event, token) || lock(&self.async_handlers).remove(event, token);
+        let removed_sync = lock(&self.handlers).remove(event, token);
+        let removed = if removed_sync {
+            true
+        } else {
+            let removed_async = lock(&self.async_handlers).remove(event, token);
+            if removed_async {
+                self.async_count.fetch_sub(1, Ordering::SeqCst);
+            }
+            removed_async
+        };
         if removed {
             self.emit_lifecycle(lifecycle::EVENT_UNSUBSCRIBED, event, token.id);
         }
@@ -469,25 +501,29 @@ impl EventBus {
     pub fn publish(&self, event: &str, payload: &Value) -> usize {
         let handlers = lock(&self.handlers).snapshot(event);
         let invoked = dispatch(&handlers, event, payload);
-        let async_handlers = lock(&self.async_handlers).snapshot(event);
-        if !async_handlers.is_empty() {
-            // Quiescence: every queued handler keeps its module's guard
-            // alive until the pool has run it (see AsyncTask::leaders), so a
-            // hot reload waits instead of dlclosing under pending handlers.
-            let leaders = async_handlers
-                .iter()
-                .map(|(owner, _)| {
-                    owner
-                        .as_ref()
-                        .and_then(|(id, _)| super::hot_reload::guard_module(id))
-                })
-                .collect();
-            self.pool.push(AsyncTask {
-                event: event.to_string(),
-                payload: payload.clone(),
-                leaders,
-                handlers: async_handlers,
-            });
+        // Fast path (TASK-161): with no async subscriptions — the default —
+        // skip the async registry lock + snapshot entirely.
+        if self.async_count.load(Ordering::Relaxed) > 0 {
+            let async_handlers = lock(&self.async_handlers).snapshot(event);
+            if !async_handlers.is_empty() {
+                // Quiescence: every queued handler keeps its module's guard
+                // alive until the pool has run it (see AsyncTask::leaders), so a
+                // hot reload waits instead of dlclosing under pending handlers.
+                let leaders = async_handlers
+                    .iter()
+                    .map(|(owner, _)| {
+                        owner
+                            .as_ref()
+                            .and_then(|(id, _)| super::hot_reload::guard_module(id))
+                    })
+                    .collect();
+                self.pool.push(AsyncTask {
+                    event: event.to_string(),
+                    payload: payload.clone(),
+                    leaders,
+                    handlers: async_handlers,
+                });
+            }
         }
         invoked
     }
@@ -555,13 +591,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn with_cap(cap: usize) -> EventBus {
+    pub(super) fn with_cap(cap: usize) -> EventBus {
         EventBus {
             handlers: Arc::new(Mutex::new(Registry::default())),
             async_handlers: Arc::new(Mutex::new(Registry::default())),
             pool: Arc::new(AsyncPool::new(cap)),
             next_id: Arc::new(AtomicU64::new(0)),
             emitting_lifecycle: Arc::new(AtomicBool::new(false)),
+            async_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -905,5 +942,69 @@ mod tests {
 
         bus.subscribe("x.evt", Arc::new(|_, _| {}));
         assert_eq!(n.load(Ordering::SeqCst), 2, "later subscriptions emit exactly once");
+    }
+}
+
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_events`.
+    use super::*;
+    use super::tests::with_cap;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_event_bus_publish() {
+        let bus = with_cap(64);
+        let payload = serde_json::json!({ "tick": 1u64, "drained": 0u64 });
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // publish with zero subscribers (steady-state tick boundary shape)
+        for _ in 0..10_000u32 {
+            let _ = bus.publish("bench.none", &payload);
+        }
+        let mut best_none = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish("bench.none", &payload);
+            }
+            best_none = best_none.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // one sync subscriber
+        let _tok = bus.subscribe("bench.one", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            let _ = bus.publish("bench.one", &payload);
+        }
+        let mut best_one = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish("bench.one", &payload);
+            }
+            best_one = best_one.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // one glob-pattern subscriber, then has_subscribers (exact miss + 1 pattern scan)
+        let _pat = bus.subscribe("platform.*", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            let _ = bus.has_subscribers("platform.tick_boundary");
+        }
+        let mut best_glob = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.has_subscribers("platform.tick_boundary");
+            }
+            best_glob = best_glob.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op (min of {rounds}x{iters})",
+            best_none * 1e9,
+            best_one * 1e9,
+            best_glob * 1e9
+        );
     }
 }

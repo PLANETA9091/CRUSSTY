@@ -60,7 +60,7 @@
 //!   JVMTI retransformation) does not double-instrument.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Where to inject the instrumented call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,19 +111,26 @@ pub struct TransformedClass {
 }
 
 /// The engine consumes class bytes, runs matching rules, returns new bytes.
+///
+/// Hotpath note (TASK-161): `apply` runs on EVERY class load (lib.rs CFLH
+/// fires per class; thousands at boot). The rules registry is therefore an
+/// immutable snapshot behind an RwLock — the read path clones one `Arc` and
+/// matches with zero allocations, instead of locking a Mutex and cloning a
+/// whole `Vec<Arc<Rule>>` per class. Registration (cold, boot-time) rebuilds
+/// the snapshot.
 pub struct TransformEngine {
-    rules: Mutex<Vec<Arc<Rule>>>,
+    rules: RwLock<Arc<[Arc<Rule>]>>,
 }
 
 impl TransformEngine {
     pub fn new() -> Self {
         Self {
-            rules: Mutex::new(Vec::new()),
+            rules: RwLock::new(Arc::from(Vec::new())),
         }
     }
 
     pub fn register(&self, rule: Rule) {
-        let mut rules = self.rules.lock().unwrap();
+        let mut rules = self.rules.write().unwrap();
         // Conflict guard: two modules (or a module + a platform brick)
         // registering the same rule on the same point would fire the probe
         // twice per hit. Exact duplicates are rejected instead of silently
@@ -135,11 +142,13 @@ impl TransformEngine {
             );
             return;
         }
-        rules.push(Arc::new(rule));
+        let mut v: Vec<Arc<Rule>> = rules.to_vec();
+        v.push(Arc::new(rule));
+        *rules = v.into();
     }
 
     pub fn rules(&self) -> Vec<Arc<Rule>> {
-        self.rules.lock().unwrap().clone()
+        self.rules.read().unwrap().to_vec()
     }
 
     /// Apply matching rules to class bytes.
@@ -151,9 +160,13 @@ impl TransformEngine {
     /// then choose to fail the class load or run it untransformed. Never
     /// panics; parse failures return `Err` with context.
     pub fn apply(&self, class_name: &str, bytes: &[u8]) -> Result<Option<TransformedClass>, String> {
-        let matched: Vec<Arc<Rule>> = self
-            .rules()
-            .into_iter()
+        // One atomic bump for the snapshot; the guard is dropped immediately
+        // so a concurrent register never blocks a long-running transform.
+        let snapshot: Arc<[Arc<Rule>]> = self.rules.read().unwrap().clone();
+        // Borrowing filter: no Arc bumps, and an empty match allocates nothing
+        // (the per-class-load fast path — most classes match no rule).
+        let matched: Vec<&Arc<Rule>> = snapshot
+            .iter()
             .filter(|r| matches_pattern(&r.class_pattern, class_name))
             .collect();
         if matched.is_empty() {
@@ -161,7 +174,7 @@ impl TransformEngine {
         }
         let class = parse_class(bytes).map_err(|e| format!("transform {class_name}: {e}"))?;
         let mut plan = Plan::default();
-        for rule in &matched {
+        for rule in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
                     Injection::MethodEntry => {
@@ -238,11 +251,13 @@ fn rule_matches_method(rule: &Rule, m: &Member) -> bool {
     (rule.method == "*" || rule.method == m.name) && (rule.descriptor == "*" || rule.descriptor == m.descriptor)
 }
 
-/// Process-wide engine used by the platform hook pipeline.
+/// Process-wide engine used by the platform hook pipeline. Returns the
+/// static `Arc` itself — the per-class-load caller (lib.rs CFLH) pays zero
+/// atomic refcount work to reach the engine.
 static ENGINE: OnceLock<Arc<TransformEngine>> = OnceLock::new();
 
-pub fn global_engine() -> Arc<TransformEngine> {
-    ENGINE.get_or_init(|| Arc::new(TransformEngine::new())).clone()
+pub fn global_engine() -> &'static Arc<TransformEngine> {
+    ENGINE.get_or_init(|| Arc::new(TransformEngine::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,7 +1406,7 @@ mod tests {
 
     // --- synthetic class builder -------------------------------------------
 
-    struct Cb {
+    pub(super) struct Cb {
         cp: Vec<(u8, Vec<u8>)>,
     }
 
@@ -1399,33 +1414,33 @@ mod tests {
         fn new() -> Self {
             Self { cp: vec![(0, vec![])] }
         }
-        fn utf8(&mut self, s: &str) -> u16 {
+        pub(super) fn utf8(&mut self, s: &str) -> u16 {
             let n = self.cp.len() as u16;
             let mut payload = (s.len() as u16).to_be_bytes().to_vec();
             payload.extend_from_slice(s.as_bytes());
             self.cp.push((TAG_UTF8, payload));
             n
         }
-        fn class(&mut self, name_utf8: u16) -> u16 {
+        pub(super) fn class(&mut self, name_utf8: u16) -> u16 {
             let n = self.cp.len() as u16;
             self.cp.push((TAG_CLASS, name_utf8.to_be_bytes().to_vec()));
             n
         }
-        fn nat(&mut self, name: u16, desc: u16) -> u16 {
+        pub(super) fn nat(&mut self, name: u16, desc: u16) -> u16 {
             let n = self.cp.len() as u16;
             let mut p = name.to_be_bytes().to_vec();
             p.extend_from_slice(&desc.to_be_bytes());
             self.cp.push((TAG_NAME_AND_TYPE, p));
             n
         }
-        fn mref(&mut self, class: u16, nat: u16) -> u16 {
+        pub(super) fn mref(&mut self, class: u16, nat: u16) -> u16 {
             let n = self.cp.len() as u16;
             let mut p = class.to_be_bytes().to_vec();
             p.extend_from_slice(&nat.to_be_bytes());
             self.cp.push((TAG_METHODREF, p));
             n
         }
-        fn long(&mut self, value: i64) -> u16 {
+        pub(super) fn long(&mut self, value: i64) -> u16 {
             let n = self.cp.len() as u16;
             self.cp.push((TAG_LONG, value.to_be_bytes().to_vec()));
             // long/double occupy two constant-pool slots; the second slot has
@@ -1433,14 +1448,14 @@ mod tests {
             self.cp.push((0, Vec::new()));
             n
         }
-        fn idx(&self, s: &str) -> u16 {
+        pub(super) fn idx(&self, s: &str) -> u16 {
             self.cp
                 .iter()
                 .enumerate()
                 .find_map(|(i, (t, p))| (t == &TAG_UTF8 && p[2..] == *s.as_bytes()).then_some(i as u16))
                 .expect("utf8 entry")
         }
-        fn fin(&self, this: u16, super_: u16, methods: Vec<MethodB>) -> Vec<u8> {
+        pub(super) fn fin(&self, this: u16, super_: u16, methods: Vec<MethodB>) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
             out.extend_from_slice(&0u16.to_be_bytes());
@@ -1495,14 +1510,14 @@ mod tests {
         }
     }
 
-    struct MethodB {
+    pub(super) struct MethodB {
         access: u16,
         name: u16,
         desc: u16,
         code: Option<CodeB>,
     }
 
-    struct CodeB {
+    pub(super) struct CodeB {
         code_attr_name: u16,
         max_stack: u16,
         max_locals: u16,
@@ -1511,7 +1526,7 @@ mod tests {
         sub: Vec<(u16, Vec<u8>)>,
     }
 
-    fn basic_cb() -> (Cb, u16, u16) {
+    pub(super) fn basic_cb() -> (Cb, u16, u16) {
         let mut c = Cb::new();
         let t = c.utf8("Test");
         let o = c.utf8("java/lang/Object");
@@ -1520,7 +1535,7 @@ mod tests {
         (c, cl_t, cl_o)
     }
 
-    fn method_b(name: u16, desc: u16, code: Option<CodeB>) -> MethodB {
+    pub(super) fn method_b(name: u16, desc: u16, code: Option<CodeB>) -> MethodB {
         MethodB {
             access: 0x0009,
             name,
@@ -1529,7 +1544,7 @@ mod tests {
         }
     }
 
-    fn code_b(code_attr_name: u16, code: Vec<u8>) -> CodeB {
+    pub(super) fn code_b(code_attr_name: u16, code: Vec<u8>) -> CodeB {
         CodeB {
             code_attr_name,
             max_stack: 1,
@@ -2084,5 +2099,100 @@ mod conflict_guard_tests {
         other.helper = "dev.crussty.hooks.TickHook.onOther".to_string();
         e.register(other);
         assert_eq!(e.rules().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_transform`.
+    //! The no-match path is THE per-class-load hot path (lib.rs CFLH fires for every
+    //! class the JVM loads; the overwhelming majority match no rule and must pass
+    //! through for free).
+    use super::*;
+    use std::time::Instant;
+
+    fn bench_kernelish_class() -> Vec<u8> {
+        let (mut c, cl_t, cl_o) = tests::basic_cb();
+        let code_n = c.utf8("Code");
+        let n_run = c.utf8("run");
+        let d_run = c.utf8("()V");
+        let n_tick = c.utf8("tickServer");
+        let d_tick = c.utf8("(Ljava/util/function/BooleanSupplier;)V");
+        let m1 = tests::method_b(n_run, d_run, Some(tests::code_b(code_n, vec![0xB1])));
+        let m2 = tests::method_b(n_tick, d_tick, Some(tests::code_b(code_n, vec![0xB1])));
+        c.fin(cl_t, cl_o, vec![m1, m2])
+    }
+
+    fn bench_engine() -> TransformEngine {
+        // Scheduler-table-shaped registry + one wildcard: a realistic engine.
+        let e = TransformEngine::new();
+        let table = [
+            ("net/minecraft/server/MinecraftServer", "tickServer", "(Ljava/util/function/BooleanSupplier;)V"),
+            ("net/minecraft/server/level/ServerLevel", "tick", "(Ljava/util/function/BooleanSupplier;)V"),
+            ("io/papermc/paper/threadedregions/scheduler/FallbackRegionScheduler", "run", "*"),
+            ("io/papermc/paper/threadedregions/scheduler/FallbackRegionScheduler", "execute", "*"),
+            ("io/papermc/paper/threadedregions/scheduler/FoliaGlobalRegionScheduler", "run", "*"),
+            ("org/bukkit/craftbukkit/scheduler/CraftScheduler", "mainThreadHeartbeat", "*"),
+            ("net/minecraft/world/ticks/LevelTicks", "tick", "*"),
+            ("net/minecraft/world/entity/Entity", "*", "*"),
+        ];
+        for (class, method, desc) in table {
+            e.register(Rule::new(
+                class,
+                method,
+                desc,
+                Injection::MethodEntry,
+                "dev.crussty.hooks.SchedulerHooks.onTick",
+            ));
+        }
+        e
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_transform_apply_nomatch() {
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+        for _ in 0..10_000u32 {
+            let _ = e.apply("some/unrelated/Type", &bytes);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = e.apply("some/unrelated/Type", &bytes);
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH transform no-match: {:.0} ns/op (8 rules + 1 wildcard, min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_transform_apply_match() {
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+        for _ in 0..10_000u32 {
+            let _ = e.apply("net/minecraft/server/MinecraftServer", &bytes);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = e.apply("net/minecraft/server/MinecraftServer", &bytes);
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH transform match+inject: {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
     }
 }
