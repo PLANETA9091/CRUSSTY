@@ -18,7 +18,7 @@ mod scan;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use cplug_abi::{CPluginApi, ClassHookFn, JavaVmPtr, CPAPI_VERSION};
@@ -83,7 +83,9 @@ pub struct RegistrationGuard {
 
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
-        *reg_ctx().lock().unwrap() = self.prev.clone();
+        let prev = self.prev.clone();
+        *reg_ctx().lock().unwrap() = prev.clone();
+        REG_CTX_SET.store(prev.is_some(), Ordering::Release);
     }
 }
 
@@ -92,30 +94,53 @@ pub fn begin_registration(id: &str, gen: u64) -> RegistrationGuard {
     let mut ctx = reg_ctx().lock().unwrap();
     let prev = ctx.clone();
     *ctx = Some((id.to_string(), gen));
+    drop(ctx);
+    REG_CTX_SET.store(true, Ordering::Release);
     RegistrationGuard { prev }
 }
 
 /// The owner stamp applied to registrations made right now (from a module
 /// handshake), or `None` outside any.
 pub fn registration_owner() -> Option<(String, u64)> {
+    // Lock-free fast gate (TASK-163): outside any registration window — the
+    // state of every thread that is not literally inside a module handshake
+    // — the answer is None and needs no mutex round-trip.
+    if !REG_CTX_SET.load(Ordering::Acquire) {
+        return None;
+    }
     reg_ctx().lock().unwrap().clone()
 }
+
+/// True while some thread is inside a registration window (TASK-163 gate
+/// mirror of `reg_ctx`).
+static REG_CTX_SET: AtomicBool = AtomicBool::new(false);
 
 /// Drop every hook registered by module `id` of library generation `gen` —
 /// the generation a hot reload is replacing. Idempotent; other owners are
 /// untouched (including a newer generation of the same module, which is
 /// exactly why the purge is keyed by (id, gen) and not by id alone).
 pub fn purge_module_hooks(id: &str, gen: u64) {
-    let mut h = hooks().lock().unwrap();
-    let before = h.len();
-    h.retain(|entry| entry.owner.as_ref() != Some(&(id.to_string(), gen)));
-    let removed = before - h.len();
+    let removed = {
+        let mut h = hooks().lock().unwrap();
+        let before = h.len();
+        h.retain(|entry| entry.owner.as_ref() != Some(&(id.to_string(), gen)));
+        before - h.len()
+    };
     if removed > 0 {
+        // TASK-163: keep the lock-free live-count honest (Release so a
+        // concurrent class-load gate that observes 0 cannot miss a purge).
+        PLUGIN_HOOKS_LIVE.fetch_sub(removed, Ordering::AcqRel);
         eprintln!(
             "[crussty-runtime] hook purge: dropped {removed} hook(s) owned by '{id}' gen {gen}"
         );
     }
 }
+
+/// Live plugin class-hook count (TASK-163): the per-class-load fast gate and
+/// the dispatch-prep gate key off this — zero means the JVMTI phase query,
+/// the registry lock + Vec clone and the CString build are all skipped on
+/// every class load the JVM performs.
+static PLUGIN_HOOKS_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// Raw jvmtiEnv pointer as usize (JVMTI envs are process-wide, usable from
 /// any thread — safe to share).
 static JVMTI_ENV: OnceLock<usize> = OnceLock::new();
@@ -342,6 +367,25 @@ impl Agent for CrusstyRuntime {
         new_class_data_len: *mut jni::jint,
         new_class_data: *mut *mut u8,
     ) {
+        // FAST GATE (TASK-163): with no transform rules, no plugin class
+        // hooks and no lifecycle subscribers there is nothing this callback
+        // can produce — skip the name derivation (the per-load constant-pool
+        // walk), the JVMTI phase query, the registry lock/clone and the
+        // CString build entirely. This is the shape of a runtime whose
+        // modules use side_table/events/storage but never patch the kernel.
+        // Release-side ordering: rule registrations and hook registrations
+        // both publish under their own locks/atomics before the counts this
+        // gate reads, so a gate miss can only ever under-count by a moment —
+        // and the class then runs untransformed exactly as it would on a
+        // failed transform (documented degrade direction).
+        let hooks_live = PLUGIN_HOOKS_LIVE.load(Ordering::Acquire) > 0;
+        if !hooks_live
+            && platform::transform::global_engine().rule_count() == 0
+            && !platform::events::global_ref()
+                .has_subscribers(platform::lifecycle::CLASS_LOADED)
+        {
+            return;
+        }
         // The VM-provided `name` pointer is NOT reliably NUL-terminated on
         // HotSpot: it can point into the interned-symbol arena where the
         // next symbol's bytes follow immediately ("ImprovedNoise" ->
@@ -349,39 +393,47 @@ impl Agent for CrusstyRuntime {
         // that string (platform transform rules, plugin hooks) silently
         // misses its targets. The class file itself is the source of truth:
         // parse this_class from its constant pool and prefer that.
-        let name = if !class_data.is_null() && class_data_len > 10 {
-            let bytes =
-                unsafe { std::slice::from_raw_parts(class_data, class_data_len as usize) };
-            // A panic unwinding through this extern "C" callback is fatal
-            // (abort) — the parser must never take the JVM down with it.
-            std::panic::catch_unwind(|| class_file_name(bytes))
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| read_bounded_cstr(name))
+        let data_slice = if !class_data.is_null() && class_data_len > 10 {
+            Some(unsafe {
+                std::slice::from_raw_parts(class_data, class_data_len as usize)
+            })
         } else {
-            read_bounded_cstr(name)
+            None
         };
-        // TASK-46-class hardening (S7-8): JVMTI-callback-reachable lock; a
-        // poisoned mutex must not unwind across the trampoline (= VM abort).
+        // A panic unwinding through this extern "C" callback is fatal
+        // (abort) — the parser must never take the JVM down with it; the
+        // borrowed name keeps the hot path allocation-free.
+        let owned_name: String;
+        let name: &str = match data_slice
+            .as_deref()
+            .and_then(|b| std::panic::catch_unwind(|| class_file_name(b)).ok().flatten())
+        {
+            Some(n) => n,
+            None => {
+                owned_name = read_bounded_cstr(name);
+                &owned_name
+            }
+        };
+        // Dispatch prep (TASK-163): the JVMTI phase query and the registry
+        // lock + Vec clone run only when plugin hooks exist at all; the
+        // CString for the C-ABI call is built only when a hook will run.
         //
         // JVMTI-PHASE GATE (shutdown-crash family, hs_err "Signal Dispatcher"
-        // 2026-09-07/08, 4 occurrences): the JVM keeps LOADING classes while
-        // it dies — shutdown-hook classes load on the "Signal Dispatcher"
-        // thread after VMDeath begins — and this hook fires for them. Plugin
-        // hooks are module-owned closures doing arbitrary JNI and allocator
-        // work; driving them against a dying VM is the crash chain (CFLH
-        // dispatch `call *0x20(%rbp)` landing in the module's .rodata strings
-        // / NULL — addr2line-proven against build e830e7b9). Gate the snapshot
-        // to an EMPTY table for everything but LIVE: a get_phase error means
-        // the env is already in trouble, and skipping is the documented
-        // degrade direction. The byte-transform engine below stays
-        // unconditional on purpose (pure byte work, degrades to
-        // "class runs untransformed"), so engine rules still apply on dying-VM
-        // loads while module code never runs there.
-        let registered = if jvmti_env()
-            .and_then(|env| env.get_phase().ok())
-            .map(|phase| phase == jvmti_bindings::sys::jvmti::JVMTI_PHASE_LIVE)
-            .unwrap_or(false)
+        // 2026-09-07/08, 4 occurrences — LAW): the JVM keeps LOADING classes
+        // while it dies, and this hook fires for them; module-owned hooks do
+        // arbitrary JNI work and driving them against a dying VM is the
+        // crash chain. Gate the snapshot to an EMPTY table for everything
+        // but LIVE (skip is the documented degrade direction). The
+        // byte-transform engine below stays unconditional on purpose (pure
+        // byte work, degrades to "class runs untransformed").
+        // TASK-46-class hardening (S7-8): the registry lock is
+        // JVMTI-callback-reachable; a poisoned mutex must not unwind across
+        // the trampoline (= VM abort).
+        let registered = if hooks_live
+            && jvmti_env()
+                .and_then(|env| env.get_phase().ok())
+                .map(|phase| phase == jvmti_bindings::sys::jvmti::JVMTI_PHASE_LIVE)
+                .unwrap_or(false)
         {
             hooks()
                 .lock()
@@ -395,7 +447,11 @@ impl Agent for CrusstyRuntime {
         // (class names never contain interior NULs, so this is infallible in
         // practice; None only if the name somehow embedded one, in which case
         // plugin hooks are skipped for this class rather than reading garbage).
-        let cname = std::ffi::CString::new(name.as_str()).ok();
+        let cname = if registered.is_empty() {
+            None
+        } else {
+            std::ffi::CString::new(name).ok()
+        };
 
         let mut current: *const u8 = class_data;
         let mut current_len = class_data_len as usize;
@@ -559,9 +615,17 @@ fn read_bounded_cstr(name: *const c_char) -> String {
 
 /// Extract the true internal class name from class-file bytes: walk the
 /// constant pool, read this_class -> name_index -> Utf8. O(pool size),
-/// zero allocation beyond the returned String, no panics on malformed
-/// input (returns None instead — callers fall back to the VM name).
-fn class_file_name(data: &[u8]) -> Option<String> {
+/// zero allocation, no panics on malformed input (returns None instead —
+/// callers fall back to the VM name).
+///
+/// Zero-alloc (TASK-163): the previous version materialised two
+/// `Vec<Option<_>>` pools sized by cp_count plus a String on EVERY class
+/// load (~0.85 µs measured, the fattest line in the JVM's hottest loop).
+/// This walker stores nothing — pass 1 finds the pool end, pass 2 walks to
+/// this_class and its Utf8 (usually in the same pass, since the name Utf8
+/// typically precedes the Class entry) and borrows the name bytes straight
+/// out of `class_data`.
+fn class_file_name(data: &[u8]) -> Option<&str> {
     if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
         return None;
     }
@@ -575,60 +639,110 @@ fn class_file_name(data: &[u8]) -> Option<String> {
     if cp_count == 0 {
         return None;
     }
-    // constant pool entries are indexed 1..cp_count; entries may be None
-    // only for tag shapes we must skip correctly to stay aligned.
+    // One walk (TASK-163): record each entry's start offset into a STACK
+    // table — no heap allocation, no second pass. Pools beyond the table
+    // (rare) fall back to the storage-free two-pass walker below.
+    if cp_count <= 1024 {
+        let mut offs = [0u32; 1024];
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            offs[i] = idx as u32;
+            let tag = *data.get(idx)?;
+            idx += match tag {
+                1 => 3 + u16_at(idx + 1)? as usize,
+                7 | 8 | 16 | 19 | 20 => 3,
+                15 => 4,
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
+                5 | 6 => 9,
+                _ => return None,
+            };
+            i += match tag {
+                5 | 6 => 2,
+                _ => 1,
+            };
+        }
+        // access_flags(2) this_class(2) right after the pool
+        let this_idx = u16_at(idx + 2)? as usize;
+        if this_idx == 0 || this_idx >= cp_count {
+            return None;
+        }
+        let cat = offs[this_idx] as usize;
+        if *data.get(cat)? != 7 {
+            return None;
+        }
+        let name_idx = u16_at(cat + 1)? as usize;
+        if name_idx == 0 || name_idx >= cp_count {
+            return None;
+        }
+        let nat = offs[name_idx] as usize;
+        if *data.get(nat)? != 1 {
+            return None;
+        }
+        let len = u16_at(nat + 1)? as usize;
+        let start = nat + 3;
+        if start + len > data.len() {
+            return None;
+        }
+        return std::str::from_utf8(&data[start..start + len]).ok();
+    }
+    // Fallback for pathological pools (>1024 entries): storage-free
+    // two-pass — pass 1 finds the pool end, pass 2 walks to this_class and
+    // then to its Utf8.
+    let step = |idx: usize| -> Option<(usize, usize)> {
+        let tag = *data.get(idx)?;
+        let (bytes, slots) = match tag {
+            1 => (3 + u16_at(idx + 1)? as usize, 1),
+            7 | 8 | 16 | 19 | 20 => (3, 1),
+            15 => (4, 1),
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => (5, 1),
+            5 | 6 => (9, 2),
+            _ => return None,
+        };
+        Some((bytes, slots))
+    };
     let mut idx = 10usize;
-    let mut cp_utf8: Vec<Option<&[u8]>> = vec![None; cp_count];
-    let mut cp_class_name_idx: Vec<Option<usize>> = vec![None; cp_count];
     let mut i = 1usize;
     while i < cp_count {
-        let tag = *data.get(idx)?;
-        match tag {
-            1 => {
-                // Utf8: u2 length + bytes
-                let len = u16_at(idx + 1)? as usize;
-                let start = idx + 3;
-                if start + len > data.len() {
-                    return None;
-                }
-                cp_utf8[i] = Some(&data[start..start + len]);
-                idx = start + len;
-                i += 1;
-            }
-            7 => {
-                // Class: u2 name_index
-                let ni = u16_at(idx + 1)? as usize;
-                if ni < cp_count {
-                    cp_class_name_idx[i] = Some(ni);
-                }
-                idx += 3;
-                i += 1;
-            }
-            8 | 16 | 19 | 20 => {
-                idx += 3;
-                i += 1;
-            }
-            15 => {
-                idx += 4;
-                i += 1;
-            }
-            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
-                idx += 5;
-                i += 1;
-            }
-            5 | 6 => {
-                // long/double take two slots
-                idx += 9;
-                i += 2;
-            }
-            _ => return None,
-        }
+        let (bytes, slots) = step(idx)?;
+        idx += bytes;
+        i += slots;
     }
-    // access_flags(2) this_class(2): this_class is a CONSTANT_Class index
     let this_idx = u16_at(idx + 2)? as usize;
-    let name_idx = cp_class_name_idx.get(this_idx).copied().flatten()?;
-    let raw = cp_utf8.get(name_idx).copied().flatten()?;
-    String::from_utf8(raw.to_vec()).ok()
+    if this_idx == 0 || this_idx >= cp_count {
+        return None;
+    }
+    let walk_to = |target: usize| -> Option<(u8, usize)> {
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            if i == target {
+                return Some((*data.get(idx)?, idx));
+            }
+            let (bytes, slots) = step(idx)?;
+            idx += bytes;
+            i += slots;
+        }
+        None
+    };
+    let (tag, at) = walk_to(this_idx)?;
+    if tag != 7 {
+        return None;
+    }
+    let name_idx = u16_at(at + 1)? as usize;
+    if name_idx == 0 || name_idx >= cp_count {
+        return None;
+    }
+    let (tag, at) = walk_to(name_idx)?;
+    if tag != 1 {
+        return None;
+    }
+    let len = u16_at(at + 1)? as usize;
+    let start = at + 3;
+    if start + len > data.len() {
+        return None;
+    }
+    std::str::from_utf8(&data[start..start + len]).ok()
 }
 
 #[cfg(test)]
@@ -658,7 +772,7 @@ mod class_name_tests {
     #[test]
     fn parses_simple_name() {
         let data = minimal_class(b"foo/Bar");
-        assert_eq!(class_file_name(&data).as_deref(), Some("foo/Bar"));
+        assert_eq!(class_file_name(&data), Some("foo/Bar"));
     }
 
     #[test]
@@ -679,7 +793,7 @@ mod class_name_tests {
         b.extend_from_slice(&[0, 0x21]);
         b.extend_from_slice(&[0, 4]);
         b.extend_from_slice(&[0, 0]);
-        assert_eq!(class_file_name(&b).as_deref(), Some("Test"));
+        assert_eq!(class_file_name(&b), Some("Test"));
     }
 
     #[test]
@@ -708,7 +822,7 @@ mod class_name_tests {
 /// bus actually has subscribers (the hook runs on the class-loading thread,
 /// which must stay cheap).
 fn publish_class_loaded(name: &str, bytes_len: usize) {
-    let bus = platform::events::global();
+    let bus = platform::events::global_ref();
     if bus.has_subscribers(platform::lifecycle::CLASS_LOADED) {
         bus.publish(
             platform::lifecycle::CLASS_LOADED,
@@ -725,6 +839,10 @@ unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn
         ctx: ctx as usize,
         func: hook,
     });
+    // Release: a class-load gate that observes the new count on another
+    // thread is guaranteed to see the pushed entry through the registry
+    // lock (the push happened under it).
+    PLUGIN_HOOKS_LIVE.fetch_add(1, Ordering::Release);
     0
 }
 unsafe extern "C" fn api_jvmti_allocate(size: usize) -> *mut u8 {
@@ -1051,5 +1169,139 @@ mod claim_tests {
         assert_eq!(claim(0x11, "class:a/b/C"), 0); // idempotent, same owner
         assert_eq!(claim(0x22, "class:a/b/C"), -1); // other module: refused
         assert_eq!(claim(0x22, "class:a/b/D"), 0); // different key: fine
+    }
+}
+
+/// Round-4 hotpath benches (TASK-163): the per-class-load loop is the JVM's
+/// hottest path — every class the kernel ever loads pays this callback.
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_cflh`.
+    use super::*;
+    use std::time::Instant;
+
+    /// A representative mid-size class: ~300 constant-pool entries, a
+    /// 40-char internal name — the shape of a typical kernel class.
+    fn representative_class() -> Vec<u8> {
+        let mut b = Vec::with_capacity(8192);
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
+        b.extend_from_slice(&[0, 0]); // minor
+        b.extend_from_slice(&[0, 65]); // major 65
+        let slots = 300u16;
+        b.extend_from_slice(&slots.to_be_bytes()); // cp_count
+        let mut i = 1usize;
+        while i < (slots as usize) - 1 {
+            // Utf8 filler entry (varied lengths 8..40)
+            let len = 8 + (i % 32);
+            b.push(1);
+            b.extend_from_slice(&(len as u16).to_be_bytes());
+            b.extend(std::iter::repeat(b'x').take(len));
+            i += 1;
+        }
+        // last slot: the name
+        b.push(1);
+        b.extend_from_slice(&(40u16).to_be_bytes());
+        b.extend_from_slice(b"java/util/concurrent/ConcurrentHashMap");
+        b.push(7);
+        b.extend_from_slice(&((slots - 1)).to_be_bytes());
+        b.extend_from_slice(&[0, 0x21]);
+        b.extend_from_slice(&(slots - 1).to_be_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_cflh_class_load_overhead() {
+        let data = representative_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // segment 1: name derivation from class bytes
+        for _ in 0..10_000u32 {
+            let _ = class_file_name(&data);
+        }
+        let mut best_name = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = class_file_name(&data);
+            }
+            best_name = best_name.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // segment 2: the class-load fast-gate chain (TASK-163) — plugin
+        // hook count + engine rule count + lifecycle subscriber check, the
+        // shape every class load pays before any work happens.
+        let gate = || {
+            let hooks_live = PLUGIN_HOOKS_LIVE.load(Ordering::Acquire) > 0;
+            !hooks_live
+                && platform::transform::global_engine().rule_count() == 0
+                && !platform::events::global_ref()
+                    .has_subscribers(platform::lifecycle::CLASS_LOADED)
+        };
+        // bisection: per-component attribution
+        let (mut b1, mut b2, mut b3) = (f64::MAX, f64::MAX, f64::MAX);
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(PLUGIN_HOOKS_LIVE.load(Ordering::Acquire));
+            }
+            b1 = b1.min(t.elapsed().as_secs_f64() / f64::from(iters));
+            let t = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(platform::transform::global_engine().rule_count());
+            }
+            b2 = b2.min(t.elapsed().as_secs_f64() / f64::from(iters));
+            let t = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    platform::events::global_ref()
+                        .has_subscribers(platform::lifecycle::CLASS_LOADED),
+                );
+            }
+            b3 = b3.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        for _ in 0..10_000u32 {
+            let _ = gate();
+        }
+        let mut best_prep = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = gate();
+            }
+            best_prep = best_prep.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH cflh: class_file_name {:.0} ns/op, fast-gate {:.0} ns/op (hooks {:.0} / rules {:.0} / subs {:.0}) (min of {rounds}x{iters})",
+            best_name * 1e9,
+            best_prep * 1e9,
+            b1 * 1e9,
+            b2 * 1e9,
+            b3 * 1e9
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_registration_owner() {
+        let iters = 200_000u32;
+        let rounds = 5;
+        for _ in 0..10_000u32 {
+            let _ = registration_owner();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = registration_owner();
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH registration_owner: {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
     }
 }

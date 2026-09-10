@@ -409,6 +409,13 @@ pub fn global() -> EventBus {
     GLOBAL.get_or_init(EventBus::default).clone()
 }
 
+/// Borrowed handle to the process-global bus (TASK-163): hot callers (the
+/// per-class-load gate) must not pay the six-Arc clone `global()` costs to
+/// consult a counter. Same bus, no clone.
+pub fn global_ref() -> &'static EventBus {
+    GLOBAL.get_or_init(EventBus::default)
+}
+
 impl EventBus {
     /// Subscribe to an event name. Handler runs synchronously on the
     /// publisher's thread, in subscription order. Returns a token usable

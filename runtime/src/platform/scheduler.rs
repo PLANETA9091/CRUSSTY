@@ -103,7 +103,7 @@
 use crate::platform::events::lifecycle::TICK_BOUNDARY;
 use crate::platform::transform::{global_engine, Injection, Rule};
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -149,10 +149,23 @@ pub fn add_router(f: RouterFn) {
     let mut v: Vec<RouterFn> = w.to_vec();
     v.push(f);
     *w = v.into();
+    drop(w);
+    // TASK-163 gate mirror: the route_task/probe fast path trusts this count.
+    ROUTER_LIVE.fetch_add(1, Ordering::Release);
 }
+
+/// Live router count (TASK-163): zero — the production default until a
+/// module routes — turns route_task and every scheduling-surface probe into
+/// a single acquire load.
+static ROUTER_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// The kernel adapter calls this for every scheduled task (via transform).
 pub fn route_task(task: &ScheduledTask) -> Routing {
+    // TASK-163 fast gate: no routers registered — skip the RwLock read and
+    // the Arc clone (the probe paths hit this per task-scheduled event).
+    if ROUTER_LIVE.load(Ordering::Acquire) == 0 {
+        return Routing::KeepKernel;
+    }
     let snapshot: Arc<[RouterFn]> = routers().read().unwrap_or_else(|p| p.into_inner()).clone();
     for r in snapshot.iter() {
         let d = r(task);
@@ -430,6 +443,7 @@ mod tests {
     pub(super) fn reset_routers() {
         if let Some(m) = ROUTERS.get() {
             *m.write().unwrap_or_else(|p| p.into_inner()) = Arc::from(Vec::new());
+            ROUTER_LIVE.store(0, Ordering::Release);
         }
     }
 
@@ -689,5 +703,36 @@ mod bench_hotpath {
     /// Reset the last-boundary baseline (u64::MAX sentinel = no baseline).
     fn reset_last_boundary_for_tests() {
         LAST_BOUNDARY_NS.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod bench_drain {
+    //! Release-only A/B bench (TASK-163): `cargo test --release -- --ignored --nocapture bench_drain`.
+    use super::*;
+    use std::time::Instant;
+
+    /// Per-tick cost of the injected-task drain on the default (empty queue)
+    /// shape — every server tick pays this.
+    #[test]
+    #[ignore]
+    fn bench_drain_injected_empty() {
+        let iters = 200_000u32;
+        let rounds = 5;
+        for _ in 0..10_000u32 {
+            let _ = drain_injected();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = drain_injected();
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH drain_injected(empty): {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
     }
 }

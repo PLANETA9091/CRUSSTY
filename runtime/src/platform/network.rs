@@ -143,7 +143,7 @@
 //! idiom whose deque bookkeeping cost O(conns) per touch.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -193,12 +193,19 @@ pub type PacketHookFn = Arc<dyn Fn(&mut Packet) -> Verdict + Send + Sync>;
 static HOOKS: LazyLock<RwLock<Arc<[PacketHookFn]>>> =
     LazyLock::new(|| RwLock::new(Arc::from(Vec::new())));
 
+/// Live packet-hook count (TASK-163): the per-packet fast gate — zero (the
+/// default until a module registers) skips the registry read lock and the
+/// Arc clone entirely. Release-bumped under the write lock.
+static PACKET_HOOKS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
 /// Modules register packet hooks at init (order = registration order).
 pub fn add_hook(f: PacketHookFn) {
     let mut w = HOOKS.write().unwrap_or_else(|p| p.into_inner());
     let mut v = w.to_vec();
     v.push(f);
     *w = v.into();
+    drop(w);
+    PACKET_HOOKS_LIVE.fetch_add(1, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,19 +328,32 @@ pub fn attach_conn(conn_id: u64, player_uuid: Option<u128>) -> bool {
             stamp,
         },
     );
+    // TASK-163 gate mirror: keep the live-conn count honest (the per-packet
+    // state_of gate trusts 0 = empty table).
+    let live = reg.map.len();
+    drop(reg);
+    CONNS_LIVE.store(live, Ordering::Release);
     true
 }
 
 /// Forget a connection (called by the `onClose` hook on channel inactive).
 /// Returns `true` if the conn was tracked. O(1) (was O(n) `retain`).
 pub fn detach_conn(conn_id: u64) -> bool {
-    CONNS
+    let removed = CONNS
         .write()
         .unwrap_or_else(|p| p.into_inner())
         .map
         .remove(&conn_id)
-        .is_some()
+        .is_some();
+    if removed {
+        let live = CONNS.read().unwrap_or_else(|p| p.into_inner()).map.len();
+        CONNS_LIVE.store(live, Ordering::Release);
+    }
+    removed
 }
+
+/// Live tracked-connection count (TASK-163): the per-packet `state_of` gate.
+static CONNS_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Advance the connection's protocol state; used by the handshake and
 /// protocol-swap hooks. Returns `false` (state unchanged) for unknown conns,
@@ -357,6 +377,11 @@ pub fn set_conn_state(conn_id: u64, state_code: u8) -> bool {
 /// Tracked protocol-state code for a connection, if any. Takes the registry
 /// READ lock only — the per-packet path never needs the write lock.
 pub fn state_of(conn_id: u64) -> Option<u8> {
+    // TASK-163 fast gate: zero tracked conns (before the first player) is
+    // one acquire load — no lock round-trip.
+    if CONNS_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     CONNS
         .read()
         .unwrap_or_else(|p| p.into_inner())
@@ -430,14 +455,28 @@ fn publish_counter(kind: CounterKind, total: u64) {
         CounterKind::Out => (&LAST_PUB_OUT, "network.packets_out"),
         CounterKind::Dropped => (&LAST_PUB_DROPPED, "network.dropped"),
     };
-    let now = now_ms();
-    let last = cell.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 1000
-        && cell
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        publish_metric(name, total as f64, Some("packets"), None);
+    // TASK-163: the In/Out throttle is COUNT-based (sample every 4096th
+    // packet) instead of wall-clock: the sampled value is the monotonic
+    // running total either way, and the per-packet path loses its
+    // SystemTime::now() vDSO call entirely. The Dropped counter stays
+    // wall-clock throttled — drops are rare, the clock is free there.
+    match kind {
+        CounterKind::In | CounterKind::Out => {
+            if total & 4095 == 0 {
+                publish_metric(name, total as f64, Some("packets"), None);
+            }
+        }
+        CounterKind::Dropped => {
+            let now = now_ms();
+            let last = cell.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 1000
+                && cell
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                publish_metric(name, total as f64, Some("packets"), None);
+            }
+        }
     }
 }
 
@@ -476,19 +515,23 @@ pub fn run_hooks(mut packet: Packet) -> Verdict {
     let total = dir_kind.0.fetch_add(1, Ordering::Relaxed) + 1;
     publish_counter(dir_kind.1, total);
 
-    let hooks = HOOKS
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    for h in hooks.iter() {
-        match h(&mut packet) {
-            Verdict::Pass => continue,
-            Verdict::Drop => {
-                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-                publish_counter(CounterKind::Dropped, dropped);
-                return Verdict::Drop;
+    // TASK-163 fast gate: with zero registered hooks — the default until a
+    // module adds one — skip the registry read lock and the Arc clone.
+    if PACKET_HOOKS_LIVE.load(Ordering::Acquire) > 0 {
+        let hooks = HOOKS
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for h in hooks.iter() {
+            match h(&mut packet) {
+                Verdict::Pass => continue,
+                Verdict::Drop => {
+                    let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    publish_counter(CounterKind::Dropped, dropped);
+                    return Verdict::Drop;
+                }
+                Verdict::Disconnect => return Verdict::Disconnect,
             }
-            Verdict::Disconnect => return Verdict::Disconnect,
         }
     }
     Verdict::Pass
@@ -567,9 +610,9 @@ mod tests {
 
     /// Serializes tests that touch global state (hooks, registry, counters,
     /// engine rules) which live for the whole test process.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn packet(direction: Direction, conn_id: u64, state: u8, payload: &[u8]) -> Packet {
+    pub(super) fn packet(direction: Direction, conn_id: u64, state: u8, payload: &[u8]) -> Packet {
         Packet {
             direction,
             state,
@@ -771,7 +814,7 @@ mod tests {
     /// force a full table. Drives each conn to Play through the legal
     /// Handshake -> Login -> Play path so later `set_conn_state` touches are
     /// legal self-transitions (the touch code must actually run).
-    fn bench_fill(range: u64) {
+    pub(super) fn bench_fill(range: u64) {
         for i in 0..range {
             attach_conn(i, None);
             set_conn_state(i, ProtocolState::Login.code());
@@ -780,7 +823,7 @@ mod tests {
     }
 
     /// Detach every id in `0..range` so later tests see an empty registry.
-    fn bench_drain(range: u64) {
+    pub(super) fn bench_drain(range: u64) {
         for i in 0..range {
             detach_conn(i);
         }
@@ -932,6 +975,67 @@ mod tests {
         bench_drain(64);
         println!(
             "BENCH run_hooks concurrent x{threads}: {:.0} ns/op (per-op wall, 1 hook, 64 conns, min of {rounds}x{iters}/t)",
+            best * 1e9
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_default_shape {
+    //! Release-only A/B bench (TASK-163): `cargo test --release -- --ignored --nocapture bench_packet_default`.
+    use super::*;
+    use super::tests::{bench_drain, bench_fill, packet, TEST_LOCK};
+    use std::time::Instant;
+
+    /// Per-packet cost on the production-default shape: zero plugin hooks,
+    /// zero connections (before the first player joins).
+    #[test]
+    #[ignore]
+    fn bench_run_hooks_default_shape() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        // warmup
+        for i in 0..10_000u64 {
+            let _ = run_hooks(packet(Direction::Inbound, i, 0, &[1, 2, 3]));
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = run_hooks(packet(Direction::Inbound, i, 0, &[1, 2, 3]));
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH run_hooks(default 0 hooks 0 conns): {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
+
+    /// Per-packet cost with live connections but still zero plugin hooks —
+    /// the steady state of a serving server without packet plugins.
+    #[test]
+    #[ignore]
+    fn bench_run_hooks_64conns_nohooks() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        bench_fill(64);
+        for i in 0..10_000u64 {
+            let _ = run_hooks(packet(Direction::Inbound, i % 64, 0, &[1, 2, 3]));
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = run_hooks(packet(Direction::Inbound, i % 64, 0, &[1, 2, 3]));
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        bench_drain(64);
+        println!(
+            "BENCH run_hooks(0 hooks, 64 conns): {:.0} ns/op (min of {rounds}x{iters})",
             best * 1e9
         );
     }

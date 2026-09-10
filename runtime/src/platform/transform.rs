@@ -60,6 +60,7 @@
 //!   JVMTI retransformation) does not double-instrument.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Where to inject the instrumented call.
@@ -120,12 +121,17 @@ pub struct TransformedClass {
 /// the snapshot.
 pub struct TransformEngine {
     rules: RwLock<Arc<[Arc<Rule>]>>,
+    /// Live rule count (TASK-163): the per-class-load fast gate reads this
+    /// instead of locking the rules RwLock. Release-bumped under the write
+    /// lock so a gate that observes >0 sees the rule through the lock.
+    live_rules: AtomicUsize,
 }
 
 impl TransformEngine {
     pub fn new() -> Self {
         Self {
             rules: RwLock::new(Arc::from(Vec::new())),
+            live_rules: AtomicUsize::new(0),
         }
     }
 
@@ -144,7 +150,14 @@ impl TransformEngine {
         }
         let mut v: Vec<Arc<Rule>> = rules.to_vec();
         v.push(Arc::new(rule));
+        let live = v.len();
         *rules = v.into();
+        self.live_rules.store(live, Ordering::Release);
+    }
+
+    /// Number of live rules — lock-free (TASK-163 per-class-load gate).
+    pub fn rule_count(&self) -> usize {
+        self.live_rules.load(Ordering::Acquire)
     }
 
     pub fn rules(&self) -> Vec<Arc<Rule>> {
