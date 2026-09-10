@@ -137,12 +137,14 @@
 //! by the intention packet / login success; configuration since 1.20.5);
 //! netty.io `ByteToMessageDecoder`/`MessageToByteEncoder` semantics; and the
 //! ProtocolLib/PacketEvents interception pattern (hook the codecs, not the
-//! listeners). The bounded LRU registry follows the standard
-//! `LinkedHashMap(accessOrder)` idiom, expressed with `VecDeque` + `HashMap`.
+//! listeners). The bounded LRU registry is a stamp-based design: a global
+//! monotonic clock stamps every touch (O(1)), eviction scans for the minimum
+//! stamp only on overflow, replacing the classic `LinkedHashMap(accessOrder)`
+//! idiom whose deque bookkeeping cost O(conns) per touch.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use super::publish_metric;
@@ -184,15 +186,19 @@ pub enum Verdict {
 
 pub type PacketHookFn = Arc<dyn Fn(&mut Packet) -> Verdict + Send + Sync>;
 
-static HOOKS: OnceLock<Mutex<Vec<PacketHookFn>>> = OnceLock::new();
+/// Hook registry: an atomically-swapped immutable snapshot. `add_hook`
+/// rebuilds the slice (rare, init-time); the per-packet path takes a read
+/// lock and clones ONE `Arc` (a single atomic increment) instead of locking
+/// a `Mutex` and cloning a `Vec` of hooks on every packet.
+static HOOKS: LazyLock<RwLock<Arc<[PacketHookFn]>>> =
+    LazyLock::new(|| RwLock::new(Arc::from(Vec::new())));
 
 /// Modules register packet hooks at init (order = registration order).
 pub fn add_hook(f: PacketHookFn) {
-    HOOKS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(f);
+    let mut w = HOOKS.write().unwrap_or_else(|p| p.into_inner());
+    let mut v = w.to_vec();
+    v.push(f);
+    *w = v.into();
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +249,7 @@ fn transition_legal(from: ProtocolState, to: ProtocolState) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-connection registry (bounded LRU)
+// Per-connection registry (stamp-based bounded LRU)
 // ---------------------------------------------------------------------------
 
 /// Hard cap on concurrently tracked connections; the oldest LRU entry is
@@ -262,59 +268,71 @@ pub struct ConnInfo {
 struct ConnEntry {
     player_uuid: Option<u128>,
     state: ProtocolState,
+    /// LRU stamp: a value from the process-global monotonic clock, taken at
+    /// the last touch. Larger = more recently used. An O(1) replacement for
+    /// the old VecDeque order (whose `position()` scan made every touch
+    /// O(conns) and every detach O(conns)).
+    stamp: u64,
 }
 
 #[derive(Default)]
 struct ConnRegistry {
     map: HashMap<u64, ConnEntry>,
-    /// LRU order: front = least recently used, back = most recently used.
-    order: VecDeque<u64>,
 }
 
-impl ConnRegistry {
-    fn touch(&mut self, conn_id: u64) {
-        if let Some(pos) = self.order.iter().position(|&c| c == conn_id) {
-            self.order.remove(pos);
-            self.order.push_back(conn_id);
-        }
-    }
-}
+/// Process-global LRU clock (one tick per touch; wraps after ~584M years of
+/// per-packet touches — not a concern).
+static LRU_CLOCK: AtomicU64 = AtomicU64::new(0);
 
-static CONNS: LazyLock<Mutex<ConnRegistry>> =
-    LazyLock::new(|| Mutex::new(ConnRegistry::default()));
+static CONNS: LazyLock<RwLock<ConnRegistry>> =
+    LazyLock::new(|| RwLock::new(ConnRegistry::default()));
+
+fn lru_touch(entry: &mut ConnEntry) {
+    entry.stamp = LRU_CLOCK.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Register a connection. A re-attach of a live conn only refreshes the
 /// player UUID and reports `false` (not newly created). Evicts the least
-/// recently used conn when the table is at [`MAX_CONNS`].
+/// recently used conn when the table is at [`MAX_CONNS`] (an O(n) scan, but
+/// only paid on overflow — never on the per-packet path).
 pub fn attach_conn(conn_id: u64, player_uuid: Option<u128>) -> bool {
-    let mut reg = CONNS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut reg = CONNS.write().unwrap_or_else(|p| p.into_inner());
     if let Some(entry) = reg.map.get_mut(&conn_id) {
         entry.player_uuid = player_uuid;
-        reg.touch(conn_id);
+        lru_touch(entry);
         return false;
     }
     if reg.map.len() >= MAX_CONNS {
-        if let Some(oldest) = reg.order.pop_front() {
+        if let Some((oldest, _)) = reg
+            .map
+            .iter()
+            .min_by_key(|(_, e)| e.stamp)
+            .map(|(k, e)| (*k, e.stamp))
+        {
             reg.map.remove(&oldest);
         }
     }
+    let stamp = LRU_CLOCK.fetch_add(1, Ordering::Relaxed);
     reg.map.insert(
         conn_id,
         ConnEntry {
             player_uuid,
             state: ProtocolState::Handshake,
+            stamp,
         },
     );
-    reg.order.push_back(conn_id);
     true
 }
 
 /// Forget a connection (called by the `onClose` hook on channel inactive).
-/// Returns `true` if the conn was tracked.
+/// Returns `true` if the conn was tracked. O(1) (was O(n) `retain`).
 pub fn detach_conn(conn_id: u64) -> bool {
-    let mut reg = CONNS.lock().unwrap_or_else(|p| p.into_inner());
-    reg.order.retain(|&c| c != conn_id);
-    reg.map.remove(&conn_id).is_some()
+    CONNS
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .map
+        .remove(&conn_id)
+        .is_some()
 }
 
 /// Advance the connection's protocol state; used by the handshake and
@@ -324,7 +342,7 @@ pub fn set_conn_state(conn_id: u64, state_code: u8) -> bool {
     let Some(to) = ProtocolState::from_code(state_code) else {
         return false;
     };
-    let mut reg = CONNS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut reg = CONNS.write().unwrap_or_else(|p| p.into_inner());
     let Some(entry) = reg.map.get_mut(&conn_id) else {
         return false;
     };
@@ -332,14 +350,15 @@ pub fn set_conn_state(conn_id: u64, state_code: u8) -> bool {
         return false;
     }
     entry.state = to;
-    reg.touch(conn_id);
+    lru_touch(entry);
     true
 }
 
-/// Tracked protocol-state code for a connection, if any.
+/// Tracked protocol-state code for a connection, if any. Takes the registry
+/// READ lock only — the per-packet path never needs the write lock.
 pub fn state_of(conn_id: u64) -> Option<u8> {
     CONNS
-        .lock()
+        .read()
         .unwrap_or_else(|p| p.into_inner())
         .map
         .get(&conn_id)
@@ -349,7 +368,7 @@ pub fn state_of(conn_id: u64) -> Option<u8> {
 /// Tracked details (uuid + state) for a connection, if any.
 pub fn conn_info(conn_id: u64) -> Option<ConnInfo> {
     CONNS
-        .lock()
+        .read()
         .unwrap_or_else(|p| p.into_inner())
         .map
         .get(&conn_id)
@@ -362,7 +381,7 @@ pub fn conn_info(conn_id: u64) -> Option<ConnInfo> {
 /// Number of currently tracked connections.
 pub fn conn_count() -> usize {
     CONNS
-        .lock()
+        .read()
         .unwrap_or_else(|p| p.into_inner())
         .map
         .len()
@@ -370,39 +389,33 @@ pub fn conn_count() -> usize {
 
 /// Tracked connection ids in LRU order (least recently used first).
 pub fn conns() -> Vec<u64> {
-    CONNS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .order
-        .iter()
-        .copied()
-        .collect()
+    let reg = CONNS.read().unwrap_or_else(|p| p.into_inner());
+    let mut rows: Vec<(u64, u64)> =
+        reg.map.iter().map(|(k, e)| (*k, e.stamp)).collect();
+    rows.sort_by_key(|(_, stamp)| *stamp);
+    rows.into_iter().map(|(id, _)| id).collect()
 }
 
 // ---------------------------------------------------------------------------
 // Telemetry counters
 // ---------------------------------------------------------------------------
 
-/// Coalescing interval for metric publishes: the snapshot sees the current
-/// totals at most once per second per counter.
-const COUNTER_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 static PACKETS_IN: AtomicU64 = AtomicU64::new(0);
 static PACKETS_OUT: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Default)]
-struct CounterPub {
-    last_in: Option<Instant>,
-    last_out: Option<Instant>,
-    last_dropped: Option<Instant>,
-}
+/// Last publish time (ms since process start) per counter. The per-packet
+/// path takes NO lock: a `compare_exchange` claims the once-per-second
+/// publish slot, so concurrent threads coalesce without a mutex.
+static LAST_PUB_IN: AtomicU64 = AtomicU64::new(0);
+static LAST_PUB_OUT: AtomicU64 = AtomicU64::new(0);
+static LAST_PUB_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-static COUNTER_PUB: Mutex<CounterPub> = Mutex::new(CounterPub {
-    last_in: None,
-    last_out: None,
-    last_dropped: None,
-});
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn now_ms() -> u64 {
+    START.elapsed().as_millis() as u64
+}
 
 enum CounterKind {
     In,
@@ -412,15 +425,18 @@ enum CounterKind {
 
 /// Publish the running total, coalesced to one push per second per counter.
 fn publish_counter(kind: CounterKind, total: u64) {
-    let mut pub_state = COUNTER_PUB.lock().unwrap_or_else(|p| p.into_inner());
-    let (slot, name) = match kind {
-        CounterKind::In => (&mut pub_state.last_in, "network.packets_in"),
-        CounterKind::Out => (&mut pub_state.last_out, "network.packets_out"),
-        CounterKind::Dropped => (&mut pub_state.last_dropped, "network.dropped"),
+    let (cell, name) = match kind {
+        CounterKind::In => (&LAST_PUB_IN, "network.packets_in"),
+        CounterKind::Out => (&LAST_PUB_OUT, "network.packets_out"),
+        CounterKind::Dropped => (&LAST_PUB_DROPPED, "network.dropped"),
     };
-    let now = Instant::now();
-    if slot.is_none_or(|t| now.duration_since(t) >= COUNTER_PUBLISH_INTERVAL) {
-        *slot = Some(now);
+    let now = now_ms();
+    let last = cell.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 1000
+        && cell
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
         publish_metric(name, total as f64, Some("packets"), None);
     }
 }
@@ -445,6 +461,10 @@ pub fn packet_counters() -> (u64, u64, u64) {
 /// every packet; a hook returning [`Verdict::Drop`] bumps and publishes
 /// `network.dropped`; [`Verdict::Disconnect`] stops the chain and the adapter
 /// kicks the conn with `packet.disconnect_reason`.
+///
+/// Hot-path discipline: no allocation, no Mutex — the hooks snapshot is one
+/// `Arc` clone off an immutable slice, the registry read is a `RwLock` read,
+/// and counter publishes are atomic CAS claims.
 pub fn run_hooks(mut packet: Packet) -> Verdict {
     if let Some(state) = state_of(packet.conn_id) {
         packet.state = state;
@@ -457,10 +477,10 @@ pub fn run_hooks(mut packet: Packet) -> Verdict {
     publish_counter(dir_kind.1, total);
 
     let hooks = HOOKS
-        .get()
-        .map(|m| m.lock().unwrap().clone())
-        .unwrap_or_default();
-    for h in hooks {
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    for h in hooks.iter() {
         match h(&mut packet) {
             Verdict::Pass => continue,
             Verdict::Drop => {
