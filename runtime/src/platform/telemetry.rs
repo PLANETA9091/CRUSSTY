@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,8 +52,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::OnceLock;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::thread;
 
@@ -108,6 +107,12 @@ static TPS: Mutex<TpsWindow> = Mutex::new(TpsWindow {
     samples: VecDeque::new(),
     sum_ns: 0,
 });
+
+/// Last TPS value as raw f64 bits (TASK-162): the per-tick store is a single
+/// relaxed atomic write — no snapshot lock, no Arc clone, no inner mutex.
+/// `snapshot()` overlays this onto the returned Snapshot, so readers see the
+/// latest value exactly as before; the static starts at 0 bits = 0.0 f64.
+static TPS_LAST_BITS: AtomicU64 = AtomicU64::new(0);
 
 /// Ticks older than this fall out of the TPS window.
 const TPS_WINDOW_SECS: u64 = 60;
@@ -192,10 +197,14 @@ fn snapshot_arc() -> Arc<Mutex<Snapshot>> {
 }
 
 pub fn snapshot() -> Snapshot {
-    snapshot_arc()
+    let mut s = snapshot_arc()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .clone()
+        .clone();
+    // TASK-162 overlay: `set_tps` no longer locks the snapshot, so the
+    // latest TPS rides on the atomic and lands here at read time.
+    s.tps = current_tps();
+    s
 }
 
 /// Modules publish metrics; the panel reads them in the snapshot.
@@ -219,11 +228,43 @@ pub fn publish_metric(
     });
 }
 
+/// Store the latest TPS. Per-tick hot path (TASK-162): one relaxed atomic
+/// store — the value lands in [`snapshot`] via the overlay below.
 pub fn set_tps(v: f64) {
-    snapshot_arc()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .tps = v;
+    TPS_LAST_BITS.store(v.to_bits(), Ordering::Relaxed);
+}
+
+/// Read the current TPS without touching any lock (for hot readers).
+fn current_tps() -> f64 {
+    f64::from_bits(TPS_LAST_BITS.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod bench_hotpath {
+    //! Release-only A/B bench: `cargo test --release -- --ignored --nocapture bench_push_tick`.
+    use super::*;
+
+    /// Per-tick ingestion cost (TASK-162 before/after subject): the path
+    /// every server tick pays — window push + TPS store.
+    #[test]
+    #[ignore]
+    fn bench_push_tick_time() {
+        push_tick_time(16_666_667); // pre-touch: snapshot/window init off the clock
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for i in 0..iters {
+                push_tick_time(16_666_667 + u64::from(i % 1_000));
+            }
+            best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH telemetry: push_tick_time {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
 }
 
 pub fn set_mem(used_mb: u64, max_mb: u64) {
@@ -258,9 +299,17 @@ pub fn set_server_name(name: &str) {
 /// sliding 1-minute window automatically updates the snapshot TPS as
 /// tps = 1000 / avg_ms.
 pub fn push_tick_time(tick_ns: u64) {
+    push_tick_time_at(Instant::now(), tick_ns);
+}
+
+/// Same ingestion with a caller-supplied timestamp: the tick boundary has
+/// already read the clock when it computes the tick duration, so the window
+/// reuses that instant instead of paying a second clock read per tick
+/// (TASK-162).
+pub fn push_tick_time_at(at: Instant, tick_ns: u64) {
     let tps = {
         let mut w = TPS.lock().unwrap_or_else(|p| p.into_inner());
-        w.push(Instant::now(), tick_ns);
+        w.push(at, tick_ns);
         w.tps()
     };
     set_tps(tps);
@@ -457,6 +506,7 @@ mod tests {
     fn reset_state() {
         *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
         TPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        TPS_LAST_BITS.store(0, Ordering::Relaxed);
     }
 
     #[test]

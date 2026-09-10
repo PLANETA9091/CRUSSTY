@@ -393,6 +393,14 @@ pub struct EventBus {
     /// async-registry lock + snapshot entirely in the common no-async case.
     /// Maintained by `subscribe_async` / `unsubscribe` / `purge_owner`.
     async_count: Arc<AtomicUsize>,
+    /// Total live subscription count across BOTH registries (TASK-162).
+    /// Zero is the production default, so `publish` / `has_subscribers` use
+    /// it as a lock-free fast gate: one relaxed load instead of two mutex
+    /// acquisitions plus a registry scan. Maintained by `subscribe`,
+    /// `subscribe_async`, `unsubscribe` and `purge_owner` — the invariant is
+    /// total == (sync entries + async entries), so gate > 0 always falls back
+    /// to the exact registry path (conservative, never wrong).
+    total_subs: Arc<AtomicUsize>,
 }
 
 static GLOBAL: OnceLock<EventBus> = OnceLock::new();
@@ -418,6 +426,7 @@ impl EventBus {
                 owner,
             )
         };
+        self.total_subs.fetch_add(1, Ordering::SeqCst);
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
     }
@@ -438,6 +447,7 @@ impl EventBus {
             )
         };
         self.async_count.fetch_add(1, Ordering::SeqCst);
+        self.total_subs.fetch_add(1, Ordering::SeqCst);
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
     }
@@ -454,6 +464,7 @@ impl EventBus {
         }
         let removed = removed_sync + removed_async;
         if removed > 0 {
+            self.total_subs.fetch_sub(removed, Ordering::SeqCst);
             eprintln!(
                 "[crussty:events] purge: dropped {removed} subscription(s) owned by '{}' gen {}",
                 owner.0, owner.1
@@ -467,6 +478,12 @@ impl EventBus {
     /// no handler snapshot — so hot paths (e.g. the class-load hook) can
     /// skip building a payload entirely when nobody listens.
     pub fn has_subscribers(&self, event: &str) -> bool {
+        // Lock-free fast gate (TASK-162): zero subscriptions is the default
+        // steady state — one relaxed load beats two mutex acquisitions plus
+        // a registry scan.
+        if self.total_subs.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
         let any = |registry: &Mutex<Registry>| {
             let r = lock(registry);
             r.exact.contains_key(event)
@@ -490,6 +507,7 @@ impl EventBus {
             removed_async
         };
         if removed {
+            self.total_subs.fetch_sub(1, Ordering::SeqCst);
             self.emit_lifecycle(lifecycle::EVENT_UNSUBSCRIBED, event, token.id);
         }
         removed
@@ -499,6 +517,12 @@ impl EventBus {
     /// Async handlers for this event are queued as one task and dispatched
     /// on the pool.
     pub fn publish(&self, event: &str, payload: &Value) -> usize {
+        // Lock-free fast gate (TASK-162): nothing subscribed anywhere —
+        // exactly one relaxed load instead of locking the sync registry and
+        // scanning it. This is the per-tick / per-class-load default shape.
+        if self.total_subs.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
         let handlers = lock(&self.handlers).snapshot(event);
         let invoked = dispatch(&handlers, event, payload);
         // Fast path (TASK-161): with no async subscriptions — the default —
@@ -599,6 +623,7 @@ mod tests {
             next_id: Arc::new(AtomicU64::new(0)),
             emitting_lifecycle: Arc::new(AtomicBool::new(false)),
             async_count: Arc::new(AtomicUsize::new(0)),
+            total_subs: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1000,11 +1025,27 @@ mod bench_hotpath {
             }
             best_glob = best_glob.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
+        // has_subscribers on a completely empty bus — the production global
+        // default shape (TASK-162 gate subject). Fresh bus so the gate, not
+        // the registry scan, is what the number reflects.
+        let empty = with_cap(64);
+        for _ in 0..10_000u32 {
+            let _ = empty.has_subscribers("platform.tick_boundary");
+        }
+        let mut best_empty = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = empty.has_subscribers("platform.tick_boundary");
+            }
+            best_empty = best_empty.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
         println!(
-            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_one * 1e9,
-            best_glob * 1e9
+            best_glob * 1e9,
+            best_empty * 1e9
         );
     }
 }

@@ -319,10 +319,13 @@ pub fn on_tick_boundary() -> usize {
         bus.publish(TICK_BOUNDARY, &json!({ "tick": tick, "drained": drained }));
     }
     let epoch = *MONO_EPOCH.get_or_init(Instant::now);
-    let now_ns = u64::try_from(now().duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+    // One clock read per tick (TASK-162): the boundary duration and the TPS
+    // window timestamp share this instant instead of paying a second read.
+    let at = now();
+    let now_ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
     let prev = LAST_BOUNDARY_NS.swap(now_ns, Ordering::Relaxed);
     if prev != u64::MAX {
-        push_tick_sample(now_ns.saturating_sub(prev));
+        push_tick_sample_at(at, now_ns.saturating_sub(prev));
     }
     drained
 }
@@ -343,12 +346,13 @@ fn now() -> Instant {
 /// [`on_tick_boundary`] so test builds record samples locally instead of
 /// mutating the process-global window (see the module docs, "Test seam").
 #[cfg(not(test))]
-fn push_tick_sample(ns: u64) {
-    crate::platform::telemetry::push_tick_time(ns);
+fn push_tick_sample_at(at: Instant, ns: u64) {
+    crate::platform::telemetry::push_tick_time_at(at, ns);
 }
 
 #[cfg(test)]
-fn push_tick_sample(ns: u64) {
+fn push_tick_sample_at(at: Instant, ns: u64) {
+    let _ = at; // the local window records durations only
     TICK_SAMPLES.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(ns);
 }
 
