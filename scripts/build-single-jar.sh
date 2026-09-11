@@ -28,18 +28,33 @@ cp libcrussty_runtime.so "$stage/"
 
 # Modules are published as release bundles (see PLANETA9091/crussty-catalog);
 # fetch every linux-x64 entry and unpack it into the jar.
+#
+# The catalog INDEX (catalog.json) lives in the private PLANETA9091/
+# crussty-catalog repo — an anonymous fetch 404s (TASK-168: this silently
+# red-ed e2e stage 7 on every commit since it landed). When CATALOG_TOKEN is
+# set (a PAT with read access to that repo; wired in e2e.yml) it authenticates
+# the index fetch; module release assets themselves are public. An
+# unreachable index exits 42 = "catalog unavailable", which e2e.sh reports as
+# an honest stage-7 SKIP instead of a red run.
 CATALOG=https://raw.githubusercontent.com/PLANETA9091/crussty-catalog/main/catalog.json
-curl -fsSL --retry 3 --retry-delay 2 "$CATALOG" -o "$stage/catalog.json"
+if [ -n "${CATALOG_TOKEN:-}" ]; then
+    AUTH=(-H "Authorization: Bearer $CATALOG_TOKEN")
+else
+    AUTH=()
+fi
+curl -fsSL --retry 3 --retry-delay 2 "${AUTH[@]}" "$CATALOG" -o "$stage/catalog.json" || exit 42
 python3 - "$stage/catalog.json" "$stage/modules" <<'PY'
 import io, json, os, subprocess, sys, tarfile
 entries = json.load(open(sys.argv[1]))
 mods = sys.argv[2]
 os.makedirs(mods, exist_ok=True)
+tok = os.environ.get("CATALOG_TOKEN", "")
+auth = ["-H", f"Authorization: Bearer {tok}"] if tok else []
 for e in entries:
     if e.get("platform") != "linux-x64":
         continue
     print("fetching", e["id"], e["url"])
-    data = subprocess.check_output(["curl", "-fsSL", e["url"]])
+    data = subprocess.check_output(["curl", "-fsSL", *auth, e["url"]])
     tarfile.open(fileobj=io.BytesIO(data), mode="r:gz").extractall(mods)
 PY
 

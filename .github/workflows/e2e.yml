@@ -34,6 +34,11 @@ jobs:
 
       - name: E2E (boot purpur, markers, hot-reload, stop)
         run: bash scripts/e2e.sh
+        env:
+          # Optional PAT with read access to the private PLANETA9091/crussty-catalog
+          # repo (module catalog index for the single-jar distribution stage).
+          # Without it stage 7 is reported as an honest SKIP, not a failure.
+          CATALOG_TOKEN: ${{ secrets.CATALOG_TOKEN }}
 
       - name: Upload e2e logs on failure
         if: failure()

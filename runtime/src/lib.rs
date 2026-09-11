@@ -15,6 +15,7 @@
 pub mod platform;
 mod scan;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
@@ -62,16 +63,24 @@ pub fn mark_hook_classes_ready() {
     HOOK_CLASSES_READY.store(true, Ordering::Relaxed);
 }
 
-/// Registration context: the module (id, library generation) whose
-/// `cplugin_init` handshake is currently on this thread. Class hooks and
-/// event subscriptions registered during the handshake are stamped with
-/// this owner; a hot reload later purges registrations by owner, so the
-/// replaced generation's hooks/subscriptions are dropped exactly, without
-/// touching hooks of other modules or of the new generation.
-static REG_CTX: OnceLock<Mutex<Option<(String, u64)>>> = OnceLock::new();
-
-fn reg_ctx() -> &'static Mutex<Option<(String, u64)>> {
-    REG_CTX.get_or_init(|| Mutex::new(None))
+// Registration context: the module (id, library generation) whose
+// `cplugin_init` handshake is currently running **on this thread**. Class
+// hooks and event subscriptions registered during the handshake are
+// stamped with this owner; a hot reload later purges registrations by
+// owner, so the replaced generation's hooks/subscriptions are dropped
+// exactly, without touching hooks of other modules or of the new
+// generation.
+//
+// Thread-local by contract (TASK-168): a handshake window on the loader
+// thread must never stamp registrations made by other threads — parallel
+// module loads, background publishers or unrelated bus subscribers. The
+// previous implementation kept this in a process-global mutex, which let a
+// concurrent handshake on thread A stamp thread B's subscriptions (caught
+// red-handed by the TASK-167 concurrent memo test in CI: a parallel test
+// window stamped the test bus's subscriptions, and the mid-swap guard then
+// skipped them).
+thread_local! {
+    static REG_CTX: Cell<Option<(String, u64)>> = const { Cell::new(None) };
 }
 
 /// RAII guard: while alive, every class hook / event subscription
@@ -83,37 +92,36 @@ pub struct RegistrationGuard {
 
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
-        let prev = self.prev.clone();
-        *reg_ctx().lock().unwrap() = prev.clone();
-        REG_CTX_SET.store(prev.is_some(), Ordering::Release);
+        let prev = self.prev.take();
+        REG_CTX.with(|c| c.set(prev));
     }
 }
 
 /// Start a module registration window (see [`RegistrationGuard`]).
 pub fn begin_registration(id: &str, gen: u64) -> RegistrationGuard {
-    let mut ctx = reg_ctx().lock().unwrap();
-    let prev = ctx.clone();
-    *ctx = Some((id.to_string(), gen));
-    drop(ctx);
-    REG_CTX_SET.store(true, Ordering::Release);
+    let prev = REG_CTX.with(|c| {
+        let prev = c.take();
+        c.set(Some((id.to_string(), gen)));
+        prev
+    });
     RegistrationGuard { prev }
 }
 
-/// The owner stamp applied to registrations made right now (from a module
-/// handshake), or `None` outside any.
+/// The owner stamp applied to registrations made right now on this thread
+/// (from a module handshake), or `None` outside any.
 pub fn registration_owner() -> Option<(String, u64)> {
-    // Lock-free fast gate (TASK-163): outside any registration window — the
-    // state of every thread that is not literally inside a module handshake
-    // — the answer is None and needs no mutex round-trip.
-    if !REG_CTX_SET.load(Ordering::Acquire) {
-        return None;
-    }
-    reg_ctx().lock().unwrap().clone()
+    // take/put-back on a `Cell<Option<(String, u64)>>`: no locks, no borrow
+    // flags, no allocation outside a live window (where the clone is a
+    // one-time registration-time cost). ~1 TLS access — see the TASK-166
+    // TLS law; the former global-mutex fast gate (REG_CTX_SET) is gone: the
+    // TLS read IS the gate now.
+    REG_CTX.with(|c| {
+        let cur = c.take();
+        let out = cur.clone();
+        c.set(cur);
+        out
+    })
 }
-
-/// True while some thread is inside a registration window (TASK-163 gate
-/// mirror of `reg_ctx`).
-static REG_CTX_SET: AtomicBool = AtomicBool::new(false);
 
 /// Drop every hook registered by module `id` of library generation `gen` —
 /// the generation a hot reload is replacing. Idempotent; other owners are
@@ -1169,6 +1177,43 @@ mod claim_tests {
         assert_eq!(claim(0x11, "class:a/b/C"), 0); // idempotent, same owner
         assert_eq!(claim(0x22, "class:a/b/C"), -1); // other module: refused
         assert_eq!(claim(0x22, "class:a/b/D"), 0); // different key: fine
+    }
+
+    #[test]
+    fn registration_window_is_thread_local() {
+        // TASK-168 regression: a handshake window on thread A must never
+        // stamp registrations (or owner queries) made on thread B. The
+        // pre-TASK-168 global REG_CTX leaked the window across threads and
+        // broke the TASK-167 concurrent memo test in CI.
+        assert_eq!(registration_owner(), None, "clean thread starts unowned");
+        let _g = begin_registration("tlocal", 3);
+        assert_eq!(registration_owner(), Some(("tlocal".to_string(), 3)));
+        let other = std::thread::spawn(|| {
+            assert_eq!(
+                registration_owner(),
+                None,
+                "another thread's window must be invisible here"
+            );
+            // Subscriptions made on this thread stay unowned even while the
+            // first thread's window is open: an owner purge for that window
+            // must not touch them.
+            let bus = platform::events::EventBus::default();
+            bus.subscribe("tlocal.evt", std::sync::Arc::new(|_, _| {}));
+            assert_eq!(
+                bus.purge_owner(&("tlocal".to_string(), 3)),
+                0,
+                "subscription must be unowned: another thread's window is invisible"
+            );
+            assert_eq!(bus.publish("tlocal.evt", &serde_json::json!(null)), 1);
+        });
+        other.join().unwrap();
+        assert_eq!(
+            registration_owner(),
+            Some(("tlocal".to_string(), 3)),
+            "window intact on the owning thread"
+        );
+        drop(_g);
+        assert_eq!(registration_owner(), None, "guard drop restores None");
     }
 }
 

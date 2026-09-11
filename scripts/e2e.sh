@@ -272,9 +272,24 @@ stage "7. single-jar boot (java -jar, no -agentpath) + reload"
 # runtime + modules through Boot.java and loads them via JNI_OnLoad. The
 # pgrep matcher differs from stage 5 (jar is named crussty-*.jar, not
 # purpur-*.jar), so this stage is the only automated coverage of that path.
+# TASK-168: the module catalog index lives in the private crussty-catalog
+# repo — when it is unreachable (no CATALOG_TOKEN secret, repo still
+# private) build-single-jar.sh exits 42 and the stage is SKIPPED honestly
+# instead of silently red-ed on every commit. Everything else still fails
+# the run.
 SJ_PORT="$(free_port 25600)" || fail "no free port found in range (single-jar)"
-bash scripts/build-single-jar.sh "$PURPUR_VERSION" >/dev/null 2>&1 \
-    || fail "build-single-jar.sh failed"
+set +e
+bash scripts/build-single-jar.sh "$PURPUR_VERSION" >/dev/null 2>&1
+SJ_BUILD_RC=$?
+set -e
+SJ_SKIPPED=0
+if [ "$SJ_BUILD_RC" -eq 42 ]; then
+    SJ_SKIPPED=1
+    log "STAGE 7 SKIPPED: module catalog unreachable (crussty-catalog is private; add a CATALOG_TOKEN repo secret with read access or make the repo public)"
+elif [ "$SJ_BUILD_RC" -ne 0 ]; then
+    fail "build-single-jar.sh failed (rc=$SJ_BUILD_RC)"
+fi
+if [ "$SJ_SKIPPED" -eq 0 ]; then
 SJ_DIR="$SERIAL_DIR/sjrun"
 mkdir -p "$SJ_DIR"
 SJ_JAR="$REPO/dist/crussty-$PURPUR_VERSION.jar"
@@ -322,6 +337,7 @@ kill -0 "$SJ_PID" 2>/dev/null || fail "single-jar server died during hot-reload 
 [ "$found_sj_purge" -eq 1 ] || fail "single-jar stale hooks not purged (reload=$found_sj_reload purge=$found_sj_purge)"
 log "single-jar hot-reload ok: reloaded=$found_sj_reload hook-purge=$found_sj_purge"
 kill -TERM -- "$SJ_PID" 2>/dev/null || true
+fi # SJ_SKIPPED == 0 (stage 7 body)
 
 echo
 echo "================ E2E PASS ================"
@@ -330,6 +346,6 @@ echo "  modules:   $MODULES"
 echo "  pipeline:  ready"
 echo "  hello:     from native c-plugin"
 echo "  crussty:   $([ "$found_native" -eq 1 ] && echo "native surface live" || echo "NOT verified (check modules/crussty/native/)")"
-echo "  single-jar: boot + hot-reload ok"
+echo "  single-jar: $([ "$SJ_SKIPPED" -eq 1 ] && echo "SKIPPED (catalog unreachable; add CATALOG_TOKEN secret)" || echo "boot + hot-reload ok")"
 echo "  boot time: $((SECONDS - START))s"
 exit 0
