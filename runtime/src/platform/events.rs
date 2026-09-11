@@ -1493,12 +1493,64 @@ mod bench_hotpath {
             }
             best_empty = best_empty.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
+        // one async subscriber — characterizes the full enqueue path
+        // (TASK-169): resolve + guards + task alloc + pool.push (Mutex +
+        // condvar notify). The number includes the worker wake cost: the
+        // honest per-publish price of the async pool as built.
+        let _atok = bus.subscribe_async("bench.async", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            let _ = bus.publish("bench.async", &payload);
+        }
+        let mut best_async = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish("bench.async", &payload);
+            }
+            best_async = best_async.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        // pool.push isolated from queue_async (TASK-169): (a) build-only
+        // per-op cost of one AsyncTask (to_string + Value clone + allocs),
+        // (b) build + push — the delta is the enqueue critical section
+        // (Mutex + push_back + condvar notify, including the worker wake).
+        let pool = Arc::clone(&bus.pool);
+        let build_task = || AsyncTask {
+            event: "bench.async".into(),
+            payload: payload.clone(),
+            leaders: Vec::new(),
+            handlers: Arc::from(Vec::new()),
+        };
+        for _ in 0..10_000u32 {
+            drop(build_task());
+        }
+        let mut best_build = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                drop(build_task());
+            }
+            best_build = best_build.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        for _ in 0..10_000u32 {
+            pool.push(build_task());
+        }
+        let mut best_push = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                pool.push(build_task());
+            }
+            best_push = best_push.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
         println!(
-            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op, publish(1 async sub) {:.0} ns/op, task build {:.0} ns/op, task build+push {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_one * 1e9,
             best_glob * 1e9,
-            best_empty * 1e9
+            best_empty * 1e9,
+            best_async * 1e9,
+            best_build * 1e9,
+            best_push * 1e9
         );
     }
 }
