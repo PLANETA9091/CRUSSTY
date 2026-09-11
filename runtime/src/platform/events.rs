@@ -350,8 +350,25 @@ impl RegistryView {
     /// Exact matches first, then patterns in insertion order — the dispatch
     /// order guarantee.
     fn resolve(&self, hash: u64, event: &str) -> Resolved {
+        let exact = self.exact_find(hash, event);
+        // TASK-175 fast path (RESOLVE_SHARED_EXACT A/B toggle): with no
+        // patterns registered the dispatch list is EXACTLY the precomputed
+        // exact-topic slice (built once at mutation time, TASK-164) — share
+        // it with one atomic increment instead of rebuilding a
+        // byte-identical Vec + Arc on every call. queue_async bypasses the
+        // sync-path memo, so every async publish paid a Vec alloc + Arc
+        // inner alloc here plus the worker-side Arc dealloc; a zero match
+        // additionally returns a shared static empty list (no Arc-header
+        // alloc). The patterned case keeps the full build: mixed
+        // exact+pattern concat order is unchanged.
+        if RESOLVE_SHARED_EXACT && self.patterns.is_empty() {
+            return match exact {
+                Some(list) => Arc::clone(list),
+                None => empty_resolved(),
+            };
+        }
         let mut out: Vec<(Option<(Box<str>, u64)>, Handler)> = Vec::new();
-        if let Some(list) = self.exact_find(hash, event) {
+        if let Some(list) = exact {
             out.extend(list.iter().cloned());
         }
         for p in &self.patterns {
@@ -361,6 +378,13 @@ impl RegistryView {
         }
         Arc::from(out)
     }
+}
+
+/// Shared empty dispatch list: zero-match resolves clone one static Arc
+/// instead of building and dropping an Arc header per call (TASK-175).
+fn empty_resolved() -> Resolved {
+    static EMPTY: OnceLock<Resolved> = OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
 }
 
 /// Writer-side registry + RCU-published immutable view (TASK-164). Every
@@ -590,6 +614,12 @@ const INLINE_EVENT_CAP: usize = 23;
 /// unconditionally (round-13 baseline). See queue_async for the
 /// correctness argument.
 const ASYNC_LEADERS_ZEROALLOC: bool = true;
+
+/// TASK-175 A/B toggle: when true, resolve() on a patternless view shares
+/// the precomputed exact-topic Arc (one atomic increment) instead of
+/// rebuilding an identical Vec + Arc per call; when false, the full build
+/// runs unconditionally (round-14 baseline). See RegistryView::resolve.
+const RESOLVE_SHARED_EXACT: bool = true;
 
 /// Heap-free event-name storage for queued async tasks (TASK-173): the
 /// build path previously paid one `to_string()` allocation (and the worker
