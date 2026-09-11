@@ -576,9 +576,55 @@ fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved
     }
 }
 
+/// TASK-173 A/B toggle: when true, an AsyncTask event name up to
+/// INLINE_EVENT_CAP bytes is stored inline in the task (heap-free build
+/// path); when false, every name is boxed (round-12 allocation baseline).
+/// Both modes compile to the same struct layout, so the A/B isolates the
+/// allocation, not a type-size delta between variants.
+const ASYNC_EVENT_INLINE: bool = true;
+const INLINE_EVENT_CAP: usize = 23;
+
+/// Heap-free event-name storage for queued async tasks (TASK-173): the
+/// build path previously paid one `to_string()` allocation (and the worker
+/// paid its deallocation) per task. Names up to 23 bytes live in the task's
+/// own footprint; longer names fall back to a boxed `str` — never
+/// truncated, handler-visible names are byte-exact in both variants.
+enum InlineEvent {
+    Inline { len: u8, buf: [u8; INLINE_EVENT_CAP] },
+    Heap(Box<str>),
+}
+
+impl From<&str> for InlineEvent {
+    #[inline]
+    fn from(s: &str) -> Self {
+        if ASYNC_EVENT_INLINE && s.len() <= INLINE_EVENT_CAP {
+            let mut buf = [0u8; INLINE_EVENT_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            InlineEvent::Inline { len: s.len() as u8, buf }
+        } else {
+            InlineEvent::Heap(Box::from(s))
+        }
+    }
+}
+
+impl InlineEvent {
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            InlineEvent::Inline { len, buf } => {
+                // SAFETY: the bytes were copied verbatim from a valid `&str`
+                // (UTF-8 by construction) and are only ever read back through
+                // this slice of exactly `len` bytes.
+                unsafe { std::str::from_utf8_unchecked(&buf[..*len as usize]) }
+            }
+            InlineEvent::Heap(s) => s,
+        }
+    }
+}
+
 /// One queued unit of async work: the handler snapshot for a single publish.
 struct AsyncTask {
-    event: String,
+    event: InlineEvent,
     payload: Value,
     /// Phantom guards keep the module mappings alive while their handlers
     /// sit in the queue or run: a reload cannot dlclose a module whose async
@@ -704,16 +750,19 @@ impl AsyncPool {
                 // into unloaded code.
                 eprintln!(
                     "[crussty:events] async handler for '{}' skipped: module '{}' is being reloaded",
-                    task.event,
+                    task.event.as_str(),
                     owner.as_ref().expect("owner checked").0
                 );
                 leader_index += 1;
                 continue;
             }
             leader_index += 1;
-            let result = catch_unwind(AssertUnwindSafe(|| handler(&task.event, &task.payload)));
+            let result = catch_unwind(AssertUnwindSafe(|| handler(task.event.as_str(), &task.payload)));
             if let Err(panic) = result {
-                eprintln!("[crussty:events] async handler panicked for '{}': {panic:?}", task.event);
+                eprintln!(
+                    "[crussty:events] async handler panicked for '{}': {panic:?}",
+                    task.event.as_str()
+                );
             }
         }
     }
@@ -979,7 +1028,7 @@ impl EventBus {
             })
             .collect();
         self.pool.push(AsyncTask {
-            event: event.to_string(),
+            event: event.into(),
             payload: payload.clone(),
             leaders,
             handlers: list,
@@ -1069,6 +1118,23 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn inline_event_stores_byte_exact_names() {
+        // Round-trip through both variants: short names take the inline
+        // path under the A/B toggle, longer names (24 bytes) must fall
+        // back to the heap variant without truncation — handler-visible
+        // names are byte-exact in every case.
+        let short = InlineEvent::from("bench.async");
+        let boundary = InlineEvent::from("x".repeat(INLINE_EVENT_CAP).as_str());
+        let overflow = InlineEvent::from("platform.plugin_unloaded");
+        assert_eq!(short.as_str(), "bench.async");
+        assert_eq!(boundary.as_str().len(), INLINE_EVENT_CAP);
+        assert_eq!(overflow.as_str(), "platform.plugin_unloaded");
+        // Multibyte UTF-8 must survive the byte copy (len is bytes).
+        let multibyte = InlineEvent::from("событие");
+        assert_eq!(multibyte.as_str(), "событие");
+    }
 
     pub(super) fn with_cap(cap: usize) -> EventBus {
         let gens = Arc::new(AtomicU64::new(0));
