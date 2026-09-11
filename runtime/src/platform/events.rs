@@ -592,6 +592,19 @@ struct AsyncPool {
     dropping: AtomicBool,
     dropped: AtomicUsize,
     workers: OnceLock<()>,
+    /// Registered-idle worker count (TASK-170). A worker increments this
+    /// while HOLDING the queue lock in the instant before it commits to
+    /// `condvar.wait`, and decrements right after wake (also under the
+    /// lock). Every access is serialized by the queue mutex, so a pusher
+    /// that observes `idle == 0` while holding the lock knows every worker
+    /// is inside the pop loop and will re-check the queue under the same
+    /// lock before sleeping — the notify can then be skipped with no
+    /// missed-wakeup window: any thread counted in `idle` is guaranteed
+    /// to re-check the queue before its next sleep, and that re-check
+    /// sees the pushed task. Notifying a condvar with no waiter is still
+    /// a futex wake syscall (~0.3-3.5us measured) — under saturation every
+    /// push paid it for nothing.
+    idle: AtomicUsize,
 }
 
 impl AsyncPool {
@@ -603,6 +616,7 @@ impl AsyncPool {
             dropping: AtomicBool::new(false),
             dropped: AtomicUsize::new(0),
             workers: OnceLock::new(),
+            idle: AtomicUsize::new(0),
         }
     }
 
@@ -631,12 +645,25 @@ impl AsyncPool {
         let mut queue = lock(&self.queue);
         loop {
             if let Some(task) = queue.pop_front() {
-                if queue.len() < self.cap {
+                // Hysteresis (TASK-170): the drop-burst latch used to reset
+                // on EVERY pop that took len below cap, so under sustained
+                // saturation the capacity warning re-armed at pop frequency
+                // — a log flood that itself cost throughput and made the
+                // saturated regime unmeasurable. Reset only when the queue
+                // genuinely drains (below half capacity): one eprintln per
+                // overload episode.
+                if queue.len() < self.cap / 2 {
                     self.dropping.store(false, Ordering::SeqCst);
                 }
                 return task;
             }
+            // Register idle while still holding the lock (TASK-170), then
+            // commit to the wait; decrement as soon as it returns so the
+            // count never includes an awake worker for longer than the
+            // wake-to-decrement window.
+            self.idle.fetch_add(1, Ordering::SeqCst);
             queue = self.condvar.wait(queue).unwrap_or_else(|p| p.into_inner());
+            self.idle.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -974,6 +1001,8 @@ impl AsyncPool {
             }
         }
         queue.push_back(task);
+        // TEMP A/B (TASK-170): gate OFF variant — unconditional notify.
+        let _ = self.idle.load(Ordering::SeqCst);
         self.condvar.notify_one();
     }
 }
@@ -1542,15 +1571,40 @@ mod bench_hotpath {
             }
             best_push = best_push.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
+        // Saturated regime (TASK-170): the handler does real work so the
+        // publisher outpaces the pool; the queue sits at capacity and
+        // drop-oldest sheds. This is the shape where the notify cost
+        // (empty-waiter futex wake per push) and the drop-latch log policy
+        // show their true per-op price. Warmup must reach saturation
+        // (queue full) before the timed rounds start.
+        let _slok = bus.subscribe_async("bench.async.slow", Arc::new(|_, _| {
+            let mut x = 0u64;
+            for i in 0..20_000u64 {
+                x = x.wrapping_add(i.wrapping_mul(7));
+            }
+            std::hint::black_box(x);
+        }));
+        for _ in 0..30_000u32 {
+            let _ = bus.publish("bench.async.slow", &payload);
+        }
+        let mut best_sat = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish("bench.async.slow", &payload);
+            }
+            best_sat = best_sat.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
         println!(
-            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op, publish(1 async sub) {:.0} ns/op, task build {:.0} ns/op, task build+push {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op, publish(1 async sub) {:.0} ns/op, task build {:.0} ns/op, task build+push {:.0} ns/op, publish(1 async saturated) {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_one * 1e9,
             best_glob * 1e9,
             best_empty * 1e9,
             best_async * 1e9,
             best_build * 1e9,
-            best_push * 1e9
+            best_push * 1e9,
+            best_sat * 1e9
         );
     }
 }
