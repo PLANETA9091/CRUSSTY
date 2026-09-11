@@ -27,10 +27,8 @@ use std::hint::spin_loop;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// FNV-1a 64-bit over u64 chunks (TASK-164): one xor+multiply per 8 bytes
-/// for the long class/topic names on the hot paths, byte-wise FNV tail.
-/// Collision safety comes from the full string compare that every consumer
-/// runs on a hash hit — the hash only feeds open addressing and memo keys.
+/// FNV-1a 64-bit over u64 chunks: the cold-path hash (view builds, event
+/// resolution). Hot per-load/per-publish paths use [`str_hash`].
 #[inline]
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

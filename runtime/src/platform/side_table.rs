@@ -45,8 +45,9 @@
 //! Without a VM (`crate::VM` unset, e.g. unit tests) every JNI-dependent
 //! path degrades gracefully: [`key_from_jobject`] returns `None`.
 
+use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak as StdWeak};
 use std::time::Duration;
 
@@ -231,22 +232,244 @@ fn tables_registry() -> &'static Mutex<HashMap<u64, GcTableWeak>> {
     TABLES_REGISTRY.get_or_init(Default::default)
 }
 
+/// Lock-free read mirror (TASK-165). Per-entity per-tick lookups dominate
+/// side-table traffic, and the RwLock read round-trip costs more than the
+/// lookup itself. For the value shapes side tables hold in production (ids,
+/// counters, flags — small `Copy` scalars), writers mirror every entry into
+/// a fixed-size open-addressed atomic table keyed by the object token, so
+/// `get`/`contains`/`get_or_insert`-hit answer from 2-3 atomic loads with
+/// no lock at all. The map stays the source of truth: all writers hold the
+/// write lock (serialized), so mirror writes need no coordination of their
+/// own, and readers only trust the mirror while it is guaranteed complete.
+///
+/// Completeness is governed by `mirror_ok`, a one-way latch per table: it
+/// starts down (nothing mirrored), is raised after the first mirrorable
+/// insert backfills the whole map, and drops permanently the moment the
+/// live count exceeds [`MIRROR_LIVE_CAP`] — past that the mirror would no
+/// longer be complete, so readers fall back to the lock for good. Value
+/// types that are not [`mirror_bits`]-encodable simply never raise the
+/// latch and keep the plain lock path (correct for every `Clone` value).
+///
+/// Tokens ([`next_key`]) are process-unique monotonic u64s starting at 1,
+/// so `0` is a safe empty sentinel and `u64::MAX` a tombstone.
+const MIRROR_SLOTS: usize = 16384;
+const MIRROR_LIVE_CAP: usize = MIRROR_SLOTS / 4 * 3;
+const MIRROR_TOMBSTONE: u64 = u64::MAX;
+
+struct Mirror {
+    keys: Box<[AtomicU64]>,
+    vals: Box<[AtomicU64]>,
+}
+
+impl Mirror {
+    fn new() -> Self {
+        Self {
+            keys: (0..MIRROR_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            vals: (0..MIRROR_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    #[inline]
+    fn slot(token: u64) -> usize {
+        (token.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & (MIRROR_SLOTS - 1)
+    }
+
+    /// Insert or update. Callers hold the table write lock, so mirror
+    /// writes are serialized with every other mutation — the CAS cannot
+    /// actually lose. Ordering: value first, then the key, so a reader that
+    /// Acquire-matches the key always sees a value that was in the map.
+    fn put(&self, token: u64, bits: u64) {
+        let mut i = Self::slot(token);
+        loop {
+            let k = self.keys[i].load(Ordering::Relaxed);
+            if k == token {
+                // In-place update: the reader either sees the old or the
+                // new value — both were legitimate map contents.
+                self.vals[i].store(bits, Ordering::Release);
+                return;
+            }
+            if k == 0 || k == MIRROR_TOMBSTONE {
+                self.vals[i].store(bits, Ordering::Release);
+                if self
+                    .keys[i]
+                    .compare_exchange(k, token, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            i = (i + 1) & (MIRROR_SLOTS - 1);
+        }
+    }
+
+    /// Remove (tombstone). The stale value is deliberately left in place:
+    /// a reader that matched the key before the removal re-validates the
+    /// key after reading the value, and if a racing re-insert put the same
+    /// token back, the re-validation passes while the value read may come
+    /// from either side of the window — both were genuinely in the map.
+    /// Zeroing the value here would expose the never-a-value 0 across that
+    /// window instead.
+    fn del(&self, token: u64) {
+        let mut i = Self::slot(token);
+        loop {
+            let k = self.keys[i].load(Ordering::Relaxed);
+            if k == token {
+                self.keys[i].store(MIRROR_TOMBSTONE, Ordering::Release);
+                return;
+            }
+            if k == 0 {
+                return; // not present
+            }
+            i = (i + 1) & (MIRROR_SLOTS - 1);
+        }
+    }
+
+    /// Lock-free probe with read validation: match the key, read the value,
+    /// re-read the key — only an unchanged key publishes the value. While
+    /// the mirror is on it is a superset of the map, so a clean-empty stop
+    /// is definitive absence.
+    fn probe(&self, token: u64) -> Option<u64> {
+        let mut i = Self::slot(token);
+        loop {
+            let k = self.keys[i].load(Ordering::Acquire);
+            if k == token {
+                let v = self.vals[i].load(Ordering::Relaxed);
+                if self.keys[i].load(Ordering::Acquire) == token {
+                    return Some(v);
+                }
+                // removed under us: keep probing (a tombstoned token may
+                // legitimately have been re-inserted further along)
+            } else if k == 0 {
+                return None;
+            }
+            i = (i + 1) & (MIRROR_SLOTS - 1);
+        }
+    }
+}
+
+/// Mirror encoding (TASK-165): side tables hold ids, counters and flags —
+/// small `Copy` scalars. For these types the mirror stores the raw bits in
+/// one `AtomicU64`; any other value type reports `None` and the table
+/// silently stays on the lock path (correct for every `Clone` value).
+fn mirror_bits<V: 'static>(v: &V) -> Option<u64> {
+    let any: &dyn std::any::Any = v;
+    macro_rules! try_type {
+        ($ty:ty, $to:expr) => {
+            if let Some(x) = any.downcast_ref::<$ty>() {
+                return Some($to(x));
+            }
+        };
+    }
+    // u64 first: the common counter shape pays one TypeId compare.
+    try_type!(u64, |x: &u64| *x);
+    try_type!(i64, |x: &i64| *x as u64);
+    try_type!(u32, |x: &u32| u64::from(*x));
+    try_type!(i32, |x: &i32| (*x as i64) as u64);
+    try_type!(u16, |x: &u16| u64::from(*x));
+    try_type!(i16, |x: &i16| (*x as i64) as u64);
+    try_type!(u8, |x: &u8| u64::from(*x));
+    try_type!(i8, |x: &i8| (*x as i64) as u64);
+    try_type!(usize, |x: &usize| *x as u64);
+    try_type!(isize, |x: &isize| (*x as i64) as u64);
+    try_type!(f32, |x: &f32| u64::from(x.to_bits()));
+    try_type!(f64, |x: &f64| x.to_bits());
+    try_type!(bool, |x: &bool| u64::from(*x));
+    None
+}
+
+/// Mirror decode — the exact inverse of [`mirror_bits`] for the same `V`.
+/// Only ever called with bits `mirror_bits::<V>` produced, i.e. after a
+/// TypeId match proved `V` is the matched scalar type.
+fn mirror_from_bits<V: 'static>(bits: u64) -> V {
+    macro_rules! try_type {
+        ($ty:ty, $val:expr) => {
+            if TypeId::of::<V>() == TypeId::of::<$ty>() {
+                let val: $ty = $val;
+                // SAFETY: the TypeId equality above proves `V` and `$ty`
+                // are the same type; copying through the reinterpreted
+                // pointer of an aligned local is a plain same-size copy.
+                return unsafe { std::ptr::addr_of!(val).cast::<V>().read() };
+            }
+        };
+    }
+    try_type!(u64, bits);
+    try_type!(i64, bits as i64);
+    try_type!(u32, bits as u32);
+    try_type!(i32, bits as i32);
+    try_type!(u16, bits as u16);
+    try_type!(i16, bits as i16);
+    try_type!(u8, bits as u8);
+    try_type!(i8, bits as i8);
+    try_type!(usize, bits as usize);
+    try_type!(isize, bits as isize);
+    try_type!(f32, f32::from_bits(bits as u32));
+    try_type!(f64, f64::from_bits(bits));
+    try_type!(bool, bits != 0);
+    unreachable!("mirror values are only stored for mirror_bits-encodable types")
+}
+
 /// Shared state of a [`SideTable`]. Kept behind an [`Arc`] so the sweep can
 /// hold the table alive briefly while it notifies.
 ///
-/// Hotpath note (TASK-161): the map is an RwLock, not a Mutex — side tables
-/// are read-mostly (per-entity per-tick lookups dominate writes), so reads
-/// share the lock instead of serializing. (RwLock<T>: Sync needs T: Send +
-/// Sync, hence the tighter `V: Sync` bound on the table; every real value
-/// type — counters, ids, small structs — is Sync.)
+/// Hotpath note (TASK-161/165): the map is the writer-side source of truth;
+/// per-entity per-tick reads go through the lock-free [`Mirror`] whenever
+/// the value type is mirror-encodable and the table is under the live cap
+/// (see [`Mirror`]).
 struct SideTableInner<V> {
     map: RwLock<HashMap<ObjectKey, V>>,
+    mirror: OnceLock<Mirror>,
+    mirror_ok: AtomicBool,
     on_collect: Mutex<Option<OnCollect>>,
+}
+
+impl<V: Clone + Send + Sync + 'static> SideTableInner<V> {
+    /// Mirror maintenance after a map mutation (write lock held, so the
+    /// map view is stable). `bits` is the precomputed encoding of the
+    /// inserted/updated value; `None` means the value type is not
+    /// mirror-encodable and the whole mirror machinery stays dormant.
+    fn mirror_note(&self, map: &HashMap<ObjectKey, V>, k: ObjectKey, bits: Option<u64>, live_after: usize) {
+        let Some(bits) = bits else { return };
+        if live_after > MIRROR_LIVE_CAP {
+            // One-way latch: past the live cap the mirror is no longer
+            // guaranteed complete — readers fall back to the lock for good.
+            if self.mirror.get().is_some() {
+                self.mirror_ok.store(false, Ordering::Release);
+            }
+            return;
+        }
+        match self.mirror.get() {
+            Some(m) => m.put(k.0, bits),
+            None => {
+                // First mirrorable insert under the cap: backfill the
+                // mirror from the full map, then raise the reader latch.
+                let m = self.mirror.get_or_init(|| {
+                    let m = Mirror::new();
+                    for (key, val) in map {
+                        if let Some(b) = mirror_bits::<V>(val) {
+                            m.put(key.0, b);
+                        }
+                    }
+                    m
+                });
+                m.put(k.0, bits);
+                self.mirror_ok.store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 impl<V: Send + Sync + 'static> GcNotifiable for SideTableInner<V> {
     fn notify_collected(&self, key: ObjectKey) {
-        let removed = self.map.write().unwrap_or_else(|p| p.into_inner()).remove(&key).is_some();
+        let removed = {
+            let mut map = self.map.write().unwrap_or_else(|p| p.into_inner());
+            let removed = map.remove(&key).is_some();
+            if removed {
+                if let Some(m) = self.mirror.get() {
+                    m.del(key.0);
+                }
+            }
+            removed
+        };
         if !removed {
             return;
         }
@@ -269,6 +492,8 @@ impl<V: Clone + Send + Sync + 'static> SideTable<V> {
     pub fn new() -> Self {
         let inner: Arc<SideTableInner<V>> = Arc::new(SideTableInner {
             map: RwLock::new(HashMap::new()),
+            mirror: OnceLock::new(),
+            mirror_ok: AtomicBool::new(false),
             on_collect: Mutex::new(None),
         });
         let id = NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed);
@@ -288,32 +513,83 @@ impl<V: Clone + Send + Sync + 'static> SideTable<V> {
 
     /// Return the value for `k`, or insert `default_fn()`'s result and
     /// return it. `default_fn` runs only when the key is absent.
+    ///
+    /// Per-entity per-tick access is exactly this shape (TASK-165): a hit
+    /// answers from the lock-free mirror — no lock, no clone of the map
+    /// path — and only a genuinely new entity takes the write lock.
     pub fn get_or_insert(&self, k: ObjectKey, default_fn: impl FnOnce() -> V) -> V {
-        let mut map = self.inner.map.write().unwrap_or_else(|p| p.into_inner());
+        let inner = &*self.inner;
+        if inner.mirror_ok.load(Ordering::Acquire) {
+            if let Some(m) = inner.mirror.get() {
+                if let Some(bits) = m.probe(k.0) {
+                    return mirror_from_bits::<V>(bits);
+                }
+                // Authoritative miss while the mirror is on — the key is
+                // genuinely absent; fall through to the insert path.
+            }
+        } else if let Some(v) =
+            inner.map.read().unwrap_or_else(|p| p.into_inner()).get(&k).cloned()
+        {
+            // Mirror off (never raised, latched by the live cap, or a
+            // non-encodable value type): the map decides.
+            return v;
+        }
+        let mut map = inner.map.write().unwrap_or_else(|p| p.into_inner());
         if let Some(v) = map.get(&k) {
             return v.clone();
         }
         let v = default_fn();
+        let bits = mirror_bits::<V>(&v);
         map.insert(k, v.clone());
+        let live_after = map.len();
+        inner.mirror_note(&map, k, bits, live_after);
         v
     }
 }
 
-impl<V: Clone> SideTable<V> {
+impl<V: Clone + Send + Sync + 'static> SideTable<V> {
     pub fn insert(&self, k: ObjectKey, v: V) {
-        self.inner.map.write().unwrap_or_else(|p| p.into_inner()).insert(k, v);
+        let inner = &*self.inner;
+        let bits = mirror_bits::<V>(&v);
+        let mut map = inner.map.write().unwrap_or_else(|p| p.into_inner());
+        map.insert(k, v);
+        let live_after = map.len();
+        inner.mirror_note(&map, k, bits, live_after);
     }
 
     pub fn get(&self, k: &ObjectKey) -> Option<V> {
-        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).get(k).cloned()
+        let inner = &*self.inner;
+        if inner.mirror_ok.load(Ordering::Acquire) {
+            if let Some(m) = inner.mirror.get() {
+                return m.probe(k.0).map(mirror_from_bits::<V>);
+            }
+        }
+        inner.map.read().unwrap_or_else(|p| p.into_inner()).get(k).cloned()
     }
 
     pub fn remove(&self, k: &ObjectKey) -> Option<V> {
-        self.inner.map.write().unwrap_or_else(|p| p.into_inner()).remove(k)
+        let inner = &*self.inner;
+        let removed = {
+            let mut map = inner.map.write().unwrap_or_else(|p| p.into_inner());
+            let removed = map.remove(k);
+            if removed.is_some() {
+                if let Some(m) = inner.mirror.get() {
+                    m.del(k.0);
+                }
+            }
+            removed
+        };
+        removed
     }
 
     pub fn contains(&self, k: &ObjectKey) -> bool {
-        self.inner.map.read().unwrap_or_else(|p| p.into_inner()).contains_key(k)
+        let inner = &*self.inner;
+        if inner.mirror_ok.load(Ordering::Acquire) {
+            if let Some(m) = inner.mirror.get() {
+                return m.probe(k.0).is_some();
+            }
+        }
+        inner.map.read().unwrap_or_else(|p| p.into_inner()).contains_key(k)
     }
 
     pub fn len(&self) -> usize {
@@ -574,6 +850,90 @@ mod tests {
     }
 
     #[test]
+    fn mirror_roundtrip_overwrite_remove_and_latch() {
+        // Mirror-encodable value type: gets/contains answer from the lock-free
+        // mirror once it is raised, and semantics must be identical to the map.
+        let t = SideTable::<u64>::new();
+        let k1 = ObjectKey(11);
+        let k2 = ObjectKey(22);
+        t.insert(k1, 7);
+        assert!(t.inner.mirror_ok.load(Ordering::Acquire));
+        assert_eq!(t.get(&k1), Some(7));
+        t.insert(k1, 9); // overwrite in place
+        assert_eq!(t.get(&k1), Some(9));
+        t.insert(k2, 0); // a legitimate zero must round-trip
+        assert_eq!(t.get(&k2), Some(0));
+        assert!(t.contains(&k2));
+        assert_eq!(t.remove(&k1), Some(9));
+        assert_eq!(t.get(&k1), None);
+        assert!(!t.contains(&k1));
+        assert_eq!(t.get_or_insert(k1, || 15), 15); // re-insert via the other path
+        assert_eq!(t.get(&k1), Some(15));
+        assert_eq!(t.get_or_insert(k1, || 99), 15); // hit answers from the mirror
+
+        // Live-cap latch: past MIRROR_LIVE_CAP the mirror drops permanently
+        // (never re-raised after the purge), and every read stays correct.
+        for i in 0..=MIRROR_LIVE_CAP as u64 {
+            t.insert(ObjectKey(100_000 + i), i);
+        }
+        assert!(!t.inner.mirror_ok.load(Ordering::Acquire));
+        assert_eq!(t.get(&k1), Some(15));
+        assert_eq!(t.get(&ObjectKey(100_000 + 5)), Some(5));
+        assert_eq!(t.get(&ObjectKey(999_999_999)), None);
+        for i in 0..=MIRROR_LIVE_CAP as u64 {
+            t.remove(&ObjectKey(100_000 + i));
+        }
+        t.insert(ObjectKey(7), 1); // under the cap again — mirror must NOT re-raise
+        assert!(!t.inner.mirror_ok.load(Ordering::Acquire));
+        assert_eq!(t.get(&ObjectKey(7)), Some(1));
+        assert_eq!(t.get(&k1), Some(15));
+    }
+
+    #[test]
+    fn mirror_concurrent_reads_never_see_garbage() {
+        let t = Arc::new(SideTable::<u64>::new());
+        for i in 0..64u64 {
+            t.insert(ObjectKey(i + 1), i * 3 + 1);
+        }
+        let stop = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let t = Arc::clone(&t);
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut seen = 0u64;
+                let mut xs = 0x9E37_79B9_7F4A_7C15u64;
+                loop {
+                    // At least one load per reader: the writer's 2000 tiny
+                    // rounds can finish before a slow reader is scheduled.
+                    xs ^= xs << 13;
+                    xs ^= xs >> 7;
+                    xs ^= xs << 17;
+                    if let Some(v) = t.get(&ObjectKey(xs % 64 + 1)) {
+                        assert!(v % 3 == 1 && v / 3 < 64, "garbage value {v}");
+                        seen += 1;
+                    }
+                    if stop.load(Ordering::Relaxed) == 1 {
+                        break;
+                    }
+                }
+                seen
+            }));
+        }
+        for round in 0..2000u64 {
+            let k = ObjectKey(round % 64 + 1);
+            t.insert(k, (round % 64) * 3 + 1);
+            t.remove(&k);
+            // re-insert so the table stays populated for the readers
+            t.insert(k, (round % 64) * 3 + 1);
+        }
+        stop.store(1, Ordering::Relaxed);
+        for h in handles {
+            assert!(h.join().unwrap() > 0);
+        }
+    }
+
+    #[test]
     fn values_clones_current_entries() {
         let t = SideTable::<u64>::new();
         t.insert(ObjectKey(1), 10);
@@ -628,6 +988,29 @@ mod bench_hotpath {
             best_get = best_get.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
 
+        // get_or_insert hit (per-entity per-tick access shape): the key is
+        // already present, so the default never materializes — the mirror
+        // answers without taking any lock (TASK-165).
+        for _ in 0..10_000u32 {
+            xs ^= xs << 13;
+            xs ^= xs >> 7;
+            xs ^= xs << 17;
+            let _ = t.get_or_insert(ObjectKey(xs % n + 1), || u64::MAX);
+        }
+        let mut best_goi = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                xs ^= xs << 13;
+                xs ^= xs >> 7;
+                xs ^= xs << 17;
+                let key = ObjectKey(xs % n + 1);
+                let v = t.get_or_insert(key, || u64::MAX);
+                debug_assert_ne!(v, u64::MAX);
+            }
+            best_goi = best_goi.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
         // insert+remove churn (write path)
         let mut best_churn = f64::MAX;
         for _ in 0..rounds {
@@ -643,6 +1026,10 @@ mod bench_hotpath {
             "BENCH side_table: get rand(4096) {:.0} ns/op, insert+remove {:.0} ns/op (min of {rounds}x{iters})",
             best_get * 1e9,
             best_churn * 1e9
+        );
+        println!(
+            "BENCH side_table fast: get_or_insert hit rand(4096) {:.0} ns/op (lock-free mirror, min of {rounds}x{iters})",
+            best_goi * 1e9
         );
     }
 }

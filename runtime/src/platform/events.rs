@@ -74,7 +74,7 @@
 //! invalidation (slab/arena pattern), RCU snapshots (see [`rcu`]).
 
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -403,139 +403,177 @@ impl RegistryCell {
 /// subscribers pays no lock, no snapshot and no allocation — the resolved
 /// handler list is cached per thread and invalidated by either registry's
 /// generation moving.
-const MEMO_SLOTS: usize = 4;
 
 struct MemoSlot {
     bus_key: u64,
     /// Combined (sync<<32 | async) generation the slot was resolved at.
     gens: u64,
-    hash: u64,
     name: Box<str>,
     resolved: Resolved,
     has_async: bool,
 }
 
 thread_local! {
-    static MEMO: RefCell<[Option<MemoSlot>; MEMO_SLOTS]> = const {
-        RefCell::new([None, None, None, None])
-    };
+    /// MRU memo slot (TASK-165): the hot publish/has path takes it out (a
+    /// plain move — no borrow-flag RMW), matches, dispatches, puts it back.
+    /// While it is taken out a re-entrant publish from a handler simply
+    /// finds the MRU empty and takes the cold path — correct cache
+    /// semantics; a put-back that races a nested re-fill is
+    /// generation-checked on the next publish (cache miss, never staleness).
+    static MEMO_MRU: Cell<Option<MemoSlot>> = const { Cell::new(None) };
+    /// Cold memo slots. Handlers may run under the shared borrow of a cold
+    /// hit (same re-entrancy contract as TASK-164); fills use
+    /// `try_borrow_mut` and skip when a dispatch borrow is alive.
+    static MEMO_REST: RefCell<[Option<MemoSlot>; MEMO_REST_SLOTS]> =
+        const { RefCell::new([None, None, None]) };
     static MEMO_CLOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+const MEMO_REST_SLOTS: usize = 3;
+
 #[inline]
-fn memo_key_matches(s: &MemoSlot, bus_key: u64, gens: u64, hash: u64, event: &str) -> bool {
-    s.bus_key == bus_key
-        && s.gens == gens
-        && s.hash == hash
-        && &*s.name == event
+fn memo_key_matches(s: &MemoSlot, bus_key: u64, gens: u64, event: &str) -> bool {
+    s.bus_key == bus_key && s.gens == gens && &*s.name == event
 }
 
-/// Hot publish through the memo: on a hit the dispatch runs while the slot
-/// is borrowed (no Arc refcount traffic at all). Re-entrant publishes from a
-/// handler re-borrow shared — safe; a nested SLOW-path fill uses
-/// `try_borrow_mut` and simply skips the fill. Returns
-/// `(invoked, has_async)` when a slot matched.
-fn memo_dispatch(
-    bus_key: u64,
-    gens: u64,
-    hash: u64,
-    event: &str,
-    payload: &Value,
-) -> Option<(usize, bool)> {
-    let mut hit = None;
-    MEMO.with(|m| {
-        // Phase 1 (shared borrow): find the slot. Nested publishes from a
-        // handler re-borrow shared — safe.
-        let idx = {
-            let slots = m.borrow();
-            let mut idx = None;
-            for (i, slot) in slots.iter().enumerate() {
-                let Some(s) = slot else { continue };
-                if memo_key_matches(s, bus_key, gens, hash, event) {
-                    idx = Some(i);
-                    break;
+/// Hot publish through the memo: on an MRU hit the dispatch runs with the
+/// slot TAKEN OUT of the memo (no borrow flag at all on the hot path); on a
+/// cold hit the dispatch runs under the shared REST borrow (re-entrant
+/// publishes from a handler are safe; the promote/swap then uses
+/// `try_borrow_mut` and simply skips if a nested publish still holds it).
+/// Returns `(invoked, has_async)` when a slot matched.
+///
+/// TASK-165: the memo key is `(bus, generation)` + the event string itself —
+/// no hash on the hot path. The FNV prefilter only ever saved a ~20-byte
+/// memcmp on a hit while costing a 5-multiply serial chain on every call;
+/// dropping it is a strict win (the generation compare rejects mutations
+/// before the memcmp runs either way).
+#[inline]
+fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Option<(usize, bool)> {
+    // MRU fast path: take/match/dispatch/put-back, zero borrow traffic.
+    MEMO_MRU.with(|m0| {
+        let s0 = m0.take();
+        let mut out = None;
+        if let Some(s) = s0.as_ref() {
+            if memo_key_matches(s, bus_key, gens, event) {
+                let invoked = dispatch(&s.resolved, event, payload);
+                out = Some((invoked, s.has_async));
+            }
+        }
+        m0.set(s0);
+        if out.is_some() {
+            return out;
+        }
+        // Cold path: scan + dispatch under the shared REST borrow.
+        MEMO_REST.with(|rest| {
+            let idx = {
+                let slots = rest.borrow();
+                let mut idx = None;
+                for (i, slot) in slots.iter().enumerate() {
+                    let Some(s) = slot else { continue };
+                    if memo_key_matches(s, bus_key, gens, event) {
+                        let invoked = dispatch(&s.resolved, event, payload);
+                        out = Some((invoked, s.has_async));
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                idx
+            };
+            // Promote a cold hit to the MRU slot (plain moves; skips while
+            // a nested dispatch still holds the shared borrow).
+            if let Some(i) = idx {
+                if let Ok(mut slots) = rest.try_borrow_mut() {
+                    let promoted = slots[i].take();
+                    let demoted = MEMO_MRU.with(|m0| m0.take());
+                    MEMO_MRU.with(|m0| m0.set(promoted));
+                    slots[i] = demoted;
                 }
             }
-            idx
-        };
-        let Some(i) = idx else { return };
-        // Phase 2: dispatch under the shared borrow — the nested-publish
-        // shape stays panic-free; the MRU swap happens after, best-effort.
-        {
-            let slots = m.borrow();
-            let s = slots[i].as_ref().expect("hit slot");
-            let invoked = dispatch(&s.resolved, event, payload);
-            hit = Some((invoked, s.has_async));
-        }
-        if i > 0 {
-            if let Ok(mut slots) = m.try_borrow_mut() {
-                slots.swap(0, i);
-            }
-        }
-    });
-    hit
+        });
+        out
+    })
 }
 
-/// Hot has_subscribers through the memo. Never holds a mutable borrow: a
-/// handler may call has_subscribers re-entrantly while a publish holds the
-/// shared borrow (the MRU swap then just skips).
-fn memo_has(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<bool> {
-    let mut hit = None;
-    MEMO.with(|m| {
-        let idx = {
-            let slots = m.borrow();
-            let mut idx = None;
-            for (i, slot) in slots.iter().enumerate() {
-                let Some(s) = slot else { continue };
-                if memo_key_matches(s, bus_key, gens, hash, event) {
-                    hit = Some(!s.resolved.is_empty() || s.has_async);
-                    idx = Some(i);
-                    break;
-                }
-            }
-            idx
-        };
-        if let Some(i) = idx {
-            if i > 0 {
-                if let Ok(mut slots) = m.try_borrow_mut() {
-                    slots.swap(0, i);
-                }
+/// Hot has_subscribers through the memo: MRU slot first (taken out, no
+/// borrow flag), then the cold slots under a shared borrow. Never holds a
+/// mutable borrow: a handler may call has_subscribers re-entrantly while a
+/// publish dispatches.
+fn memo_has(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
+    MEMO_MRU.with(|m0| {
+        let s0 = m0.take();
+        let mut hit = None;
+        if let Some(s) = s0.as_ref() {
+            if memo_key_matches(s, bus_key, gens, event) {
+                hit = Some(!s.resolved.is_empty() || s.has_async);
             }
         }
-    });
-    hit
-}
-
-fn memo_fill(
-    bus_key: u64,
-    gens: u64,
-    hash: u64,
-    event: &str,
-    resolved: Resolved,
-    has_async: bool,
-) {
-    MEMO.with(|m| {
-        // try_borrow_mut: a nested fill while a hit-borrow is alive just
-        // skips the fill — the next publish re-resolves and retries.
-        if let Ok(mut slots) = m.try_borrow_mut() {
-            let clock = MEMO_CLOCK.with(|c| c.get());
-            MEMO_CLOCK.with(|c| c.set(clock + 1));
-            // Refresh an existing slot for this (bus, event) in place; otherwise
-            // round-robin over the fixed-size table.
-            let target = slots
-                .iter()
-                .position(|s| {
-                    s.as_ref()
-                        .is_some_and(|s| s.bus_key == bus_key && s.hash == hash && &*s.name == event)
+        m0.set(s0);
+        if hit.is_some() {
+            return hit;
+        }
+        MEMO_REST.with(|rest| {
+            let idx = {
+                let slots = rest.borrow();
+                for slot in slots.iter() {
+                    let Some(s) = slot else { continue };
+                    if memo_key_matches(s, bus_key, gens, event) {
+                        hit = Some(!s.resolved.is_empty() || s.has_async);
+                        break;
+                    }
+                }
+                slots.iter().position(|s| {
+                    s.as_ref().is_some_and(|s| memo_key_matches(s, bus_key, gens, event))
                 })
-                .unwrap_or(clock % MEMO_SLOTS);
-            slots[target] = Some(MemoSlot {
-                bus_key,
-                gens,
-                hash,
-                name: event.into(),
-                resolved,
-                has_async,
+            };
+            // Promote the cold hit to the MRU slot so the next lookup takes
+            // the borrow-free path (skips while a dispatch borrow is alive).
+            if let Some(i) = idx {
+                if let Ok(mut slots) = rest.try_borrow_mut() {
+                    let promoted = slots[i].take();
+                    let demoted = MEMO_MRU.with(|m0| m0.take());
+                    MEMO_MRU.with(|m0| m0.set(promoted));
+                    slots[i] = demoted;
+                }
+            }
+        });
+        hit
+    })
+}
+
+fn memo_fill(bus_key: u64, gens: u64, event: &str, resolved: Resolved, has_async: bool) {
+    let fresh = || MemoSlot {
+        bus_key,
+        gens,
+        name: event.into(),
+        resolved: Arc::clone(&resolved),
+        has_async,
+    };
+    // Refresh the MRU slot in place when it already holds (bus, event).
+    MEMO_MRU.with(|m0| {
+        let s0 = m0.take();
+        let refresh_mru = s0
+            .as_ref()
+            .is_some_and(|s| s.bus_key == bus_key && &*s.name == event);
+        if refresh_mru {
+            m0.set(Some(fresh()));
+        } else {
+            m0.set(s0);
+            // Cold refresh / round-robin fill; a nested fill while a
+            // dispatch borrow is alive just skips (the next publish
+            // re-resolves and retries).
+            MEMO_REST.with(|rest| {
+                if let Ok(mut slots) = rest.try_borrow_mut() {
+                    if let Some(i) = slots.iter().position(|s| {
+                        s.as_ref().is_some_and(|s| s.bus_key == bus_key && &*s.name == event)
+                    }) {
+                        slots[i] = Some(fresh());
+                    } else {
+                        let clock = MEMO_CLOCK.with(|c| c.get());
+                        MEMO_CLOCK.with(|c| c.set(clock + 1));
+                        slots[clock % MEMO_REST_SLOTS] = Some(fresh());
+                    }
+                }
             });
         }
     });
@@ -776,13 +814,15 @@ impl EventBus {
         if gens == 0 {
             return false;
         }
-        let hash = fnv1a(event.as_bytes());
-        if let Some(any) = memo_has(self.sync.id, gens, hash, event) {
+        // TASK-165: the memo hit path pays no hash — key is (bus, gen) + the
+        // event string itself; FNV only on the cold resolution path.
+        if let Some(any) = memo_has(self.sync.id, gens, event) {
             return any;
         }
+        let hash = fnv1a(event.as_bytes());
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
         let any = !resolved.is_empty() || has_async;
-        memo_fill(self.sync.id, gens, hash, event, resolved, has_async);
+        memo_fill(self.sync.id, gens, event, resolved, has_async);
         any
     }
 
@@ -819,26 +859,20 @@ impl EventBus {
         if gens == 0 {
             return 0;
         }
-        let hash = fnv1a(event.as_bytes());
         // Per-thread memo hit: precomputed resolved list — no locks, no
-        // snapshot, no allocation, no refcount traffic on the hot path.
+        // snapshot, no allocation, no refcount traffic, and since TASK-165
+        // no hash either (key = (bus, gen) + the event string itself).
         if let Some((invoked, has_async)) =
-            memo_dispatch(self.sync.id, gens, hash, event, payload)
+            memo_dispatch(self.sync.id, gens, event, payload)
         {
             if has_async {
-                self.queue_async(event, payload, hash);
+                self.queue_async(event, payload, fnv1a(event.as_bytes()));
             }
             return invoked;
         }
+        let hash = fnv1a(event.as_bytes());
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
-        memo_fill(
-            self.sync.id,
-            gens,
-            hash,
-            event,
-            Arc::clone(&resolved),
-            has_async,
-        );
+        memo_fill(self.sync.id, gens, event, Arc::clone(&resolved), has_async);
         let invoked = dispatch(&resolved, event, payload);
         if has_async {
             self.queue_async(event, payload, hash);
@@ -1394,3 +1428,5 @@ mod bench_hotpath {
         );
     }
 }
+
+

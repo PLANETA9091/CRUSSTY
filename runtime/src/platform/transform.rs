@@ -59,7 +59,7 @@
 //! - Instrumentation is idempotent per helper: re-running `apply` (e.g.
 //!   JVMTI retransformation) does not double-instrument.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -221,7 +221,12 @@ impl RulesView {
 }
 
 thread_local! {
-    static VIEW_MEMO: RefCell<Option<(u64, u64, Arc<RulesView>)>> = const { RefCell::new(None) };
+    /// Per-thread view memo (TASK-165): a plain `Cell` — the probe takes the
+    /// slot out (plain move, no borrow-flag RMW), reads through the local
+    /// `Arc` and puts it back on the single exit. Re-entrancy is impossible
+    /// by construction: nothing between `take` and `set` runs user code
+    /// (no handlers in rule matching), and TLS is per-thread.
+    static VIEW_MEMO: Cell<Option<(u64, u64, Arc<RulesView>)>> = const { Cell::new(None) };
 }
 
 impl TransformEngine {
@@ -235,30 +240,31 @@ impl TransformEngine {
 
     /// Generation-checked per-thread view snapshot, keyed by (engine id,
     /// generation). `register` may run concurrently and from nested calls —
-    /// the memo guard is never held across rule matching.
+    /// the memo slot is only ever held across plain reads.
     fn view_snapshot(&self) -> Arc<RulesView> {
         let gen = self.view.gen();
         if gen == 0 {
-            // Empty default shape: the caller's live_rules gate normally
-            // prevents reaching here at all.
+            // Empty default shape: the caller's gate normally prevents
+            // reaching here at all.
             return Arc::new(RulesView::build(Vec::new()));
         }
         VIEW_MEMO.with(|m| {
-            if let Ok(borrowed) = m.try_borrow() {
-                if let Some((eid, g, v)) = borrowed.as_ref() {
-                    if *eid == self.id && *g == gen {
-                        return Arc::clone(v);
-                    }
-                }
+            let slot = m.take();
+            let hit = slot
+                .as_ref()
+                .is_some_and(|(eid, g, _)| *eid == self.id && *g == gen);
+            if hit {
+                let v = Arc::clone(&slot.as_ref().expect("hit checked").2);
+                m.set(slot);
+                v
+            } else {
+                let fresh = self
+                    .view
+                    .load_arc()
+                    .unwrap_or_else(|| Arc::new(RulesView::build(Vec::new())));
+                m.set(Some((self.id, gen, Arc::clone(&fresh))));
+                fresh
             }
-            let fresh = self
-                .view
-                .load_arc()
-                .unwrap_or_else(|| Arc::new(RulesView::build(Vec::new())));
-            if let Ok(mut slot) = m.try_borrow_mut() {
-                *slot = Some((self.id, gen, Arc::clone(&fresh)));
-            }
-            fresh
         })
     }
 
@@ -304,31 +310,42 @@ impl TransformEngine {
     /// then choose to fail the class load or run it untransformed. Never
     /// panics; parse failures return `Err` with context.
     pub fn apply(&self, class_name: &str, bytes: &[u8]) -> Result<Option<TransformedClass>, String> {
-        // Lock-free gate (TASK-163): no rules at all — the overwhelming
-        // majority of classes — is one acquire load.
-        if self.live_rules.load(Ordering::Acquire) == 0 {
+        // Lock-free gate (TASK-165): ONE acquire load. The view generation
+        // is 0 until the first `register` stores a compiled view — and every
+        // stored view carries >= 1 rule — so `gen == 0` is exactly the
+        // no-rules shape. This replaces the old `live_rules` pre-gate (two
+        // atomics per class load) with the generation the memo needs anyway.
+        let gen = self.view.gen();
+        if gen == 0 {
             return Ok(None);
         }
         let hash = super::rcu::fnv1a(class_name.as_bytes());
-        // RCU view + per-thread memo (TASK-164): the no-match path probes
-        // INSIDE the memo borrow — no Arc refcount traffic, no allocation;
-        // only an actual class hit pays the snapshot clone for the plan.
-        let gen = self.view.gen();
+        // RCU view + per-thread memo (TASK-164/165): the no-match path
+        // probes through the taken-out memo slot — no Arc refcount traffic,
+        // no allocation, no borrow flag; only an actual class hit pays the
+        // snapshot clone for the plan.
         let mut fast_none = false;
         VIEW_MEMO.with(|m| {
-            if let Ok(borrowed) = m.try_borrow() {
-                if let Some((eid, g, view)) = borrowed.as_ref() {
-                    if *eid == self.id && *g == gen {
-                        let exact_hit = view.exact_find(hash, class_name).is_some();
-                        let wild_hit = view.wildcards.iter().any(|w| match &w.kind {
+            // TASK-165: take/probe/put-back — no RefCell borrow flag on the
+            // per-class-load path (nothing here runs user code, so the slot
+            // cannot be re-entered while it is taken out).
+            let slot = m.take();
+            if let Some((eid, g, view)) = slot.as_ref() {
+                if *eid == self.id && *g == gen {
+                    let exact_hit = view.exact_find(hash, class_name).is_some();
+                    // Wildcards are the rare table shape: skip the
+                    // iterator machinery entirely for the common
+                    // wildcard-free engine (TASK-165).
+                    let wild_hit = !view.wildcards.is_empty()
+                        && view.wildcards.iter().any(|w| match &w.kind {
                             WildKind::Any => true,
                             WildKind::Suffix(s) => class_name.ends_with(&**s),
                             WildKind::Prefix(p) => class_name.starts_with(&**p),
                         });
-                        fast_none = !exact_hit && !wild_hit;
-                    }
+                    fast_none = !exact_hit && !wild_hit;
                 }
             }
+            m.set(slot);
         });
         if fast_none {
             return Ok(None);
