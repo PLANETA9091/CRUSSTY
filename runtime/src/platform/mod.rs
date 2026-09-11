@@ -13,6 +13,7 @@ pub mod events;
 pub mod hooks;
 pub mod hot_reload;
 pub mod network;
+pub mod rcu;
 pub mod rcon;
 pub mod save_events;
 pub mod scheduler;

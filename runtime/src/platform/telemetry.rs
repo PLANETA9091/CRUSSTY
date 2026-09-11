@@ -37,9 +37,8 @@
 //! works everywhere so the Windows build stays functional.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -50,8 +49,6 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::sync::OnceLock;
 #[cfg(unix)]
 use std::thread;
 
@@ -102,11 +99,17 @@ static LISTENER: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(unix)]
 static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Sliding-window TPS estimator, fed raw tick durations.
-static TPS: Mutex<TpsWindow> = Mutex::new(TpsWindow {
-    samples: VecDeque::new(),
-    sum_ns: 0,
-});
+/// Lock-free tick ring (TASK-164): the per-tick TPS ingestion writes two
+/// relaxed atomic stores + one fetch_add — no mutex, no window scan, no
+/// division on the hot path. The 60s-window average is computed lazily at
+/// `snapshot()` time (panel-cold path).
+const RING_CAP: usize = 4096;
+static RING_HEAD: AtomicU64 = AtomicU64::new(0);
+static RING_TS: [AtomicU64; RING_CAP] = [const { AtomicU64::new(0) }; RING_CAP];
+static RING_NS: [AtomicU64; RING_CAP] = [const { AtomicU64::new(0) }; RING_CAP];
+/// Process-relative monotonic epoch for ring timestamps (nanos since epoch,
+/// 0 = empty slot; stored values are offset by +1).
+static RING_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Last TPS value as raw f64 bits (TASK-162): the per-tick store is a single
 /// relaxed atomic write — no snapshot lock, no Arc clone, no inner mutex.
@@ -116,57 +119,6 @@ static TPS_LAST_BITS: AtomicU64 = AtomicU64::new(0);
 
 /// Ticks older than this fall out of the TPS window.
 const TPS_WINDOW_SECS: u64 = 60;
-
-/// Sliding-window TPS estimator.
-///
-/// Keeps the last [`TPS_WINDOW_SECS`] seconds of tick durations in a
-/// ring-buffer style deque (time-based eviction, bounded memory) and
-/// computes tps = 1000 / avg_ms. A running sum keeps each push O(1)
-/// amortized. `Instant` (monotonic clock) is used for timestamps so wall
-/// clock adjustments can never distort the window.
-#[derive(Default)]
-struct TpsWindow {
-    samples: VecDeque<(Instant, u64)>,
-    sum_ns: u64,
-}
-
-impl TpsWindow {
-    fn push(&mut self, now: Instant, tick_ns: u64) {
-        let cutoff = now
-            .checked_sub(Duration::from_secs(TPS_WINDOW_SECS))
-            .unwrap_or(now);
-        while let Some(&(t, _)) = self.samples.front() {
-            if t >= cutoff {
-                break;
-            }
-            if let Some((_, d)) = self.samples.pop_front() {
-                self.sum_ns -= d;
-            }
-        }
-        self.samples.push_back((now, tick_ns));
-        self.sum_ns += tick_ns;
-    }
-
-    fn avg_ms(&self) -> Option<f64> {
-        if self.samples.is_empty() {
-            return None;
-        }
-        Some(self.sum_ns as f64 / self.samples.len() as f64 / 1_000_000.0)
-    }
-
-    fn tps(&self) -> f64 {
-        match self.avg_ms() {
-            Some(ms) if ms > 0.0 => 1000.0 / ms,
-            _ => 0.0,
-        }
-    }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.samples.clear();
-        self.sum_ns = 0;
-    }
-}
 
 fn unix_now_secs() -> u64 {
     SystemTime::now()
@@ -201,9 +153,10 @@ pub fn snapshot() -> Snapshot {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    // TASK-162 overlay: `set_tps` no longer locks the snapshot, so the
-    // latest TPS rides on the atomic and lands here at read time.
-    s.tps = current_tps();
+    // TASK-164: TPS comes from the lock-free ring (lazy 60s window average);
+    // `set_tps` still wins when no tick has ever been ingested, so external
+    // callers keep their existing semantics.
+    s.tps = ring_tps().unwrap_or_else(current_tps);
     s
 }
 
@@ -228,8 +181,8 @@ pub fn publish_metric(
     });
 }
 
-/// Store the latest TPS. Per-tick hot path (TASK-162): one relaxed atomic
-/// store — the value lands in [`snapshot`] via the overlay below.
+/// Store the latest TPS (external callers; the per-tick path feeds the ring
+/// instead — see [`push_tick_time_at`]).
 pub fn set_tps(v: f64) {
     TPS_LAST_BITS.store(v.to_bits(), Ordering::Relaxed);
 }
@@ -244,12 +197,12 @@ mod bench_hotpath {
     //! Release-only A/B bench: `cargo test --release -- --ignored --nocapture bench_push_tick`.
     use super::*;
 
-    /// Per-tick ingestion cost (TASK-162 before/after subject): the path
-    /// every server tick pays — window push + TPS store.
+    /// Per-tick ingestion cost INCLUDING the caller's clock read (the
+    /// `push_tick_time` public API reads Instant::now itself).
     #[test]
     #[ignore]
     fn bench_push_tick_time() {
-        push_tick_time(16_666_667); // pre-touch: snapshot/window init off the clock
+        push_tick_time(16_666_667); // pre-touch: ring init off the clock
         let iters = 200_000u32;
         let rounds = 5;
         let mut best = f64::MAX;
@@ -260,9 +213,37 @@ mod bench_hotpath {
             }
             best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
+
+        // TASK-164: the production per-tick shape — the tick boundary has
+        // already read the clock, so ingestion alone is what the server pays.
+        let at = Instant::now();
+        for _ in 0..10_000u32 {
+            push_tick_time_at(at, 16_666_667);
+        }
+        let mut best_at = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for i in 0..iters {
+                push_tick_time_at(at, 16_666_667 + u64::from(i % 1_000));
+            }
+            best_at = best_at.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // The vDSO clock read alone — the hardware floor every
+        // clock-reading path (tick boundary included) carries.
+        let mut best_clock = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(Instant::now());
+            }
+            best_clock = best_clock.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
         println!(
-            "BENCH telemetry: push_tick_time {:.0} ns/op (min of {rounds}x{iters})",
-            best * 1e9
+            "BENCH telemetry: push_tick_time {:.0} ns/op (incl clock), push_tick_time_at {:.0} ns/op, clock_read {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9,
+            best_at * 1e9,
+            best_clock * 1e9
         );
     }
 }
@@ -297,7 +278,8 @@ pub fn set_server_name(name: &str) {
 
 /// Feed a raw tick duration (ns) from a module or transform hook; the
 /// sliding 1-minute window automatically updates the snapshot TPS as
-/// tps = 1000 / avg_ms.
+/// tps = 1000 / avg_ms. Reads the clock itself (the scheduler boundary path
+/// uses [`push_tick_time_at`] to share its own clock read).
 pub fn push_tick_time(tick_ns: u64) {
     push_tick_time_at(Instant::now(), tick_ns);
 }
@@ -305,14 +287,57 @@ pub fn push_tick_time(tick_ns: u64) {
 /// Same ingestion with a caller-supplied timestamp: the tick boundary has
 /// already read the clock when it computes the tick duration, so the window
 /// reuses that instant instead of paying a second clock read per tick
-/// (TASK-162).
+/// (TASK-162). Lock-free (TASK-164): one fetch_add + two atomic stores —
+/// the window average is computed lazily by [`snapshot`].
 pub fn push_tick_time_at(at: Instant, tick_ns: u64) {
-    let tps = {
-        let mut w = TPS.lock().unwrap_or_else(|p| p.into_inner());
-        w.push(at, tick_ns);
-        w.tps()
-    };
-    set_tps(tps);
+    let i = (RING_HEAD.fetch_add(1, Ordering::Relaxed) & (RING_CAP as u64 - 1)) as usize;
+    RING_NS[i].store(tick_ns, Ordering::Relaxed);
+    let epoch = *RING_EPOCH.get_or_init(Instant::now);
+    let ts = at.saturating_duration_since(epoch).as_nanos() as u64;
+    // Offset by +1 so 0 stays the "empty slot" sentinel.
+    RING_TS[i].store(ts.saturating_add(1), Ordering::Release);
+}
+
+/// 60s-window TPS over the ring, computed at snapshot time (cold). The
+/// window reference is the NEWEST sample's timestamp — no clock read, no
+/// epoch dependency — so the eviction semantics are testable with fabricated
+/// instants and identical to the old wall-window shape in production (the
+/// newest sample is always the just-pushed tick).
+fn ring_tps() -> Option<f64> {
+    let head = RING_HEAD.load(Ordering::Relaxed);
+    if head == 0 {
+        return None;
+    }
+    let newest_i = ((head - 1) & (RING_CAP as u64 - 1)) as usize;
+    let newest_ts = RING_TS[newest_i].load(Ordering::Acquire);
+    if newest_ts == 0 {
+        return None;
+    }
+    let cutoff = (newest_ts - 1).saturating_sub(TPS_WINDOW_SECS * 1_000_000_000);
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for k in 0..RING_CAP {
+        let i = (head.wrapping_sub(k as u64 + 1) & (RING_CAP as u64 - 1)) as usize;
+        let ts = RING_TS[i].load(Ordering::Acquire);
+        if ts == 0 {
+            break; // reached the not-yet-written part of the ring
+        }
+        if ts - 1 < cutoff {
+            continue; // outside the 60s window
+        }
+        let ns = RING_NS[i].load(Ordering::Relaxed);
+        // Torn-read guard: the slot was rewritten mid-scan — skip it.
+        if RING_TS[i].load(Ordering::Acquire) != ts {
+            continue;
+        }
+        sum += ns;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let avg_ms = sum as f64 / n as f64 / 1_000_000.0;
+    Some(if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 })
 }
 
 /// Bind the telemetry socket and start the accept + refresh threads.
@@ -505,7 +530,13 @@ mod tests {
 
     fn reset_state() {
         *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        TPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        RING_HEAD.store(0, Ordering::Relaxed);
+        for slot in RING_TS.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for slot in RING_NS.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
         TPS_LAST_BITS.store(0, Ordering::Relaxed);
     }
 
@@ -574,21 +605,30 @@ mod tests {
 
     #[test]
     fn tps_window_math() {
-        let mut w = TpsWindow::default();
-        assert_eq!(w.tps(), 0.0);
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
 
-        // 100 samples of 50ms -> avg 50ms -> tps 20
+        // 100 samples of 50ms -> avg 50ms -> tps 20. Timestamps are
+        // fabricated relative to the real clock (the ring's window is
+        // wall-relative), starting at now so nothing pre-dates the epoch.
         let t0 = Instant::now();
         for i in 0..100 {
-            w.push(t0 + Duration::from_millis(i * 50), 50_000_000);
+            push_tick_time_at(t0 + Duration::from_millis(i * 50), 50_000_000);
         }
-        assert!((w.tps() - 20.0).abs() < 1e-6);
+        let s = snapshot();
+        assert!((s.tps - 20.0).abs() < 1e-6, "tps {} != 20", s.tps);
 
-        // samples older than the 60s window are evicted
-        let mut w2 = TpsWindow::default();
-        w2.push(t0, 50_000_000);
-        w2.push(t0 + Duration::from_secs(61), 40_000_000);
-        assert!((w2.tps() - 25.0).abs() < 1e-6);
+        // samples older than the 60s window are evicted. The window
+        // reference is the NEWEST sample's timestamp, so a sample stamped
+        // 61s after the first one pushes it out of the 60s window (instants
+        // may be fabricated into the future; pre-epoch ones would clamp to
+        // the epoch and never look old).
+        reset_state();
+        let t = Instant::now();
+        push_tick_time_at(t, 50_000_000);
+        push_tick_time_at(t + Duration::from_secs(61), 40_000_000);
+        let s2 = snapshot();
+        assert!((s2.tps - 25.0).abs() < 1e-6, "tps {} != 25", s2.tps);
     }
 
     #[test]

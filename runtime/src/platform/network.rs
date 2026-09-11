@@ -142,6 +142,7 @@
 //! stamp only on overflow, replacing the classic `LinkedHashMap(accessOrder)`
 //! idiom whose deque bookkeeping cost O(conns) per touch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
@@ -186,26 +187,55 @@ pub enum Verdict {
 
 pub type PacketHookFn = Arc<dyn Fn(&mut Packet) -> Verdict + Send + Sync>;
 
-/// Hook registry: an atomically-swapped immutable snapshot. `add_hook`
-/// rebuilds the slice (rare, init-time); the per-packet path takes a read
-/// lock and clones ONE `Arc` (a single atomic increment) instead of locking
-/// a `Mutex` and cloning a `Vec` of hooks on every packet.
-static HOOKS: LazyLock<RwLock<Arc<[PacketHookFn]>>> =
-    LazyLock::new(|| RwLock::new(Arc::from(Vec::new())));
+/// Hook registry: an RCU-published immutable snapshot (TASK-164) — `add_hook`
+/// rebuilds and republishes the slice (rare, init-time) through an
+/// `rcu::ArcCell`; the per-packet path reads a generation-checked per-thread
+/// memo (one acquire load + one Arc clone off TLS), no lock at all.
+static HOOKS: LazyLock<super::rcu::ArcCell<[PacketHookFn]>> =
+    LazyLock::new(super::rcu::ArcCell::new);
+
+thread_local! {
+    static HOOKS_MEMO: RefCell<Option<(u64, Arc<[PacketHookFn]>)>> = const { RefCell::new(None) };
+}
+
+/// Generation-checked per-thread hook snapshot (TASK-164). Hooks may freely
+/// call `add_hook` — the memo guard is never held across hook invocation.
+fn hooks_snapshot() -> Arc<[PacketHookFn]> {
+    let cell = &*HOOKS;
+    let gen = cell.gen();
+    if gen == 0 {
+        return Vec::new().into();
+    }
+    HOOKS_MEMO.with(|m| {
+        if let Ok(borrowed) = m.try_borrow() {
+            if let Some((g, a)) = borrowed.as_ref() {
+                if *g == gen {
+                    return Arc::clone(a);
+                }
+            }
+        }
+        let fresh = cell.load_arc().unwrap_or_else(|| Vec::new().into());
+        if let Ok(mut slot) = m.try_borrow_mut() {
+            *slot = Some((gen, Arc::clone(&fresh)));
+        }
+        fresh
+    })
+}
 
 /// Live packet-hook count (TASK-163): the per-packet fast gate — zero (the
-/// default until a module registers) skips the registry read lock and the
-/// Arc clone entirely. Release-bumped under the write lock.
+/// default until a module registers) skips the snapshot read entirely.
 static PACKET_HOOKS_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Modules register packet hooks at init (order = registration order).
 pub fn add_hook(f: PacketHookFn) {
-    let mut w = HOOKS.write().unwrap_or_else(|p| p.into_inner());
-    let mut v = w.to_vec();
+    let cell = &*HOOKS;
+    let cur = cell.load_arc().unwrap_or_else(|| Vec::new().into());
+    let mut v: Vec<PacketHookFn> = Vec::with_capacity(cur.len() + 1);
+    v.extend(cur.iter().cloned());
     v.push(f);
-    *w = v.into();
-    drop(w);
-    PACKET_HOOKS_LIVE.fetch_add(1, Ordering::Release);
+    let live = v.len();
+    cell.store(v.into());
+    PACKET_HOOKS_LIVE.store(live, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +347,8 @@ pub fn attach_conn(conn_id: u64, player_uuid: Option<u128>) -> bool {
             .map(|(k, e)| (*k, e.stamp))
         {
             reg.map.remove(&oldest);
+            // TASK-164 mirror: the evicted conn must not answer probes.
+            conn_mirror_del(oldest);
         }
     }
     let stamp = LRU_CLOCK.fetch_add(1, Ordering::Relaxed);
@@ -328,6 +360,8 @@ pub fn attach_conn(conn_id: u64, player_uuid: Option<u128>) -> bool {
             stamp,
         },
     );
+    // TASK-164 mirror: the per-packet state_of probe reads this table.
+    conn_mirror_put(conn_id, ProtocolState::Handshake.code());
     // TASK-163 gate mirror: keep the live-conn count honest (the per-packet
     // state_of gate trusts 0 = empty table).
     let live = reg.map.len();
@@ -346,6 +380,7 @@ pub fn detach_conn(conn_id: u64) -> bool {
         .remove(&conn_id)
         .is_some();
     if removed {
+        conn_mirror_del(conn_id);
         let live = CONNS.read().unwrap_or_else(|p| p.into_inner()).map.len();
         CONNS_LIVE.store(live, Ordering::Release);
     }
@@ -371,23 +406,96 @@ pub fn set_conn_state(conn_id: u64, state_code: u8) -> bool {
     }
     entry.state = to;
     lru_touch(entry);
+    conn_mirror_put(conn_id, to.code());
     true
 }
 
-/// Tracked protocol-state code for a connection, if any. Takes the registry
-/// READ lock only — the per-packet path never needs the write lock.
+/// Tracked protocol-state code for a connection, if any. Lock-free on the
+/// per-packet path (TASK-164): an open-addressed atomic mirror table
+/// (linear probing, tombstone on remove) fed by the registry writers — the
+/// RwLock map below stays the source of truth for everything cold.
 pub fn state_of(conn_id: u64) -> Option<u8> {
     // TASK-163 fast gate: zero tracked conns (before the first player) is
-    // one acquire load — no lock round-trip.
+    // one acquire load — no probe, no lock round-trip.
     if CONNS_LIVE.load(Ordering::Acquire) == 0 {
         return None;
     }
-    CONNS
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .map
-        .get(&conn_id)
-        .map(|e| e.state.code())
+    let mut i = conn_slot(conn_id);
+    let key = conn_key(conn_id);
+    loop {
+        let k = CONN_KEY[i].load(Ordering::Acquire);
+        if k == key {
+            return Some(CONN_STATE_MIRROR[i].load(Ordering::Relaxed) as u8);
+        }
+        if k == 0 {
+            // Clean empty slot: linear probing never places a key past an
+            // empty slot, so the key is definitively absent.
+            return None;
+        }
+        i = (i + 1) & (CONN_TAB - 1); // tombstone (u64::MAX) or foreign key
+    }
+}
+
+/// Atomic conn mirror table size: power of two, ~4x the conn cap so probes
+/// stay at one slot on average.
+const CONN_TAB: usize = 16384;
+const CONN_TOMBSTONE: u64 = u64::MAX;
+static CONN_KEY: [AtomicU64; CONN_TAB] = [const { AtomicU64::new(0) }; CONN_TAB];
+static CONN_STATE_MIRROR: [AtomicU64; CONN_TAB] = [const { AtomicU64::new(0) }; CONN_TAB];
+
+#[inline]
+fn conn_slot(conn_id: u64) -> usize {
+    (conn_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & (CONN_TAB - 1)
+}
+
+/// Mirror keys are stored XOR-flipped so a real conn_id can never equal the
+/// `0` empty sentinel or the `u64::MAX` tombstone (conn_id 0 is a legal id —
+/// without the flip `state_of(0)` would match clean-empty slots).
+#[inline]
+fn conn_key(conn_id: u64) -> u64 {
+    conn_id ^ 0x8000_0000_0000_0000
+}
+
+/// Mirror write: insert or update `conn_id -> state` (callers hold the
+/// registry write lock, so mirror writes are serialized).
+fn conn_mirror_put(conn_id: u64, state: u8) {
+    let key = conn_key(conn_id);
+    let mut i = conn_slot(conn_id);
+    loop {
+        let k = CONN_KEY[i].load(Ordering::Relaxed);
+        if k == key {
+            CONN_STATE_MIRROR[i].store(u64::from(state), Ordering::Release);
+            return;
+        }
+        if k == 0 || k == CONN_TOMBSTONE {
+            if CONN_KEY[i]
+                .compare_exchange(k, key, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                CONN_STATE_MIRROR[i].store(u64::from(state), Ordering::Release);
+                return;
+            }
+        }
+        i = (i + 1) & (CONN_TAB - 1);
+    }
+}
+
+/// Mirror write: remove `conn_id` (tombstone).
+fn conn_mirror_del(conn_id: u64) {
+    let key = conn_key(conn_id);
+    let mut i = conn_slot(conn_id);
+    loop {
+        let k = CONN_KEY[i].load(Ordering::Relaxed);
+        if k == key {
+            CONN_KEY[i].store(CONN_TOMBSTONE, Ordering::Release);
+            CONN_STATE_MIRROR[i].store(0, Ordering::Release);
+            return;
+        }
+        if k == 0 {
+            return; // not present
+        }
+        i = (i + 1) & (CONN_TAB - 1);
+    }
 }
 
 /// Tracked details (uuid + state) for a connection, if any.
@@ -516,12 +624,9 @@ pub fn run_hooks(mut packet: Packet) -> Verdict {
     publish_counter(dir_kind.1, total);
 
     // TASK-163 fast gate: with zero registered hooks — the default until a
-    // module adds one — skip the registry read lock and the Arc clone.
+    // module adds one — skip the registry read entirely.
     if PACKET_HOOKS_LIVE.load(Ordering::Acquire) > 0 {
-        let hooks = HOOKS
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let hooks = hooks_snapshot();
         for h in hooks.iter() {
             match h(&mut packet) {
                 Verdict::Pass => continue,
@@ -1009,6 +1114,33 @@ mod bench_default_shape {
         }
         println!(
             "BENCH run_hooks(default 0 hooks 0 conns): {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
+
+    /// FRAME cost: the run_hooks pipeline alone with a zero-length payload
+    /// (no heap alloc/free for the packet bytes — the framework share of the
+    /// per-packet cost; the payload-carrying variants above include one
+    /// Vec malloc+free that the packet bytes require).
+    #[test]
+    #[ignore]
+    fn bench_run_hooks_frame() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        for i in 0..10_000u64 {
+            let _ = run_hooks(packet(Direction::Inbound, i, 0, &[]));
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for i in 0..iters as u64 {
+                let _ = run_hooks(packet(Direction::Inbound, i, 0, &[]));
+            }
+            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH run_hooks(frame, empty payload, 0 hooks 0 conns): {:.0} ns/op (min of {rounds}x{iters})",
             best * 1e9
         );
     }

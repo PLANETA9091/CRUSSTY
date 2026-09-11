@@ -12,8 +12,8 @@
 //!   exact-name matches first and pattern matches afterwards (patterns in the
 //!   order their subscriptions were created).
 //! * Async handlers run on a lazily-spawned dispatcher pool (2 threads) and
-//!   may interleave with sync handlers. Handlers for a *single publish* of the
-//!   same event still run in subscription order (one queued task per publish),
+//!   may interleave with sync handlers. Handlers for a *single publish* of
+//!   the same event still run in subscription order (one queued task per publish),
 //!   but distinct publishes may be reordered across pool workers. Async
 //!   delivery is fire-and-forget: `publish` never blocks on it.
 //! * `publish` returns the number of sync handlers invoked; async dispatch is
@@ -45,7 +45,16 @@
 //! Every handler invocation (sync and async) is wrapped in
 //! `catch_unwind`; a panicking handler is logged and never propagates to
 //! the publisher or kills a pool worker. A sync handler may publish again —
-//! the registry lock is only held for snapshotting, never during invocation.
+//! the registry lock is only held for mutation, never during invocation.
+//!
+//! # Hot path (TASK-164)
+//!
+//! `publish` / `has_subscribers` never take a lock. Each registry keeps an
+//! immutable [`RegistryView`] published through an RCU [`rcu::ArcCell`];
+//! every hot caller resolves an event through a per-thread memo (keyed by
+//! bus id + both registry generations + event hash) holding a precomputed
+//! handler list. A memo hit is two acquire loads, an FNV hash and a
+//! compare — no allocation, no mutex, no refcount traffic on the view.
 //!
 //! # Lifecycle events
 //!
@@ -62,9 +71,10 @@
 //! (LavinMQ topic-exchange rewrite, RabbitMQ docs), `catch_unwind` +
 //! `AssertUnwindSafe` panic isolation for worker pools (std docs, Stanza
 //! Concurrent Rust §thread-panics), generation counters for stale-handle
-//! invalidation (slab/arena pattern).
+//! invalidation (slab/arena pattern), RCU snapshots (see [`rcu`]).
 
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -134,7 +144,8 @@ impl HandlerList {
 }
 
 /// Exact-name subscriptions plus glob-pattern subscriptions, in creation
-/// order (used for both the sync and the async registries).
+/// order (used for both the sync and the async registries). Writer-side
+/// source of truth — reads go through the RCU [`RegistryView`].
 #[derive(Default)]
 struct Registry {
     exact: HashMap<String, HandlerList>,
@@ -142,31 +153,6 @@ struct Registry {
 }
 
 impl Registry {
-    /// Snapshot the handlers that apply to `event` (exact first, then
-    /// matching patterns in insertion order), each with its module owner.
-    fn snapshot(&self, event: &str) -> Vec<(Option<(String, u64)>, Handler)> {
-        let mut out = Vec::new();
-        if let Some(list) = self.exact.get(event) {
-            out.reserve(list.entries.len());
-            out.extend(
-                list.entries
-                    .iter()
-                    .map(|e| (e.owner.clone(), e.handler.clone())),
-            );
-        }
-        for (pattern, list) in &self.patterns {
-            if glob_match(pattern, event) {
-                out.reserve(list.entries.len());
-                out.extend(
-                    list.entries
-                        .iter()
-                        .map(|e| (e.owner.clone(), e.handler.clone())),
-                );
-            }
-        }
-        out
-    }
-
     fn insert(
         &mut self,
         event: &str,
@@ -252,6 +238,309 @@ fn has_glob(pattern: &str) -> bool {
     pattern.contains('*')
 }
 
+/// FNV-1a 64-bit — event-name hash for the flat exact map and the per-thread
+/// memo key (shared chunked implementation in [`rcu`]).
+use super::rcu::fnv1a;
+
+/// Resolved dispatch list for one event name: exact matches first, then
+/// pattern matches in insertion order — precomputed at mutation time so the
+/// hot publish path never allocates or clones per subscriber.
+type Resolved = Arc<[(Option<(Box<str>, u64)>, Handler)]>;
+
+/// One exact topic in the view's open-addressed flat map (insert-only; the
+/// whole view is rebuilt on every registry mutation).
+struct ExactSlot {
+    hash: u64,
+    name: Box<str>,
+    list: Resolved,
+}
+
+struct PatternSlot {
+    pattern: Box<str>,
+    list: Resolved,
+}
+
+/// Immutable compiled view of a [`Registry`] (TASK-164): exact topics in an
+/// open-addressed flat map keyed by FNV-1a hash, patterns with their resolved
+/// handler lists. Published through an RCU cell; readers never lock.
+struct RegistryView {
+    exact: Vec<Option<ExactSlot>>,
+    mask: usize,
+    patterns: Vec<PatternSlot>,
+}
+
+impl RegistryView {
+    fn from_registry(reg: &Registry) -> Self {
+        let cap = (reg.exact.len() * 2 + 2).next_power_of_two();
+        let mut exact: Vec<Option<ExactSlot>> = (0..cap).map(|_| None).collect();
+        for (name, list) in &reg.exact {
+            let resolved: Resolved = Arc::from(
+                list.entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.owner
+                                .clone()
+                                .map(|(id, gen)| (id.into_boxed_str(), gen)),
+                            Arc::clone(&e.handler),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let hash = fnv1a(name.as_bytes());
+            let mut i = (hash as usize) & (cap - 1);
+            while exact[i].is_some() {
+                i = (i + 1) & (cap - 1);
+            }
+            exact[i] = Some(ExactSlot { hash, name: name.clone().into_boxed_str(), list: resolved });
+        }
+        let patterns = reg
+            .patterns
+            .iter()
+            .map(|(p, list)| PatternSlot {
+                pattern: p.clone().into_boxed_str(),
+                list: Arc::from(
+                    list.entries
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.owner
+                                    .clone()
+                                    .map(|(id, gen)| (id.into_boxed_str(), gen)),
+                                Arc::clone(&e.handler),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            })
+            .collect();
+        RegistryView { exact, mask: cap - 1, patterns }
+    }
+
+    fn exact_find(&self, hash: u64, name: &str) -> Option<&Resolved> {
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            match &self.exact[i] {
+                None => return None,
+                Some(slot) => {
+                    if slot.hash == hash && &*slot.name == name {
+                        return Some(&slot.list);
+                    }
+                    i = (i + 1) & self.mask;
+                }
+            }
+        }
+    }
+
+    fn any_match(&self, hash: u64, event: &str) -> bool {
+        if self.exact_find(hash, event).is_some() {
+            return true;
+        }
+        self.patterns.iter().any(|p| glob_match(&p.pattern, event))
+    }
+
+    /// Exact matches first, then patterns in insertion order — the dispatch
+    /// order guarantee.
+    fn resolve(&self, hash: u64, event: &str) -> Resolved {
+        let mut out: Vec<(Option<(Box<str>, u64)>, Handler)> = Vec::new();
+        if let Some(list) = self.exact_find(hash, event) {
+            out.extend(list.iter().cloned());
+        }
+        for p in &self.patterns {
+            if glob_match(&p.pattern, event) {
+                out.extend(p.list.iter().cloned());
+            }
+        }
+        Arc::from(out)
+    }
+}
+
+/// Writer-side registry + RCU-published immutable view (TASK-164). Every
+/// mutation happens under `reg`'s mutex and republishes a freshly compiled
+/// view (generation bump included).
+struct RegistryCell {
+    reg: Mutex<Registry>,
+    view: super::rcu::ArcCell<RegistryView>,
+    /// Per-cell identity for thread-local memo slots.
+    id: u64,
+    /// Bus-wide combined generation counter: sync mutations bump the high
+    /// word, async mutations the low word (TASK-164: the hot gate reads ONE
+    /// atomic for both registries).
+    shared: Arc<AtomicU64>,
+    shift: u32,
+}
+
+static NEXT_CELL_ID: AtomicU64 = AtomicU64::new(1);
+
+impl RegistryCell {
+    fn new(shared: Arc<AtomicU64>, shift: u32) -> Self {
+        Self {
+            reg: Mutex::new(Registry::default()),
+            view: super::rcu::ArcCell::new(),
+            id: NEXT_CELL_ID.fetch_add(1, Ordering::Relaxed),
+            shared,
+            shift,
+        }
+    }
+
+    /// Apply `f` to the registry; when it reports a change, compile and
+    /// publish a new view, then bump the bus-wide combined generation (the
+    /// memo invalidation point — a publish that loads the new generation
+    /// will resolve against the new view).
+    fn mutate<T>(&self, f: impl FnOnce(&mut Registry) -> (bool, T)) -> T {
+        let mut reg = self.reg.lock().unwrap_or_else(|p| p.into_inner());
+        let (changed, out) = f(&mut reg);
+        if changed {
+            let view = Arc::new(RegistryView::from_registry(&reg));
+            self.view.store(view);
+            self.shared.fetch_add(1 << self.shift, Ordering::Release);
+        }
+        out
+    }
+}
+
+/// Per-thread resolved-event memo (TASK-164): a hot publish with live
+/// subscribers pays no lock, no snapshot and no allocation — the resolved
+/// handler list is cached per thread and invalidated by either registry's
+/// generation moving.
+const MEMO_SLOTS: usize = 4;
+
+struct MemoSlot {
+    bus_key: u64,
+    /// Combined (sync<<32 | async) generation the slot was resolved at.
+    gens: u64,
+    hash: u64,
+    name: Box<str>,
+    resolved: Resolved,
+    has_async: bool,
+}
+
+thread_local! {
+    static MEMO: RefCell<[Option<MemoSlot>; MEMO_SLOTS]> = const {
+        RefCell::new([None, None, None, None])
+    };
+    static MEMO_CLOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn memo_key_matches(s: &MemoSlot, bus_key: u64, gens: u64, hash: u64, event: &str) -> bool {
+    s.bus_key == bus_key
+        && s.gens == gens
+        && s.hash == hash
+        && &*s.name == event
+}
+
+/// Hot publish through the memo: on a hit the dispatch runs while the slot
+/// is borrowed (no Arc refcount traffic at all). Re-entrant publishes from a
+/// handler re-borrow shared — safe; a nested SLOW-path fill uses
+/// `try_borrow_mut` and simply skips the fill. Returns
+/// `(invoked, has_async)` when a slot matched.
+fn memo_dispatch(
+    bus_key: u64,
+    gens: u64,
+    hash: u64,
+    event: &str,
+    payload: &Value,
+) -> Option<(usize, bool)> {
+    let mut hit = None;
+    MEMO.with(|m| {
+        // Phase 1 (shared borrow): find the slot. Nested publishes from a
+        // handler re-borrow shared — safe.
+        let idx = {
+            let slots = m.borrow();
+            let mut idx = None;
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(s) = slot else { continue };
+                if memo_key_matches(s, bus_key, gens, hash, event) {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            idx
+        };
+        let Some(i) = idx else { return };
+        // Phase 2: dispatch under the shared borrow — the nested-publish
+        // shape stays panic-free; the MRU swap happens after, best-effort.
+        {
+            let slots = m.borrow();
+            let s = slots[i].as_ref().expect("hit slot");
+            let invoked = dispatch(&s.resolved, event, payload);
+            hit = Some((invoked, s.has_async));
+        }
+        if i > 0 {
+            if let Ok(mut slots) = m.try_borrow_mut() {
+                slots.swap(0, i);
+            }
+        }
+    });
+    hit
+}
+
+/// Hot has_subscribers through the memo. Never holds a mutable borrow: a
+/// handler may call has_subscribers re-entrantly while a publish holds the
+/// shared borrow (the MRU swap then just skips).
+fn memo_has(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<bool> {
+    let mut hit = None;
+    MEMO.with(|m| {
+        let idx = {
+            let slots = m.borrow();
+            let mut idx = None;
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(s) = slot else { continue };
+                if memo_key_matches(s, bus_key, gens, hash, event) {
+                    hit = Some(!s.resolved.is_empty() || s.has_async);
+                    idx = Some(i);
+                    break;
+                }
+            }
+            idx
+        };
+        if let Some(i) = idx {
+            if i > 0 {
+                if let Ok(mut slots) = m.try_borrow_mut() {
+                    slots.swap(0, i);
+                }
+            }
+        }
+    });
+    hit
+}
+
+fn memo_fill(
+    bus_key: u64,
+    gens: u64,
+    hash: u64,
+    event: &str,
+    resolved: Resolved,
+    has_async: bool,
+) {
+    MEMO.with(|m| {
+        // try_borrow_mut: a nested fill while a hit-borrow is alive just
+        // skips the fill — the next publish re-resolves and retries.
+        if let Ok(mut slots) = m.try_borrow_mut() {
+            let clock = MEMO_CLOCK.with(|c| c.get());
+            MEMO_CLOCK.with(|c| c.set(clock + 1));
+            // Refresh an existing slot for this (bus, event) in place; otherwise
+            // round-robin over the fixed-size table.
+            let target = slots
+                .iter()
+                .position(|s| {
+                    s.as_ref()
+                        .is_some_and(|s| s.bus_key == bus_key && s.hash == hash && &*s.name == event)
+                })
+                .unwrap_or(clock % MEMO_SLOTS);
+            slots[target] = Some(MemoSlot {
+                bus_key,
+                gens,
+                hash,
+                name: event.into(),
+                resolved,
+                has_async,
+            });
+        }
+    });
+}
+
 /// One queued unit of async work: the handler snapshot for a single publish.
 struct AsyncTask {
     event: String,
@@ -260,7 +549,7 @@ struct AsyncTask {
     /// sit in the queue or run: a reload cannot dlclose a module whose async
     /// handlers are still pending or in flight (active-count protocol).
     leaders: Vec<Option<super::hot_reload::ModuleGuard>>,
-    handlers: Vec<(Option<(String, u64)>, Handler)>,
+    handlers: Resolved,
 }
 
 /// Bounded dispatcher pool. Workers are spawned lazily on first use and run
@@ -327,7 +616,7 @@ impl AsyncPool {
         // Release the guards as the handlers run, so a reload can proceed
         // once the last in-flight dispatch finishes.
         let mut leader_index = 0usize;
-        for (owner, handler) in &task.handlers {
+        for (owner, handler) in task.handlers.iter() {
             let _leader = task.leaders.get_mut(leader_index).and_then(Option::take);
             if owner.is_some() && _leader.is_none() {
                 // Mid-swap: the module's mapping may be unmapped at any
@@ -362,8 +651,8 @@ fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
     guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn dispatch(handlers: &[(Option<(String, u64)>, Handler)], event: &str, payload: &Value) -> usize {
-    for (owner, handler) in handlers {
+fn dispatch(handlers: &[(Option<(Box<str>, u64)>, Handler)], event: &str, payload: &Value) -> usize {
+    for (owner, handler) in handlers.iter() {
         let guard = owner
             .as_ref()
             .and_then(|(id, _)| super::hot_reload::guard_module(id));
@@ -382,25 +671,30 @@ fn dispatch(handlers: &[(Option<(String, u64)>, Handler)], event: &str, payload:
     handlers.len()
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EventBus {
-    handlers: Arc<Mutex<Registry>>,
-    async_handlers: Arc<Mutex<Registry>>,
+    sync: Arc<RegistryCell>,
+    async_cell: Arc<RegistryCell>,
     pool: Arc<AsyncPool>,
     next_id: Arc<AtomicU64>,
     emitting_lifecycle: Arc<AtomicBool>,
-    /// Live async subscription count (TASK-161): lets `publish` skip the
-    /// async-registry lock + snapshot entirely in the common no-async case.
-    /// Maintained by `subscribe_async` / `unsubscribe` / `purge_owner`.
-    async_count: Arc<AtomicUsize>,
-    /// Total live subscription count across BOTH registries (TASK-162).
-    /// Zero is the production default, so `publish` / `has_subscribers` use
-    /// it as a lock-free fast gate: one relaxed load instead of two mutex
-    /// acquisitions plus a registry scan. Maintained by `subscribe`,
-    /// `subscribe_async`, `unsubscribe` and `purge_owner` — the invariant is
-    /// total == (sync entries + async entries), so gate > 0 always falls back
-    /// to the exact registry path (conservative, never wrong).
-    total_subs: Arc<AtomicUsize>,
+    /// Combined (sync<<32 | async) mutation generations — the ONE atomic the
+    /// hot gate and the memo key read (TASK-164).
+    gens: Arc<AtomicU64>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        let gens = Arc::new(AtomicU64::new(0));
+        Self {
+            sync: Arc::new(RegistryCell::new(Arc::clone(&gens), 32)),
+            async_cell: Arc::new(RegistryCell::new(Arc::clone(&gens), 0)),
+            pool: Arc::new(AsyncPool::default()),
+            next_id: Arc::new(AtomicU64::new(0)),
+            emitting_lifecycle: Arc::new(AtomicBool::new(false)),
+            gens,
+        }
+    }
 }
 
 static GLOBAL: OnceLock<EventBus> = OnceLock::new();
@@ -410,7 +704,7 @@ pub fn global() -> EventBus {
 }
 
 /// Borrowed handle to the process-global bus (TASK-163): hot callers (the
-/// per-class-load gate) must not pay the six-Arc clone `global()` costs to
+/// per-class-load gate) must not pay the five-Arc clone `global()` costs to
 /// consult a counter. Same bus, no clone.
 pub fn global_ref() -> &'static EventBus {
     GLOBAL.get_or_init(EventBus::default)
@@ -424,16 +718,11 @@ impl EventBus {
     /// generation (purged on its hot reload).
     pub fn subscribe(&self, event: &str, f: Handler) -> Subscription {
         let owner = crate::registration_owner();
-        let token = {
-            let mut registry = lock(&self.handlers);
-            registry.insert(
-                event,
-                f,
-                self.next_id.fetch_add(1, Ordering::SeqCst),
-                owner,
-            )
-        };
-        self.total_subs.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let token = self.sync.mutate(|r| {
+            let tok = r.insert(event, f, id, owner);
+            (true, tok)
+        });
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
     }
@@ -444,17 +733,11 @@ impl EventBus {
     /// [`EventBus::subscribe`].
     pub fn subscribe_async(&self, event: &str, f: Handler) -> Subscription {
         let owner = crate::registration_owner();
-        let token = {
-            let mut registry = lock(&self.async_handlers);
-            registry.insert(
-                event,
-                f,
-                self.next_id.fetch_add(1, Ordering::SeqCst),
-                owner,
-            )
-        };
-        self.async_count.fetch_add(1, Ordering::SeqCst);
-        self.total_subs.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let token = self.async_cell.mutate(|r| {
+            let tok = r.insert(event, f, id, owner);
+            (true, tok)
+        });
         self.emit_lifecycle(lifecycle::EVENT_SUBSCRIBED, event, token.id);
         token
     }
@@ -464,14 +747,16 @@ impl EventBus {
     /// dlcloses the replaced library, so no publish can ever invoke an
     /// unloaded callback. Returns the number of subscriptions removed.
     pub fn purge_owner(&self, owner: &(String, u64)) -> usize {
-        let removed_sync = lock(&self.handlers).purge_owner(owner);
-        let removed_async = lock(&self.async_handlers).purge_owner(owner);
-        if removed_async > 0 {
-            self.async_count.fetch_sub(removed_async, Ordering::SeqCst);
-        }
+        let removed_sync = self.sync.mutate(|r| {
+            let n = r.purge_owner(owner);
+            (n > 0, n)
+        });
+        let removed_async = self.async_cell.mutate(|r| {
+            let n = r.purge_owner(owner);
+            (n > 0, n)
+        });
         let removed = removed_sync + removed_async;
         if removed > 0 {
-            self.total_subs.fetch_sub(removed, Ordering::SeqCst);
             eprintln!(
                 "[crussty:events] purge: dropped {removed} subscription(s) owned by '{}' gen {}",
                 owner.0, owner.1
@@ -485,36 +770,39 @@ impl EventBus {
     /// no handler snapshot — so hot paths (e.g. the class-load hook) can
     /// skip building a payload entirely when nobody listens.
     pub fn has_subscribers(&self, event: &str) -> bool {
-        // Lock-free fast gate (TASK-162): zero subscriptions is the default
-        // steady state — one relaxed load beats two mutex acquisitions plus
-        // a registry scan.
-        if self.total_subs.load(Ordering::Relaxed) == 0 {
+        // Lock-free fast gate (TASK-164): combined generation 0 = never
+        // mutated = both registries empty — ONE acquire load, no locks.
+        let gens = self.gens.load(Ordering::Acquire);
+        if gens == 0 {
             return false;
         }
-        let any = |registry: &Mutex<Registry>| {
-            let r = lock(registry);
-            r.exact.contains_key(event)
-                || r.patterns.iter().any(|(p, _)| glob_match(p, event))
-        };
-        any(&self.handlers) || any(&self.async_handlers)
+        let hash = fnv1a(event.as_bytes());
+        if let Some(any) = memo_has(self.sync.id, gens, hash, event) {
+            return any;
+        }
+        let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
+        let any = !resolved.is_empty() || has_async;
+        memo_fill(self.sync.id, gens, hash, event, resolved, has_async);
+        any
     }
 
     /// Remove a subscription. Returns `false` if the token is unknown or
     /// stale (never emitted on this bus, already removed, or its list was
     /// mutated since).
     pub fn unsubscribe(&self, event: &str, token: &Subscription) -> bool {
-        let removed_sync = lock(&self.handlers).remove(event, token);
-        let removed = if removed_sync {
+        let removed = self.sync.mutate(|r| {
+            let x = r.remove(event, token);
+            (x, x)
+        });
+        let removed = if removed {
             true
         } else {
-            let removed_async = lock(&self.async_handlers).remove(event, token);
-            if removed_async {
-                self.async_count.fetch_sub(1, Ordering::SeqCst);
-            }
-            removed_async
+            self.async_cell.mutate(|r| {
+                let x = r.remove(event, token);
+                (x, x)
+            })
         };
         if removed {
-            self.total_subs.fetch_sub(1, Ordering::SeqCst);
             self.emit_lifecycle(lifecycle::EVENT_UNSUBSCRIBED, event, token.id);
         }
         removed
@@ -524,39 +812,89 @@ impl EventBus {
     /// Async handlers for this event are queued as one task and dispatched
     /// on the pool.
     pub fn publish(&self, event: &str, payload: &Value) -> usize {
-        // Lock-free fast gate (TASK-162): nothing subscribed anywhere —
-        // exactly one relaxed load instead of locking the sync registry and
-        // scanning it. This is the per-tick / per-class-load default shape.
-        if self.total_subs.load(Ordering::Relaxed) == 0 {
+        // Lock-free fast gate (TASK-164): combined generation 0 = nothing
+        // ever subscribed — ONE acquire load, no locks. This is the
+        // per-tick / per-class-load default shape.
+        let gens = self.gens.load(Ordering::Acquire);
+        if gens == 0 {
             return 0;
         }
-        let handlers = lock(&self.handlers).snapshot(event);
-        let invoked = dispatch(&handlers, event, payload);
-        // Fast path (TASK-161): with no async subscriptions — the default —
-        // skip the async registry lock + snapshot entirely.
-        if self.async_count.load(Ordering::Relaxed) > 0 {
-            let async_handlers = lock(&self.async_handlers).snapshot(event);
-            if !async_handlers.is_empty() {
-                // Quiescence: every queued handler keeps its module's guard
-                // alive until the pool has run it (see AsyncTask::leaders), so a
-                // hot reload waits instead of dlclosing under pending handlers.
-                let leaders = async_handlers
-                    .iter()
-                    .map(|(owner, _)| {
-                        owner
-                            .as_ref()
-                            .and_then(|(id, _)| super::hot_reload::guard_module(id))
-                    })
-                    .collect();
-                self.pool.push(AsyncTask {
-                    event: event.to_string(),
-                    payload: payload.clone(),
-                    leaders,
-                    handlers: async_handlers,
-                });
+        let hash = fnv1a(event.as_bytes());
+        // Per-thread memo hit: precomputed resolved list — no locks, no
+        // snapshot, no allocation, no refcount traffic on the hot path.
+        if let Some((invoked, has_async)) =
+            memo_dispatch(self.sync.id, gens, hash, event, payload)
+        {
+            if has_async {
+                self.queue_async(event, payload, hash);
             }
+            return invoked;
+        }
+        let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
+        memo_fill(
+            self.sync.id,
+            gens,
+            hash,
+            event,
+            Arc::clone(&resolved),
+            has_async,
+        );
+        let invoked = dispatch(&resolved, event, payload);
+        if has_async {
+            self.queue_async(event, payload, hash);
         }
         invoked
+    }
+
+    /// Cold resolution path: load the RCU views, build the resolved lists.
+    fn resolve_event(&self, event: &str, hash: u64, sg: u64, ag: u64) -> (Resolved, bool) {
+        let resolved: Resolved = if sg > 0 {
+            self.sync
+                .view
+                .load_arc()
+                .map(|v| v.resolve(hash, event))
+                .unwrap_or_else(|| Arc::from(Vec::new()))
+        } else {
+            Arc::from(Vec::new())
+        };
+        let has_async = ag > 0
+            && self
+                .async_cell
+                .view
+                .load_arc()
+                .is_some_and(|v| v.any_match(hash, event));
+        (resolved, has_async)
+    }
+
+    /// Queue the async handlers for one publish (cold: only when an async
+    /// subscription matches).
+    fn queue_async(&self, event: &str, payload: &Value, hash: u64) {
+        let Some(list) = self
+            .async_cell
+            .view
+            .load_arc()
+            .map(|v| v.resolve(hash, event))
+            .filter(|l| !l.is_empty())
+        else {
+            return;
+        };
+        // Quiescence: every queued handler keeps its module's guard alive
+        // until the pool has run it (see AsyncTask::leaders), so a hot
+        // reload waits instead of dlclosing under pending handlers.
+        let leaders = list
+            .iter()
+            .map(|(owner, _)| {
+                owner
+                    .as_ref()
+                    .and_then(|(id, _)| super::hot_reload::guard_module(id))
+            })
+            .collect();
+        self.pool.push(AsyncTask {
+            event: event.to_string(),
+            payload: payload.clone(),
+            leaders,
+            handlers: list,
+        });
     }
 
     /// Number of events currently queued for async dispatch (queue depth).
@@ -623,14 +961,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     pub(super) fn with_cap(cap: usize) -> EventBus {
+        let gens = Arc::new(AtomicU64::new(0));
         EventBus {
-            handlers: Arc::new(Mutex::new(Registry::default())),
-            async_handlers: Arc::new(Mutex::new(Registry::default())),
+            sync: Arc::new(RegistryCell::new(Arc::clone(&gens), 32)),
+            async_cell: Arc::new(RegistryCell::new(Arc::clone(&gens), 0)),
             pool: Arc::new(AsyncPool::new(cap)),
             next_id: Arc::new(AtomicU64::new(0)),
             emitting_lifecycle: Arc::new(AtomicBool::new(false)),
-            async_count: Arc::new(AtomicUsize::new(0)),
-            total_subs: Arc::new(AtomicUsize::new(0)),
+            gens,
         }
     }
 

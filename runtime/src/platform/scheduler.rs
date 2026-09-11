@@ -103,8 +103,9 @@
 use crate::platform::events::lifecycle::TICK_BOUNDARY;
 use crate::platform::transform::{global_engine, Injection, Rule};
 use serde_json::json;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 /// A unit of work the kernel scheduled (identified opaquely by the module).
@@ -118,6 +119,18 @@ pub struct ScheduledTask {
     pub tag: String,
 }
 
+/// Borrowed routing probe (TASK-164): the scheduling-surface hot path
+/// consults routers with a stack probe — an owned [`ScheduledTask`] (and its
+/// tag allocation) is materialized only when a router actually claims the
+/// task.
+#[derive(Debug, Clone, Copy)]
+pub struct Probe<'a> {
+    /// Which scheduling surface fired (e.g. "kernel", "blockticks").
+    pub tag: &'a str,
+    /// Server tick estimate at probe time.
+    pub tick: Option<u64>,
+}
+
 /// Decision a module returns for an intercepted task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Routing {
@@ -129,29 +142,35 @@ pub enum Routing {
     Drop,
 }
 
-pub type RouterFn = Arc<dyn Fn(&ScheduledTask) -> Routing + Send + Sync>;
+pub type RouterFn = Arc<dyn Fn(&Probe<'_>) -> Routing + Send + Sync>;
 
-/// Hotpath note (TASK-161): `route_task` runs per task submission (Bukkit/
-/// Paper schedulers submit hundreds of tasks per second). The router list is
-/// an immutable snapshot behind an RwLock — the read path clones one `Arc`
-/// (guard dropped before routers run, so a router may safely `add_router`),
-/// instead of cloning a whole `Vec<RouterFn>` per submission.
-static ROUTERS: OnceLock<RwLock<Arc<[RouterFn]>>> = OnceLock::new();
+/// Hotpath note (TASK-164): the router list is an immutable snapshot behind
+/// an RCU cell (`rcu::ArcCell`) with a per-thread generation memo — the
+/// per-task read path is one acquire load + an Arc clone off thread-local
+/// storage, no lock at all. Registration (cold) republishes the snapshot
+/// and bumps the generation.
+static ROUTERS: OnceLock<super::rcu::ArcCell<[RouterFn]>> = OnceLock::new();
 
-fn routers() -> &'static RwLock<Arc<[RouterFn]>> {
-    ROUTERS.get_or_init(|| RwLock::new(Arc::from(Vec::new())))
+fn routers() -> &'static super::rcu::ArcCell<[RouterFn]> {
+    ROUTERS.get_or_init(super::rcu::ArcCell::new)
+}
+
+thread_local! {
+    static ROUTER_MEMO: RefCell<Option<(u64, Arc<[RouterFn]>)>> = const { RefCell::new(None) };
 }
 
 /// Register a router; all routers are consulted in order until one returns
 /// something other than KeepKernel (first non-keep wins).
 pub fn add_router(f: RouterFn) {
-    let mut w = routers().write().unwrap_or_else(|p| p.into_inner());
-    let mut v: Vec<RouterFn> = w.to_vec();
+    let cell = routers();
+    let cur = cell.load_arc().unwrap_or_else(|| Vec::new().into());
+    let mut v: Vec<RouterFn> = Vec::with_capacity(cur.len() + 1);
+    v.extend(cur.iter().cloned());
     v.push(f);
-    *w = v.into();
-    drop(w);
+    let live = v.len();
+    cell.store(v.into());
     // TASK-163 gate mirror: the route_task/probe fast path trusts this count.
-    ROUTER_LIVE.fetch_add(1, Ordering::Release);
+    ROUTER_LIVE.store(live, Ordering::Release);
 }
 
 /// Live router count (TASK-163): zero — the production default until a
@@ -161,19 +180,60 @@ static ROUTER_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// The kernel adapter calls this for every scheduled task (via transform).
 pub fn route_task(task: &ScheduledTask) -> Routing {
-    // TASK-163 fast gate: no routers registered — skip the RwLock read and
-    // the Arc clone (the probe paths hit this per task-scheduled event).
+    // TASK-163 fast gate: no routers registered — skip the snapshot entirely
+    // (the probe paths hit this per task-scheduled event).
     if ROUTER_LIVE.load(Ordering::Acquire) == 0 {
         return Routing::KeepKernel;
     }
-    let snapshot: Arc<[RouterFn]> = routers().read().unwrap_or_else(|p| p.into_inner()).clone();
-    for r in snapshot.iter() {
-        let d = r(task);
-        if d != Routing::KeepKernel {
-            return d;
-        }
+    route_generic(&Probe { tag: &task.tag, tick: task.scheduled_tick })
+}
+
+/// Shared routing walk (TASK-164): on a memo hit the routers run while the
+/// thread-local slot is borrowed — zero Arc refcount traffic on the hot
+/// path. Re-entrant routing from a router re-borrows shared (safe); a
+/// nested `add_router` bumps the generation and its memo refresh is skipped
+/// via `try_borrow_mut` (the next call re-probes).
+fn route_generic(probe: &Probe<'_>) -> Routing {
+    let cell = routers();
+    let gen = cell.gen();
+    if gen == 0 {
+        return Routing::KeepKernel;
     }
-    Routing::KeepKernel
+    let mut decision = Routing::KeepKernel;
+    ROUTER_MEMO.with(|m| {
+        let mut settled = false;
+        if let Ok(borrowed) = m.try_borrow() {
+            if let Some((g, arc)) = borrowed.as_ref() {
+                if *g == gen {
+                    for r in arc.iter() {
+                        let d = r(probe);
+                        if d != Routing::KeepKernel {
+                            decision = d;
+                            break;
+                        }
+                    }
+                    settled = true;
+                }
+            }
+        }
+        if settled {
+            return;
+        }
+        // The shared borrow above is scoped to the `if let` block, so the
+        // refresh path may take `try_borrow_mut` here.
+        let fresh = cell.load_arc().unwrap_or_else(|| Vec::new().into());
+        for r in fresh.iter() {
+            let d = r(probe);
+            if d != Routing::KeepKernel {
+                decision = d;
+                break;
+            }
+        }
+        if let Ok(mut slot) = m.try_borrow_mut() {
+            *slot = Some((gen, Arc::clone(&fresh)));
+        }
+    });
+    decision
 }
 
 /// Inject a task into the kernel scheduler from any thread. The adapter
@@ -383,19 +443,20 @@ pub fn on_level_tick() -> u64 {
 static MODULE_QUEUE: OnceLock<Mutex<Vec<ScheduledTask>>> = OnceLock::new();
 
 fn route_probe(tag: &str) -> Option<ScheduledTask> {
-    // Zero-alloc fast path (TASK-161): with no router registered — the
-    // production default — a scheduling-surface probe must not allocate a
-    // task, a tag String, or touch any queue.
-    if routers().read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+    // Zero-alloc fast path (TASK-164): with no router registered — the
+    // production default — a scheduling-surface probe is one acquire load.
+    // The probe itself is borrowed; the owned task is built only on accept.
+    if ROUTER_LIVE.load(Ordering::Acquire) == 0 {
         return None;
     }
-    let task = ScheduledTask {
-        kernel_token: ROUTED_TOKEN.fetch_add(1, Ordering::Relaxed),
-        scheduled_tick: Some(current_tick()),
-        tag: tag.to_string(),
-    };
-    match route_task(&task) {
+    let probe = Probe { tag, tick: Some(current_tick()) };
+    match route_generic(&probe) {
         Routing::RunOnModule => {
+            let task = ScheduledTask {
+                kernel_token: ROUTED_TOKEN.fetch_add(1, Ordering::Relaxed),
+                scheduled_tick: probe.tick,
+                tag: tag.to_string(),
+            };
             MODULE_QUEUE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(task.clone());
             Some(task)
         }
@@ -441,8 +502,8 @@ mod tests {
     pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     pub(super) fn reset_routers() {
-        if let Some(m) = ROUTERS.get() {
-            *m.write().unwrap_or_else(|p| p.into_inner()) = Arc::from(Vec::new());
+        if let Some(cell) = ROUTERS.get() {
+            cell.store(Vec::new().into());
             ROUTER_LIVE.store(0, Ordering::Release);
         }
     }
@@ -462,8 +523,8 @@ mod tests {
     #[test]
     fn routing_decision_order() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let d1 = Arc::new(|_: &ScheduledTask| Routing::KeepKernel);
-        let d2 = Arc::new(|_: &ScheduledTask| Routing::RunOnModule);
+        let d1 = Arc::new(|_: &Probe| Routing::KeepKernel);
+        let d2 = Arc::new(|_: &Probe| Routing::RunOnModule);
         add_router(d1);
         add_router(d2);
         let t = ScheduledTask { kernel_token: 1, scheduled_tick: None, tag: "x".into() };
@@ -487,10 +548,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_routers();
         let tag = "order-probe";
-        let drop_first = Arc::new(move |t: &ScheduledTask| {
+        let drop_first = Arc::new(move |t: &Probe| {
             if t.tag == tag { Routing::Drop } else { Routing::KeepKernel }
         });
-        let route_second = Arc::new(move |t: &ScheduledTask| {
+        let route_second = Arc::new(move |t: &Probe| {
             if t.tag == tag { Routing::RunOnModule } else { Routing::KeepKernel }
         });
         add_router(drop_first);
@@ -503,7 +564,7 @@ mod tests {
 
         // All routers deferring falls through to KeepKernel.
         reset_routers();
-        add_router(Arc::new(|_: &ScheduledTask| Routing::KeepKernel));
+        add_router(Arc::new(|_: &Probe| Routing::KeepKernel));
         assert_eq!(route_task(&t), Routing::KeepKernel);
     }
 
@@ -538,7 +599,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_routers();
         reset_queues();
-        add_router(Arc::new(|t: &ScheduledTask| {
+        add_router(Arc::new(|t: &Probe| {
             if t.tag == "kernel" { Routing::RunOnModule } else { Routing::KeepKernel }
         }));
 
@@ -627,8 +688,8 @@ mod bench_hotpath {
         let rounds = 5;
 
         // route_task with 2 registered routers, both deferring (steady state)
-        add_router(Arc::new(|_: &ScheduledTask| Routing::KeepKernel));
-        add_router(Arc::new(|_: &ScheduledTask| Routing::KeepKernel));
+        add_router(Arc::new(|_: &Probe| Routing::KeepKernel));
+        add_router(Arc::new(|_: &Probe| Routing::KeepKernel));
         let t = ScheduledTask { kernel_token: 7, scheduled_tick: None, tag: "kernel".into() };
         for _ in 0..10_000u32 {
             let _ = route_task(&t);

@@ -59,9 +59,10 @@
 //! - Instrumentation is idempotent per helper: re-running `apply` (e.g.
 //!   JVMTI retransformation) does not double-instrument.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Where to inject the instrumented call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,45 +114,175 @@ pub struct TransformedClass {
 
 /// The engine consumes class bytes, runs matching rules, returns new bytes.
 ///
-/// Hotpath note (TASK-161): `apply` runs on EVERY class load (lib.rs CFLH
-/// fires per class; thousands at boot). The rules registry is therefore an
-/// immutable snapshot behind an RwLock — the read path clones one `Arc` and
-/// matches with zero allocations, instead of locking a Mutex and cloning a
-/// whole `Vec<Arc<Rule>>` per class. Registration (cold, boot-time) rebuilds
-/// the snapshot.
+/// Hotpath note (TASK-164): `apply` runs on EVERY class load (lib.rs CFLH
+/// fires per class; thousands at boot). The rule set is an immutable
+/// [`RulesView`] published through an RCU cell with a per-thread generation
+/// memo — the no-match path is one gate load + one hash + one flat-map
+/// probe + (usually zero) wildcard compares, all lock- and alloc-free.
+/// Registration (cold, boot-time) rebuilds and republishes the view.
 pub struct TransformEngine {
-    rules: RwLock<Arc<[Arc<Rule>]>>,
+    view: super::rcu::ArcCell<RulesView>,
     /// Live rule count (TASK-163): the per-class-load fast gate reads this
-    /// instead of locking the rules RwLock. Release-bumped under the write
-    /// lock so a gate that observes >0 sees the rule through the lock.
+    /// instead of touching the view at all. Release-stored after publish so
+    /// a gate that observes >0 sees the rule through the cell.
     live_rules: AtomicUsize,
+    /// Per-engine identity for the thread-local view memo (TASK-164):
+    /// generations alone would collide across engines — two freshly built
+    /// engines both sit at gen 1, and a memo hit would hand one engine's
+    /// rules to another.
+    id: u64,
+}
+
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How a rule's class pattern matches (precompiled at view build).
+enum WildKind {
+    /// "*" — matches every class.
+    Any,
+    /// "*/x" — name ends with `x`.
+    Suffix(Box<str>),
+    /// "x*" — name starts with `x`.
+    Prefix(Box<str>),
+}
+
+struct WildcardSlot {
+    idx: usize,
+    kind: WildKind,
+}
+
+/// One exact class name in the view's open-addressed flat map
+/// (insert-only; the whole view is rebuilt on every registration).
+struct ExactSlot {
+    hash: u64,
+    name: Box<str>,
+    /// Registration indices of every exact rule for this class name.
+    idxs: Vec<usize>,
+}
+
+/// Immutable compiled rule set (TASK-164): exact class names in a flat map
+/// keyed by FNV-1a hash, wildcard rules pre-classified. `rules` keeps
+/// registration order; matching collects rule indices and sorts them, so
+/// plan application order is identical to the legacy linear scan.
+struct RulesView {
+    rules: Vec<Arc<Rule>>,
+    exact: Vec<Option<ExactSlot>>,
+    mask: usize,
+    wildcards: Vec<WildcardSlot>,
+}
+
+impl RulesView {
+    fn build(rules: Vec<Arc<Rule>>) -> Self {
+        let cap = (rules.len() * 2 + 2).next_power_of_two();
+        let mut exact: Vec<Option<ExactSlot>> = (0..cap).map(|_| None).collect();
+        let mut wildcards = Vec::new();
+        for (idx, r) in rules.iter().enumerate() {
+            let p = &r.class_pattern;
+            if p == "*" {
+                wildcards.push(WildcardSlot { idx, kind: WildKind::Any });
+            } else if let Some(suffix) = p.strip_prefix("*/") {
+                wildcards.push(WildcardSlot { idx, kind: WildKind::Suffix(suffix.into()) });
+            } else if let Some(prefix) = p.strip_suffix('*') {
+                wildcards.push(WildcardSlot { idx, kind: WildKind::Prefix(prefix.into()) });
+            } else {
+                let hash = super::rcu::fnv1a(p.as_bytes());
+                let mut i = (hash as usize) & (cap - 1);
+                loop {
+                    match &mut exact[i] {
+                        Some(slot) if slot.hash == hash && &*slot.name == p => {
+                            slot.idxs.push(idx);
+                            break;
+                        }
+                        None => {
+                            exact[i] = Some(ExactSlot { hash, name: p.clone().into(), idxs: vec![idx] });
+                            break;
+                        }
+                        Some(_) => i = (i + 1) & (cap - 1),
+                    }
+                }
+            }
+        }
+        RulesView { rules, exact, mask: cap - 1, wildcards }
+    }
+
+    fn exact_find(&self, hash: u64, name: &str) -> Option<&ExactSlot> {
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            match &self.exact[i] {
+                None => return None,
+                Some(slot) => {
+                    if slot.hash == hash && &*slot.name == name {
+                        return Some(slot);
+                    }
+                    i = (i + 1) & self.mask;
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static VIEW_MEMO: RefCell<Option<(u64, u64, Arc<RulesView>)>> = const { RefCell::new(None) };
 }
 
 impl TransformEngine {
     pub fn new() -> Self {
         Self {
-            rules: RwLock::new(Arc::from(Vec::new())),
+            view: super::rcu::ArcCell::new(),
             live_rules: AtomicUsize::new(0),
+            id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
+    /// Generation-checked per-thread view snapshot, keyed by (engine id,
+    /// generation). `register` may run concurrently and from nested calls —
+    /// the memo guard is never held across rule matching.
+    fn view_snapshot(&self) -> Arc<RulesView> {
+        let gen = self.view.gen();
+        if gen == 0 {
+            // Empty default shape: the caller's live_rules gate normally
+            // prevents reaching here at all.
+            return Arc::new(RulesView::build(Vec::new()));
+        }
+        VIEW_MEMO.with(|m| {
+            if let Ok(borrowed) = m.try_borrow() {
+                if let Some((eid, g, v)) = borrowed.as_ref() {
+                    if *eid == self.id && *g == gen {
+                        return Arc::clone(v);
+                    }
+                }
+            }
+            let fresh = self
+                .view
+                .load_arc()
+                .unwrap_or_else(|| Arc::new(RulesView::build(Vec::new())));
+            if let Ok(mut slot) = m.try_borrow_mut() {
+                *slot = Some((self.id, gen, Arc::clone(&fresh)));
+            }
+            fresh
+        })
+    }
+
     pub fn register(&self, rule: Rule) {
-        let mut rules = self.rules.write().unwrap();
+        let cur = self
+            .view
+            .load_arc()
+            .unwrap_or_else(|| Arc::new(RulesView::build(Vec::new())));
         // Conflict guard: two modules (or a module + a platform brick)
         // registering the same rule on the same point would fire the probe
         // twice per hit. Exact duplicates are rejected instead of silently
         // double-instrumenting.
-        if rules.iter().any(|r| **r == rule) {
+        if cur.rules.iter().any(|r| **r == rule) {
             eprintln!(
                 "[crussty-runtime] transform: duplicate rule ignored: {} {} {}{:?} -> {}",
                 rule.class_pattern, rule.method, rule.descriptor, rule.injection, rule.helper
             );
             return;
         }
-        let mut v: Vec<Arc<Rule>> = rules.to_vec();
+        let mut v: Vec<Arc<Rule>> = Vec::with_capacity(cur.rules.len() + 1);
+        v.extend(cur.rules.iter().cloned());
         v.push(Arc::new(rule));
         let live = v.len();
-        *rules = v.into();
+        self.view.store(Arc::new(RulesView::build(v)));
         self.live_rules.store(live, Ordering::Release);
     }
 
@@ -161,7 +292,7 @@ impl TransformEngine {
     }
 
     pub fn rules(&self) -> Vec<Arc<Rule>> {
-        self.rules.read().unwrap().to_vec()
+        self.view_snapshot().rules.clone()
     }
 
     /// Apply matching rules to class bytes.
@@ -173,21 +304,58 @@ impl TransformEngine {
     /// then choose to fail the class load or run it untransformed. Never
     /// panics; parse failures return `Err` with context.
     pub fn apply(&self, class_name: &str, bytes: &[u8]) -> Result<Option<TransformedClass>, String> {
-        // One atomic bump for the snapshot; the guard is dropped immediately
-        // so a concurrent register never blocks a long-running transform.
-        let snapshot: Arc<[Arc<Rule>]> = self.rules.read().unwrap().clone();
-        // Borrowing filter: no Arc bumps, and an empty match allocates nothing
-        // (the per-class-load fast path — most classes match no rule).
-        let matched: Vec<&Arc<Rule>> = snapshot
-            .iter()
-            .filter(|r| matches_pattern(&r.class_pattern, class_name))
-            .collect();
+        // Lock-free gate (TASK-163): no rules at all — the overwhelming
+        // majority of classes — is one acquire load.
+        if self.live_rules.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let hash = super::rcu::fnv1a(class_name.as_bytes());
+        // RCU view + per-thread memo (TASK-164): the no-match path probes
+        // INSIDE the memo borrow — no Arc refcount traffic, no allocation;
+        // only an actual class hit pays the snapshot clone for the plan.
+        let gen = self.view.gen();
+        let mut fast_none = false;
+        VIEW_MEMO.with(|m| {
+            if let Ok(borrowed) = m.try_borrow() {
+                if let Some((eid, g, view)) = borrowed.as_ref() {
+                    if *eid == self.id && *g == gen {
+                        let exact_hit = view.exact_find(hash, class_name).is_some();
+                        let wild_hit = view.wildcards.iter().any(|w| match &w.kind {
+                            WildKind::Any => true,
+                            WildKind::Suffix(s) => class_name.ends_with(&**s),
+                            WildKind::Prefix(p) => class_name.starts_with(&**p),
+                        });
+                        fast_none = !exact_hit && !wild_hit;
+                    }
+                }
+            }
+        });
+        if fast_none {
+            return Ok(None);
+        }
+        let view = self.view_snapshot();
+        let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
+        if let Some(slot) = view.exact_find(hash, class_name) {
+            matched.extend(slot.idxs.iter().map(|&i| (i, &view.rules[i])));
+        }
+        for w in &view.wildcards {
+            let hit = match &w.kind {
+                WildKind::Any => true,
+                WildKind::Suffix(s) => class_name.ends_with(&**s),
+                WildKind::Prefix(p) => class_name.starts_with(&**p),
+            };
+            if hit {
+                matched.push((w.idx, &view.rules[w.idx]));
+            }
+        }
         if matched.is_empty() {
             return Ok(None);
         }
+        // Registration order (identical to the legacy linear scan).
+        matched.sort_unstable_by_key(|(i, _)| *i);
         let class = parse_class(bytes).map_err(|e| format!("transform {class_name}: {e}"))?;
         let mut plan = Plan::default();
-        for rule in matched.iter().copied() {
+        for (_, rule) in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
                     Injection::MethodEntry => {
