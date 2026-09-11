@@ -448,6 +448,11 @@ fn memo_key_matches(s: &MemoSlot, bus_key: u64, gens: u64, event: &str) -> bool 
 /// memcmp on a hit while costing a 5-multiply serial chain on every call;
 /// dropping it is a strict win (the generation compare rejects mutations
 /// before the memcmp runs either way).
+///
+/// TASK-166: the REST scan/promote tail is a `#[cold]` never-inlined
+/// function — the round-6 stage diag attributed roughly half of the
+/// memo-hit cost to register spills from cold-branch code resident in the
+/// hot body; splitting keeps the MRU-hit shape minimal.
 #[inline]
 fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Option<(usize, bool)> {
     // MRU fast path: take/match/dispatch/put-back, zero borrow traffic.
@@ -461,28 +466,41 @@ fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Optio
             }
         }
         m0.set(s0);
-        if out.is_some() {
-            return out;
+        if out.is_none() {
+            out = memo_dispatch_cold(bus_key, gens, event, payload);
         }
-        // Cold path: scan + dispatch under the shared REST borrow.
-        MEMO_REST.with(|rest| {
-            let idx = {
-                let slots = rest.borrow();
-                let mut idx = None;
-                for (i, slot) in slots.iter().enumerate() {
-                    let Some(s) = slot else { continue };
-                    if memo_key_matches(s, bus_key, gens, event) {
-                        let invoked = dispatch(&s.resolved, event, payload);
-                        out = Some((invoked, s.has_async));
-                        idx = Some(i);
-                        break;
-                    }
+        out
+    })
+}
+
+/// Cold REST scan + dispatch + MRU promotion (see [`memo_dispatch`]).
+#[cold]
+#[inline(never)]
+fn memo_dispatch_cold(
+    bus_key: u64,
+    gens: u64,
+    event: &str,
+    payload: &Value,
+) -> Option<(usize, bool)> {
+    MEMO_REST.with(|rest| {
+        let mut out = None;
+        let mut idx = None;
+        {
+            let slots = rest.borrow();
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(s) = slot else { continue };
+                if memo_key_matches(s, bus_key, gens, event) {
+                    let invoked = dispatch(&s.resolved, event, payload);
+                    out = Some((invoked, s.has_async));
+                    idx = Some(i);
+                    break;
                 }
-                idx
-            };
-            // Promote a cold hit to the MRU slot (plain moves; skips while
-            // a nested dispatch still holds the shared borrow).
+            }
+        }
+        if out.is_some() {
             if let Some(i) = idx {
+                // Promote the cold hit to the MRU slot (plain moves; skips
+                // while a nested dispatch still holds the shared borrow).
                 if let Ok(mut slots) = rest.try_borrow_mut() {
                     let promoted = slots[i].take();
                     let demoted = MEMO_MRU.with(|m0| m0.take());
@@ -490,7 +508,7 @@ fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Optio
                     slots[i] = demoted;
                 }
             }
-        });
+        }
         out
     })
 }
@@ -498,7 +516,8 @@ fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Optio
 /// Hot has_subscribers through the memo: MRU slot first (taken out, no
 /// borrow flag), then the cold slots under a shared borrow. Never holds a
 /// mutable borrow: a handler may call has_subscribers re-entrantly while a
-/// publish dispatches.
+/// publish dispatches. Cold tail split per TASK-166 (see memo_dispatch).
+#[inline]
 fn memo_has(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
     MEMO_MRU.with(|m0| {
         let s0 = m0.take();
@@ -509,25 +528,32 @@ fn memo_has(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
             }
         }
         m0.set(s0);
-        if hit.is_some() {
-            return hit;
+        if hit.is_none() {
+            hit = memo_has_cold(bus_key, gens, event);
         }
-        MEMO_REST.with(|rest| {
-            let idx = {
-                let slots = rest.borrow();
-                for slot in slots.iter() {
-                    let Some(s) = slot else { continue };
-                    if memo_key_matches(s, bus_key, gens, event) {
-                        hit = Some(!s.resolved.is_empty() || s.has_async);
-                        break;
-                    }
+        hit
+    })
+}
+
+/// Cold REST scan + MRU promotion (see [`memo_has`]).
+#[cold]
+#[inline(never)]
+fn memo_has_cold(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
+    MEMO_REST.with(|rest| {
+        let mut hit = None;
+        let mut idx = None;
+        {
+            let slots = rest.borrow();
+            for (i, slot) in slots.iter().enumerate() {
+                let Some(s) = slot else { continue };
+                if memo_key_matches(s, bus_key, gens, event) {
+                    hit = Some(!s.resolved.is_empty() || s.has_async);
+                    idx = Some(i);
+                    break;
                 }
-                slots.iter().position(|s| {
-                    s.as_ref().is_some_and(|s| memo_key_matches(s, bus_key, gens, event))
-                })
-            };
-            // Promote the cold hit to the MRU slot so the next lookup takes
-            // the borrow-free path (skips while a dispatch borrow is alive).
+            }
+        }
+        if hit.is_some() {
             if let Some(i) = idx {
                 if let Ok(mut slots) = rest.try_borrow_mut() {
                     let promoted = slots[i].take();
@@ -536,7 +562,7 @@ fn memo_has(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
                     slots[i] = demoted;
                 }
             }
-        });
+        }
         hit
     })
 }
@@ -695,18 +721,31 @@ fn dispatch(handlers: &[(Option<(Box<str>, u64)>, Handler)], event: &str, payloa
             .as_ref()
             .and_then(|(id, _)| super::hot_reload::guard_module(id));
         if owner.is_some() && guard.is_none() {
-            eprintln!(
-                "[crussty:events] sync handler for '{event}' skipped: module '{}' is being reloaded",
-                owner.as_ref().expect("owner checked").0
-            );
+            report_skipped_reload(&owner.as_ref().expect("owner checked").0, event);
             continue;
         }
         let result = catch_unwind(AssertUnwindSafe(|| handler(event, payload)));
         if let Err(panic) = result {
-            eprintln!("[crussty:events] handler panicked for '{event}': {panic:?}");
+            report_handler_panic(event, panic);
         }
     }
     handlers.len()
+}
+
+/// Panic-reporting cold tails (TASK-166): the eprintln formatting machinery
+/// must not sit in the dispatch hot body.
+#[cold]
+#[inline(never)]
+fn report_handler_panic(event: &str, panic: Box<dyn std::any::Any + Send>) {
+    eprintln!("[crussty:events] handler panicked for '{event}': {panic:?}");
+}
+
+#[cold]
+#[inline(never)]
+fn report_skipped_reload(owner: &str, event: &str) {
+    eprintln!(
+        "[crussty:events] sync handler for '{event}' skipped: module '{owner}' is being reloaded"
+    );
 }
 
 #[derive(Clone)]
@@ -1428,5 +1467,6 @@ mod bench_hotpath {
         );
     }
 }
+
 
 

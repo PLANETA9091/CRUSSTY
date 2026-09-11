@@ -350,6 +350,18 @@ impl TransformEngine {
         if fast_none {
             return Ok(None);
         }
+        // TASK-166: everything past the probe — snapshot, match collection,
+        // class parse, plan build, edits — is a `#[cold]` never-inlined
+        // tail. The per-class-load hot body ends here.
+        self.apply_slow(class_name, bytes, hash)
+    }
+
+    /// Cold resolution + transform tail of [`TransformEngine::apply`] (see
+    /// the probe there): memo fill, match collection, byte parse, plan and
+    /// edits. Never runs on the no-match fast path.
+    #[cold]
+    #[inline(never)]
+    fn apply_slow(&self, class_name: &str, bytes: &[u8], hash: u64) -> Result<Option<TransformedClass>, String> {
         let view = self.view_snapshot();
         let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
         if let Some(slot) = view.exact_find(hash, class_name) {
