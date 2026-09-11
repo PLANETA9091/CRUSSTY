@@ -87,6 +87,13 @@ pub type Handler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 const ASYNC_WORKERS: usize = 2;
 /// Hard cap on pending async tasks; overflow drops the oldest (load shed).
 pub const ASYNC_QUEUE_CAP: usize = 4096;
+/// TASK-171 spin-then-park: how many `try_lock`+`spin_loop` probes a worker
+/// makes before committing to the condvar park. Each probe is one CAS pair
+/// (~30ns), so the whole window is a few microseconds: a publish that lands
+/// inside it is absorbed without the structural ~0.3-3.5us futex wake
+/// syscall. A truly idle pool pays the window once per idle episode, then
+/// parks with zero ongoing CPU cost.
+const ASYNC_SPIN_ITERS: usize = 1024;
 
 /// A subscription handle. Tokens are only valid on the bus that issued them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -641,20 +648,38 @@ impl AsyncPool {
         }
     }
 
+    /// TASK-170 hysteresis, shared by the spin and park pop paths: the
+    /// drop-burst latch resets only when the queue genuinely drains (below
+    /// half capacity) — one eprintln per overload episode, never a flood.
+    fn latch_reset(&self, queue: &VecDeque<AsyncTask>) {
+        if queue.len() < self.cap / 2 {
+            self.dropping.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn pop(&self) -> AsyncTask {
+        // TASK-171 spin-then-park: before committing to the condvar park,
+        // poll the queue through a bounded `try_lock` window. A publish that
+        // lands inside the window is absorbed by one CAS pair instead of
+        // waking a parked worker through the ~0.3-3.5us futex wake syscall;
+        // the pusher's idle-gate cooperates for free — a spinning worker is
+        // awake and NOT idle-counted, so the pusher skips the notify and this
+        // loop observes the task on its next probe. A worker that finds
+        // nothing falls through to the park path, which re-checks the queue
+        // under the lock before registering idle, so no wakeup is lost.
+        for _ in 0..ASYNC_SPIN_ITERS {
+            if let Ok(mut queue) = self.queue.try_lock() {
+                if let Some(task) = queue.pop_front() {
+                    self.latch_reset(&queue);
+                    return task;
+                }
+            }
+            std::hint::spin_loop();
+        }
         let mut queue = lock(&self.queue);
         loop {
             if let Some(task) = queue.pop_front() {
-                // Hysteresis (TASK-170): the drop-burst latch used to reset
-                // on EVERY pop that took len below cap, so under sustained
-                // saturation the capacity warning re-armed at pop frequency
-                // — a log flood that itself cost throughput and made the
-                // saturated regime unmeasurable. Reset only when the queue
-                // genuinely drains (below half capacity): one eprintln per
-                // overload episode.
-                if queue.len() < self.cap / 2 {
-                    self.dropping.store(false, Ordering::SeqCst);
-                }
+                self.latch_reset(&queue);
                 return task;
             }
             // Register idle while still holding the lock (TASK-170), then
@@ -1001,9 +1026,28 @@ impl AsyncPool {
             }
         }
         queue.push_back(task);
-        // TEMP A/B (TASK-170): gate OFF variant — unconditional notify.
-        let _ = self.idle.load(Ordering::SeqCst);
-        self.condvar.notify_one();
+        // Depth-, idle- and TRANSITION-aware notify (TASK-170 gate
+        // generalized by TASK-171; 02a891e shipped the OFF variant of the
+        // round-10 A/B — unconditional notify behind a dead `idle.load`
+        // under a stale TEMP comment — so the measured winner never reached
+        // production). Fire exactly when THIS push creates the first
+        // backlog unit beyond the awake workforce (len == awake + 1, where
+        // awake = ASYNC_WORKERS - idle): awake workers either hold the pop
+        // loop or sit in the TASK-171 spin window and are guaranteed to
+        // observe the queue under the lock before they can sleep (the park
+        // path re-checks first), so a shallow queue is covered without any
+        // syscall. Later pushes while the backlog persists must NOT
+        // re-notify: the woken worker drains serially at ~100ns/task, so a
+        // per-push wake against it is a 3.5us-per-task syscall flood (the
+        // preemption scenario that dominated the naive depth gate).
+        // `idle` changes only under the queue lock and the pusher holds
+        // that lock here, so this snapshot is exact for the decision
+        // instant; len evolves by +-1 under the same lock, so the equality
+        // is the crossing detector, not a coincidence filter.
+        let idle = self.idle.load(Ordering::SeqCst);
+        if idle > 0 && queue.len() == ASYNC_WORKERS - idle + 1 {
+            self.condvar.notify_one();
+        }
     }
 }
 
