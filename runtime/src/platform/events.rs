@@ -47,14 +47,16 @@
 //! the publisher or kills a pool worker. A sync handler may publish again —
 //! the registry lock is only held for mutation, never during invocation.
 //!
-//! # Hot path (TASK-164)
+//! # Hot path (TASK-164, TASK-167)
 //!
 //! `publish` / `has_subscribers` never take a lock. Each registry keeps an
 //! immutable [`RegistryView`] published through an RCU [`rcu::ArcCell`];
-//! every hot caller resolves an event through a per-thread memo (keyed by
-//! bus id + both registry generations + event hash) holding a precomputed
-//! handler list. A memo hit is two acquire loads, an FNV hash and a
-//! compare — no allocation, no mutex, no refcount traffic on the view.
+//! resolved handler lists are cached in a process-global lock-free memo:
+//! one acquire pointer load per probe, no TLS (measured 1.7-4.4ns per
+//! thread_local access in this cdylib — TASK-166), no refcounts and no
+//! allocation on hits. Records are immutable once published and never
+//! freed, which is what makes the raw-pointer read sound without any
+//! reader protocol.
 //!
 //! # Lifecycle events
 //!
@@ -74,10 +76,9 @@
 //! invalidation (slab/arena pattern), RCU snapshots (see [`rcu`]).
 
 use serde_json::Value;
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 pub type Handler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
@@ -399,210 +400,173 @@ impl RegistryCell {
     }
 }
 
-/// Per-thread resolved-event memo (TASK-164): a hot publish with live
-/// subscribers pays no lock, no snapshot and no allocation — the resolved
-/// handler list is cached per thread and invalidated by either registry's
-/// generation moving.
-
-struct MemoSlot {
-    bus_key: u64,
-    /// Combined (sync<<32 | async) generation the slot was resolved at.
-    gens: u64,
+/// Process-global lock-free resolved-event memo (TASK-167). Replaces the
+/// per-thread TLS memo: the measured TLS law (TASK-166) prices each
+/// thread_local access at 1.7-4.4ns in this cdylib (global-dynamic model),
+/// which was the last ~4ns of `publish(1 sync)`. The global table reads
+/// with ONE acquire pointer load per probe — records are immutable once
+/// published and never freed (retired records move to a process-lifetime
+/// retire list), so readers need no refcounts, no reader windows, no
+/// epochs: zero RMW on the hot path.
+///
+/// Keying: the slot index comes from the event-name hash; each record
+/// stores a 64-bit tag = fnv1a(bus_id || combined gens) plus the event
+/// name, both verified on hit — the hash only ever proposes an index. A
+/// registry mutation changes the combined generation, hence the tag: a
+/// stale record can never verify (staleness is impossible by construction,
+/// unlike the TLS put-back protocol). Bus identity is inside the tag, so
+/// records from different bus instances coexist (the per-engine-id lesson,
+/// TASK-165).
+///
+/// Memory: inserts claim the first empty slot they meet (CAS) and stop
+/// there, so a probe chain never continues past an empty slot; a saturated
+/// region overwrites a probed victim. Overwritten records are retired,
+/// never freed — one ~100B record per (registry mutation, event) pair that
+/// re-resolves; module reloads are human-scale events, so the retire list
+/// stays churn-proportional and tiny in practice.
+struct MemoRecord {
+    tag: u64,
     name: Box<str>,
     resolved: Resolved,
     has_async: bool,
 }
 
-thread_local! {
-    /// MRU memo slot (TASK-165): the hot publish/has path takes it out (a
-    /// plain move — no borrow-flag RMW), matches, dispatches, puts it back.
-    /// While it is taken out a re-entrant publish from a handler simply
-    /// finds the MRU empty and takes the cold path — correct cache
-    /// semantics; a put-back that races a nested re-fill is
-    /// generation-checked on the next publish (cache miss, never staleness).
-    static MEMO_MRU: Cell<Option<MemoSlot>> = const { Cell::new(None) };
-    /// Cold memo slots. Handlers may run under the shared borrow of a cold
-    /// hit (same re-entrancy contract as TASK-164); fills use
-    /// `try_borrow_mut` and skip when a dispatch borrow is alive.
-    static MEMO_REST: RefCell<[Option<MemoSlot>; MEMO_REST_SLOTS]> =
-        const { RefCell::new([None, None, None]) };
-    static MEMO_CLOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const MEMO_SLOTS: usize = 4096;
+const MEMO_MASK: usize = MEMO_SLOTS - 1;
+const MEMO_PROBES: usize = 8;
 
-const MEMO_REST_SLOTS: usize = 3;
+static MEMO_TABLE: [AtomicPtr<MemoRecord>; MEMO_SLOTS] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; MEMO_SLOTS];
 
+/// Retired (overwritten) memo records. Never read, never freed — see the
+/// memory note above.
+static MEMO_RETIRED: Mutex<Vec<&'static MemoRecord>> = Mutex::new(Vec::new());
+
+/// 64-bit record tag from the registry-cell id and the combined generation.
 #[inline]
-fn memo_key_matches(s: &MemoSlot, bus_key: u64, gens: u64, event: &str) -> bool {
-    s.bus_key == bus_key && s.gens == gens && &*s.name == event
+fn memo_tag(bus_key: u64, gens: u64) -> u64 {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&bus_key.to_le_bytes());
+    buf[8..].copy_from_slice(&gens.to_le_bytes());
+    fnv1a(&buf)
 }
 
-/// Hot publish through the memo: on an MRU hit the dispatch runs with the
-/// slot TAKEN OUT of the memo (no borrow flag at all on the hot path); on a
-/// cold hit the dispatch runs under the shared REST borrow (re-entrant
-/// publishes from a handler are safe; the promote/swap then uses
-/// `try_borrow_mut` and simply skips if a nested publish still holds it).
-/// Returns `(invoked, has_async)` when a slot matched.
-///
-/// TASK-165: the memo key is `(bus, generation)` + the event string itself —
-/// no hash on the hot path. The FNV prefilter only ever saved a ~20-byte
-/// memcmp on a hit while costing a 5-multiply serial chain on every call;
-/// dropping it is a strict win (the generation compare rejects mutations
-/// before the memcmp runs either way).
-///
-/// TASK-166: the REST scan/promote tail is a `#[cold]` never-inlined
-/// function — the round-6 stage diag attributed roughly half of the
-/// memo-hit cost to register spills from cold-branch code resident in the
-/// hot body; splitting keeps the MRU-hit shape minimal.
+/// Slot index for an event-name hash (FNV low bits are multiplication
+/// truncated — fold and re-scatter before masking).
 #[inline]
-fn memo_dispatch(bus_key: u64, gens: u64, event: &str, payload: &Value) -> Option<(usize, bool)> {
-    // MRU fast path: take/match/dispatch/put-back, zero borrow traffic.
-    MEMO_MRU.with(|m0| {
-        let s0 = m0.take();
-        let mut out = None;
-        if let Some(s) = s0.as_ref() {
-            if memo_key_matches(s, bus_key, gens, event) {
-                let invoked = dispatch(&s.resolved, event, payload);
-                out = Some((invoked, s.has_async));
-            }
-        }
-        m0.set(s0);
-        if out.is_none() {
-            out = memo_dispatch_cold(bus_key, gens, event, payload);
-        }
-        out
-    })
+fn memo_index(hash: u64) -> usize {
+    ((hash ^ (hash >> 27)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize & MEMO_MASK
 }
 
-/// Cold REST scan + dispatch + MRU promotion (see [`memo_dispatch`]).
-#[cold]
-#[inline(never)]
-fn memo_dispatch_cold(
+/// Probe the memo for (bus, gens, event). On a hit the record is borrowed
+/// with process lifetime: published records are immutable and never freed,
+/// so the raw pointer is always dereferenceable.
+#[inline]
+fn memo_find(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<&'static MemoRecord> {
+    let tag = memo_tag(bus_key, gens);
+    let mut i = memo_index(hash);
+    for _ in 0..MEMO_PROBES {
+        let p = MEMO_TABLE[i].load(Ordering::Acquire);
+        if p.is_null() {
+            // Inserts claim the first empty slot they meet, so a chain never
+            // continues past an empty slot: definite miss.
+            return None;
+        }
+        // SAFETY: `p` was published by a release swap/CAS and records are
+        // never mutated or freed afterwards.
+        let rec = unsafe { &*p };
+        if rec.tag == tag && &*rec.name == event {
+            return Some(rec);
+        }
+        i = (i + 1) & MEMO_MASK;
+    }
+    None
+}
+
+/// Hot publish through the global memo (TASK-167): one acquire load per
+/// probe, no TLS, no refcounts. Re-entrant publishes from a handler simply
+/// take the same read path — there is no slot state to take out or restore
+/// (the TLS take/match/put-back protocol is gone with it).
+#[inline]
+fn memo_dispatch(
     bus_key: u64,
     gens: u64,
+    hash: u64,
     event: &str,
     payload: &Value,
 ) -> Option<(usize, bool)> {
-    MEMO_REST.with(|rest| {
-        let mut out = None;
-        let mut idx = None;
-        {
-            let slots = rest.borrow();
-            for (i, slot) in slots.iter().enumerate() {
-                let Some(s) = slot else { continue };
-                if memo_key_matches(s, bus_key, gens, event) {
-                    let invoked = dispatch(&s.resolved, event, payload);
-                    out = Some((invoked, s.has_async));
-                    idx = Some(i);
-                    break;
-                }
-            }
-        }
-        if out.is_some() {
-            if let Some(i) = idx {
-                // Promote the cold hit to the MRU slot (plain moves; skips
-                // while a nested dispatch still holds the shared borrow).
-                if let Ok(mut slots) = rest.try_borrow_mut() {
-                    let promoted = slots[i].take();
-                    let demoted = MEMO_MRU.with(|m0| m0.take());
-                    MEMO_MRU.with(|m0| m0.set(promoted));
-                    slots[i] = demoted;
-                }
-            }
-        }
-        out
-    })
+    let rec = memo_find(bus_key, gens, hash, event)?;
+    Some((dispatch(&rec.resolved, event, payload), rec.has_async))
 }
 
-/// Hot has_subscribers through the memo: MRU slot first (taken out, no
-/// borrow flag), then the cold slots under a shared borrow. Never holds a
-/// mutable borrow: a handler may call has_subscribers re-entrantly while a
-/// publish dispatches. Cold tail split per TASK-166 (see memo_dispatch).
+/// Hot has_subscribers through the global memo (TASK-167) — the same
+/// zero-RMW read shape as [`memo_dispatch`].
 #[inline]
-fn memo_has(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
-    MEMO_MRU.with(|m0| {
-        let s0 = m0.take();
-        let mut hit = None;
-        if let Some(s) = s0.as_ref() {
-            if memo_key_matches(s, bus_key, gens, event) {
-                hit = Some(!s.resolved.is_empty() || s.has_async);
-            }
-        }
-        m0.set(s0);
-        if hit.is_none() {
-            hit = memo_has_cold(bus_key, gens, event);
-        }
-        hit
-    })
+fn memo_has(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<bool> {
+    let rec = memo_find(bus_key, gens, hash, event)?;
+    Some(!rec.resolved.is_empty() || rec.has_async)
 }
 
-/// Cold REST scan + MRU promotion (see [`memo_has`]).
+/// Fill the memo on a cold miss (registry-writer frequency). A record for
+/// the exact (bus, gens, event) key is content-identical to any existing
+/// one — resolution is a pure function of the view at `gens` — so a
+/// matching record is left in place and repeated cold fills are free.
 #[cold]
-#[inline(never)]
-fn memo_has_cold(bus_key: u64, gens: u64, event: &str) -> Option<bool> {
-    MEMO_REST.with(|rest| {
-        let mut hit = None;
-        let mut idx = None;
-        {
-            let slots = rest.borrow();
-            for (i, slot) in slots.iter().enumerate() {
-                let Some(s) = slot else { continue };
-                if memo_key_matches(s, bus_key, gens, event) {
-                    hit = Some(!s.resolved.is_empty() || s.has_async);
-                    idx = Some(i);
-                    break;
-                }
+fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved, has_async: bool) {
+    let tag = memo_tag(bus_key, gens);
+    let mut victim: Option<usize> = None;
+    let mut i = memo_index(hash);
+    for _ in 0..MEMO_PROBES {
+        let slot = &MEMO_TABLE[i];
+        let cur = slot.load(Ordering::Acquire);
+        if cur.is_null() {
+            let rec = Box::into_raw(Box::new(MemoRecord {
+                tag,
+                name: event.into(),
+                resolved: Arc::clone(&resolved),
+                has_async,
+            }));
+            match slot.compare_exchange(
+                std::ptr::null_mut(),
+                rec,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                // Lost the claim race: this record was never published, so
+                // no reader can hold it — drop it and keep probing.
+                Err(_) => drop(unsafe { Box::from_raw(rec) }),
             }
-        }
-        if hit.is_some() {
-            if let Some(i) = idx {
-                if let Ok(mut slots) = rest.try_borrow_mut() {
-                    let promoted = slots[i].take();
-                    let demoted = MEMO_MRU.with(|m0| m0.take());
-                    MEMO_MRU.with(|m0| m0.set(promoted));
-                    slots[i] = demoted;
-                }
-            }
-        }
-        hit
-    })
-}
-
-fn memo_fill(bus_key: u64, gens: u64, event: &str, resolved: Resolved, has_async: bool) {
-    let fresh = || MemoSlot {
-        bus_key,
-        gens,
-        name: event.into(),
-        resolved: Arc::clone(&resolved),
-        has_async,
-    };
-    // Refresh the MRU slot in place when it already holds (bus, event).
-    MEMO_MRU.with(|m0| {
-        let s0 = m0.take();
-        let refresh_mru = s0
-            .as_ref()
-            .is_some_and(|s| s.bus_key == bus_key && &*s.name == event);
-        if refresh_mru {
-            m0.set(Some(fresh()));
         } else {
-            m0.set(s0);
-            // Cold refresh / round-robin fill; a nested fill while a
-            // dispatch borrow is alive just skips (the next publish
-            // re-resolves and retries).
-            MEMO_REST.with(|rest| {
-                if let Ok(mut slots) = rest.try_borrow_mut() {
-                    if let Some(i) = slots.iter().position(|s| {
-                        s.as_ref().is_some_and(|s| s.bus_key == bus_key && &*s.name == event)
-                    }) {
-                        slots[i] = Some(fresh());
-                    } else {
-                        let clock = MEMO_CLOCK.with(|c| c.get());
-                        MEMO_CLOCK.with(|c| c.set(clock + 1));
-                        slots[clock % MEMO_REST_SLOTS] = Some(fresh());
-                    }
-                }
-            });
+            // SAFETY: published record — immutable, never freed.
+            let rec = unsafe { &*cur };
+            if rec.tag == tag && &*rec.name == event {
+                return; // already correct content
+            }
+            if victim.is_none() {
+                victim = Some(i);
+            }
         }
-    });
+        i = (i + 1) & MEMO_MASK;
+    }
+    // Saturated region: overwrite the first probed victim.
+    if let Some(vi) = victim {
+        let rec = Box::into_raw(Box::new(MemoRecord {
+            tag,
+            name: event.into(),
+            resolved: Arc::clone(&resolved),
+            has_async,
+        }));
+        let old = MEMO_TABLE[vi].swap(rec, Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: the record was published (immutable, never freed);
+            // park it forever so any reader still borrowing it stays sound.
+            MEMO_RETIRED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(unsafe { &*old });
+        }
+    }
 }
 
 /// One queued unit of async work: the handler snapshot for a single publish.
@@ -853,15 +817,15 @@ impl EventBus {
         if gens == 0 {
             return false;
         }
-        // TASK-165: the memo hit path pays no hash — key is (bus, gen) + the
-        // event string itself; FNV only on the cold resolution path.
-        if let Some(any) = memo_has(self.sync.id, gens, event) {
+        // Global memo hit (TASK-167): one acquire load per probe, no TLS.
+        // The hash is computed once and reused by the cold path below.
+        let hash = fnv1a(event.as_bytes());
+        if let Some(any) = memo_has(self.sync.id, gens, hash, event) {
             return any;
         }
-        let hash = fnv1a(event.as_bytes());
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
         let any = !resolved.is_empty() || has_async;
-        memo_fill(self.sync.id, gens, event, resolved, has_async);
+        memo_fill(self.sync.id, gens, hash, event, resolved, has_async);
         any
     }
 
@@ -898,20 +862,20 @@ impl EventBus {
         if gens == 0 {
             return 0;
         }
-        // Per-thread memo hit: precomputed resolved list — no locks, no
-        // snapshot, no allocation, no refcount traffic, and since TASK-165
-        // no hash either (key = (bus, gen) + the event string itself).
+        // Global memo hit (TASK-167): no TLS, no refcounts — one acquire
+        // load per probe. The hash is computed once and reused by the cold
+        // resolution path and the async queue below.
+        let hash = fnv1a(event.as_bytes());
         if let Some((invoked, has_async)) =
-            memo_dispatch(self.sync.id, gens, event, payload)
+            memo_dispatch(self.sync.id, gens, hash, event, payload)
         {
             if has_async {
-                self.queue_async(event, payload, fnv1a(event.as_bytes()));
+                self.queue_async(event, payload, hash);
             }
             return invoked;
         }
-        let hash = fnv1a(event.as_bytes());
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
-        memo_fill(self.sync.id, gens, event, Arc::clone(&resolved), has_async);
+        memo_fill(self.sync.id, gens, hash, event, Arc::clone(&resolved), has_async);
         let invoked = dispatch(&resolved, event, payload);
         if has_async {
             self.queue_async(event, payload, hash);
@@ -1385,6 +1349,77 @@ mod tests {
 
         bus.subscribe("x.evt", Arc::new(|_, _| {}));
         assert_eq!(n.load(Ordering::SeqCst), 2, "later subscriptions emit exactly once");
+    }
+
+    #[test]
+    fn global_memo_reentrant_publish_from_handler() {
+        let bus = EventBus::default();
+        let inner = Arc::new(AtomicUsize::new(0));
+        let i2 = Arc::clone(&inner);
+        bus.subscribe("r.inner", Arc::new(move |_, _| {
+            i2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let bus2 = bus.clone();
+        bus.subscribe("r.outer", Arc::new(move |_, _| {
+            // Nested publish while the outer dispatch is live: with the
+            // global memo there is no slot state to take out — the nested
+            // publish just probes the same table.
+            bus2.publish("r.inner", &serde_json::json!(null));
+        }));
+        assert_eq!(bus.publish("r.outer", &serde_json::json!(null)), 1);
+        assert_eq!(inner.load(Ordering::SeqCst), 1);
+        // Second publish rides the memo for both keys, nested dispatch included.
+        assert_eq!(bus.publish("r.outer", &serde_json::json!(null)), 1);
+        assert_eq!(inner.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn global_memo_concurrent_publish_and_mutate() {
+        let bus = EventBus::default();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let pat_hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        bus.subscribe("g.evt", Arc::new(move |event, _| {
+            assert_eq!(event, "g.evt", "memo must never dispatch a wrong list");
+            h2.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Warm the memo on this thread (fill), then account the baseline.
+        assert_eq!(bus.publish("g.evt", &serde_json::json!(null)), 1);
+        let mut accounted = hits.load(Ordering::SeqCst) + pat_hits.load(Ordering::SeqCst);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let bus = bus.clone();
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut returned = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    returned += bus.publish("g.evt", &serde_json::json!(null));
+                }
+                returned
+            }));
+        }
+        // Mutator: churn the registry so the combined generation (and hence
+        // the memo tags) keeps moving under the concurrent publishers.
+        for _ in 0..2_000 {
+            let p2 = Arc::clone(&pat_hits);
+            let tok = bus.subscribe("g.*", Arc::new(move |_, _| { p2.fetch_add(1, Ordering::SeqCst); }));
+            bus.unsubscribe("g.*", &tok);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_returned: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        accounted += total_returned;
+        // Strong coherence invariant: `publish` returns the exact number of
+        // sync handler invocations, so the handler atomics must sum to every
+        // returned count (each sync dispatch runs to completion on the
+        // publishing thread before the return value is produced).
+        assert_eq!(
+            hits.load(Ordering::SeqCst) + pat_hits.load(Ordering::SeqCst),
+            accounted,
+            "handler invocations must exactly match publish return counts"
+        );
     }
 }
 
