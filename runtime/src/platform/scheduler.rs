@@ -389,7 +389,11 @@ pub fn on_tick_boundary() -> usize {
     // clone per tick.
     let bus = tick_bus();
     if bus.has_subscribers(TICK_BOUNDARY) {
-        bus.publish(TICK_BOUNDARY, &json!({ "tick": tick, "drained": drained }));
+        // TASK-176: the payload rides the queue as a shared Arc instead of
+        // a per-publish deep clone — one atomic increment replaces cloning
+        // the map root, every entry node and every String key whenever an
+        // async subscriber is listening.
+        bus.publish_shared(TICK_BOUNDARY, Arc::new(json!({ "tick": tick, "drained": drained })));
     }
     let epoch = *MONO_EPOCH.get_or_init(Instant::now);
     // One clock read per tick (TASK-162): the boundary duration and the TPS

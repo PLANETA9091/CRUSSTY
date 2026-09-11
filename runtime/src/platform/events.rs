@@ -621,6 +621,13 @@ const ASYNC_LEADERS_ZEROALLOC: bool = true;
 /// runs unconditionally (round-14 baseline). See RegistryView::resolve.
 const RESOLVE_SHARED_EXACT: bool = true;
 
+/// TASK-176 A/B toggle: when true, `publish_shared` hands the caller's
+/// `Arc<Value>` straight to the queued task — one atomic increment, zero
+/// deep clone; when false, the shared publish path deep-clones the payload
+/// exactly like `publish` (round-15 baseline). Handler-visible payloads
+/// are byte-identical in both modes: `TaskPayload` derefs to `Value`.
+const ASYNC_PAYLOAD_SHARED: bool = true;
+
 /// Heap-free event-name storage for queued async tasks (TASK-173): the
 /// build path previously paid one `to_string()` allocation (and the worker
 /// paid its deallocation) per task. Names up to 23 bytes live in the task's
@@ -659,10 +666,32 @@ impl InlineEvent {
     }
 }
 
+/// Payload storage for queued async tasks (TASK-176). `publish` deep-clones
+/// the caller's borrowed Value (the borrow may die before the task runs);
+/// `publish_shared` moves the caller's `Arc<Value>` handle into the task —
+/// one atomic increment instead of cloning the map root, every entry node
+/// and every String key. Both variants hand handlers the same `&Value`:
+/// the enum derefs, so dispatch code and handler signatures are unchanged.
+enum TaskPayload {
+    Owned(Value),
+    Shared(Arc<Value>),
+}
+
+impl std::ops::Deref for TaskPayload {
+    type Target = Value;
+    #[inline]
+    fn deref(&self) -> &Value {
+        match self {
+            TaskPayload::Owned(v) => v,
+            TaskPayload::Shared(v) => v,
+        }
+    }
+}
+
 /// One queued unit of async work: the handler snapshot for a single publish.
 struct AsyncTask {
     event: InlineEvent,
-    payload: Value,
+    payload: TaskPayload,
     /// Phantom guards keep the module mappings alive while their handlers
     /// sit in the queue or run: a reload cannot dlclose a module whose async
     /// handlers are still pending or in flight (active-count protocol).
@@ -815,6 +844,35 @@ impl Default for AsyncPool {
 /// wedge the bus, and our critical sections never hold user code.
 fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
     guard.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Quiescence: every queued handler keeps its module's guard alive until
+/// the pool has run it (see AsyncTask::leaders), so a hot reload waits
+/// instead of dlclosing under pending handlers.
+/// TASK-174: the parallel leaders array exists for the reload-safety
+/// protocol — run() consults leaders.get_mut(i) only to release a module
+/// guard for OWNED handlers (the skip branch requires owner.is_some()), so
+/// when no queued handler belongs to a module there is nothing to guard
+/// and nothing to release: an out-of-range get_mut yields None exactly
+/// like a Some(None) slot. The all-unowned shape (global subscribe_async)
+/// then pushes a Vec::new() — zero heap allocs on the build path. The
+/// mixed / some-owned shape keeps the full parallel collect: an owned
+/// handler whose slot read None would be skipped as mid-reload, so
+/// leaders.len()==list.len() must hold whenever any owner exists.
+fn build_leaders(
+    list: &[(Option<(Box<str>, u64)>, Handler)],
+) -> Vec<Option<crate::platform::hot_reload::ModuleGuard>> {
+    if ASYNC_LEADERS_ZEROALLOC && !list.iter().any(|(owner, _)| owner.is_some()) {
+        Vec::new()
+    } else {
+        list.iter()
+            .map(|(owner, _)| {
+                owner
+                    .as_ref()
+                    .and_then(|(id, _)| crate::platform::hot_reload::guard_module(id))
+            })
+            .collect()
+    }
 }
 
 fn dispatch(handlers: &[(Option<(Box<str>, u64)>, Handler)], event: &str, payload: &Value) -> usize {
@@ -1021,6 +1079,47 @@ impl EventBus {
         invoked
     }
 
+    /// Publish an event whose payload the caller holds behind an `Arc`
+    /// (TASK-176). Identical to [`publish`] in every observable way —
+    /// same fast gate, same memo, same sync dispatch — except the async
+    /// queue takes the caller's handle instead of deep-cloning the Value
+    /// per publish.
+    ///
+    /// Preferred call shape: build a FRESH payload and MOVE the handle in
+    /// (`publish_shared(topic, Arc::new(json!(...)))`) — the task then owns
+    /// the value outright (count 1) and no counter line is ever contended.
+    /// Re-cloning one long-lived handle per call
+    /// (`publish_shared(topic, Arc::clone(&shared))`) still works, but the
+    /// publisher's inc and the worker's dec then bounce the same count line
+    /// across cores every publish — measurably worse than a fresh build.
+    pub fn publish_shared(&self, event: &str, payload: Arc<Value>) -> usize {
+        // Lock-free fast gate (TASK-164): combined generation 0 = nothing
+        // ever subscribed — ONE acquire load, no locks.
+        let gens = self.gens.load(Ordering::Acquire);
+        if gens == 0 {
+            return 0;
+        }
+        // Global memo hit (TASK-167) — same shape as publish; the hash is
+        // computed once and reused by the cold resolution path and the
+        // async queue below.
+        let hash = fnv1a(event.as_bytes());
+        if let Some((invoked, has_async)) =
+            memo_dispatch(self.sync.id, gens, hash, event, &payload)
+        {
+            if has_async {
+                self.queue_async_shared(event, payload, hash);
+            }
+            return invoked;
+        }
+        let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
+        memo_fill(self.sync.id, gens, hash, event, Arc::clone(&resolved), has_async);
+        let invoked = dispatch(&resolved, event, &payload);
+        if has_async {
+            self.queue_async_shared(event, payload, hash);
+        }
+        invoked
+    }
+
     /// Cold resolution path: load the RCU views, build the resolved lists.
     fn resolve_event(&self, event: &str, hash: u64, sg: u64, ag: u64) -> (Resolved, bool) {
         let resolved: Resolved = if sg > 0 {
@@ -1044,49 +1143,53 @@ impl EventBus {
     /// Queue the async handlers for one publish (cold: only when an async
     /// subscription matches).
     fn queue_async(&self, event: &str, payload: &Value, hash: u64) {
-        let Some(list) = self
-            .async_cell
+        let Some(list) = self.async_targets(event, hash) else {
+            return;
+        };
+        // The borrowed payload may die before the task runs: deep-clone it
+        // into the task (publish has no handle to share).
+        self.pool.push(AsyncTask {
+            event: event.into(),
+            payload: TaskPayload::Owned(payload.clone()),
+            leaders: build_leaders(&list),
+            handlers: list,
+        });
+    }
+
+    /// Queue the async handlers for one shared-arc publish (TASK-176): the
+    /// caller hands over its `Arc<Value>` handle, so the task stores the
+    /// payload without any deep clone when ASYNC_PAYLOAD_SHARED is on —
+    /// one atomic increment instead of cloning the map root, every entry
+    /// node and every String key. The OFF mode deep-clones exactly like
+    /// queue_async (round-15 baseline), which keeps the A/B honest about
+    /// the enqueue representation and nothing else.
+    fn queue_async_shared(&self, event: &str, payload: Arc<Value>, hash: u64) {
+        let Some(list) = self.async_targets(event, hash) else {
+            return;
+        };
+        let payload = if ASYNC_PAYLOAD_SHARED {
+            TaskPayload::Shared(payload)
+        } else {
+            TaskPayload::Owned((*payload).clone())
+        };
+        self.pool.push(AsyncTask {
+            event: event.into(),
+            payload,
+            leaders: build_leaders(&list),
+            handlers: list,
+        });
+    }
+
+    /// Resolve the async handler snapshot for one publish; `None` = nothing
+    /// to queue. Shared by the borrowed (queue_async) and shared-arc
+    /// (queue_async_shared) enqueue paths — identical semantics, callers
+    /// differ only in how the payload reaches the task.
+    fn async_targets(&self, event: &str, hash: u64) -> Option<Resolved> {
+        self.async_cell
             .view
             .load_arc()
             .map(|v| v.resolve(hash, event))
             .filter(|l| !l.is_empty())
-        else {
-            return;
-        };
-        // Quiescence: every queued handler keeps its module's guard alive
-        // until the pool has run it (see AsyncTask::leaders), so a hot
-        // reload waits instead of dlclosing under pending handlers.
-        // TASK-174: the parallel leaders array exists for the reload-safety
-        // protocol — run() consults leaders.get_mut(i) only to release a
-        // module guard for OWNED handlers (the skip branch requires
-        // owner.is_some()), so when no queued handler belongs to a module
-        // there is nothing to guard and nothing to release: an out-of-range
-        // get_mut yields None exactly like a Some(None) slot. The
-        // all-unowned shape (global subscribe_async) then pushes a
-        // Vec::new() — zero heap allocs on the build path. The mixed /
-        // some-owned shape keeps the full parallel collect: an owned
-        // handler whose slot read None would be skipped as mid-reload, so
-        // leaders.len()==list.len() must hold whenever any owner exists.
-        let leaders: Vec<Option<crate::platform::hot_reload::ModuleGuard>> = if
-            ASYNC_LEADERS_ZEROALLOC
-            && !list.iter().any(|(owner, _)| owner.is_some())
-        {
-            Vec::new()
-        } else {
-            list.iter()
-                .map(|(owner, _)| {
-                    owner
-                        .as_ref()
-                        .and_then(|(id, _)| crate::platform::hot_reload::guard_module(id))
-                })
-                .collect()
-        };
-        self.pool.push(AsyncTask {
-            event: event.into(),
-            payload: payload.clone(),
-            leaders,
-            handlers: list,
-        });
     }
 
     /// Number of events currently queued for async dispatch (queue depth).
@@ -1377,6 +1480,41 @@ mod tests {
         // The pool worker survived the panic: dispatch still works.
         bus.publish("ap.evt", &serde_json::json!(null));
         assert!(wait_until(|| done.load(Ordering::SeqCst) >= 2), "worker died after panic");
+    }
+
+    #[test]
+    fn publish_shared_matches_publish_visibility() {
+        // TASK-176: publish_shared must be observationally identical to
+        // publish — same sync return value, byte-exact handler-visible
+        // payloads on the async path, both via the shared Arc handle.
+        let bus = EventBus::default();
+
+        // sync path: same count as publish
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = Arc::clone(&n);
+        bus.subscribe("sh.sync", Arc::new(move |_, payload| {
+            n2.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(payload["tick"].as_u64(), Some(7), "sync payload via publish_shared");
+        }));
+        assert_eq!(bus.publish_shared("sh.sync", Arc::new(serde_json::json!({ "tick": 7u64 }))), 1);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+
+        // async path: the queued task derefs to the same payload
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        bus.subscribe_async("sh.async", Arc::new(move |event, payload| {
+            s.lock().unwrap().push((event.to_string(), payload["tick"].as_u64().unwrap()));
+        }));
+        bus.publish_shared("sh.async", Arc::new(serde_json::json!({ "tick": 41u64 })));
+        assert!(
+            wait_until(|| seen.lock().unwrap().len() == 1),
+            "publish_shared async handler never ran"
+        );
+        assert_eq!(seen.lock().unwrap()[0], ("sh.async".to_string(), 41u64));
+
+        // zero subscribers: same gate as publish (0 invoked, nothing queued)
+        assert_eq!(bus.publish_shared("sh.none", Arc::new(serde_json::json!(null))), 0);
+        assert_eq!(bus.async_pending(), 0);
     }
 
     #[test]
@@ -1709,7 +1847,7 @@ mod bench_hotpath {
         let pool = Arc::clone(&bus.pool);
         let build_task = || AsyncTask {
             event: "bench.async".into(),
-            payload: payload.clone(),
+            payload: TaskPayload::Owned(payload.clone()),
             leaders: Vec::new(),
             handlers: Arc::from(Vec::new()),
         };
@@ -1769,6 +1907,94 @@ mod bench_hotpath {
             best_build * 1e9,
             best_push * 1e9,
             best_sat * 1e9
+        );
+    }
+
+    /// TASK-176 A/B: the shared-arc enqueue path. The integral subject is
+    /// publish_shared(1 async sub) in the PRODUCTION call shape (scheduler
+    /// tick boundary): a FRESH Arc<Value> is built per publish and MOVED
+    /// into the call, so the task takes sole ownership (count 1) — under
+    /// ASYNC_PAYLOAD_SHARED=true the queue stores that handle with zero
+    /// deep clone; under false it deep-clones exactly like publish
+    /// (round-15 baseline). Cloning one long-lived handle per call instead
+    /// would put the Arc counter on a cross-core contended line (inc on
+    /// the publisher, dec on the worker) — a shape production callers do
+    /// not produce and the A/B must not measure.
+    /// The build(shared) isolate is toggle-independent (it constructs the
+    /// Shared variant directly), so it doubles as a cross-build noise
+    /// check against the owned task build line in bench_event_bus_publish.
+    #[test]
+    #[ignore]
+    fn bench_event_publish_shared() {
+        let bus = with_cap(64);
+        let payload = serde_json::json!({ "tick": 1u64, "drained": 0u64 });
+        let payload_arc = Arc::new(payload.clone());
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // one sync subscriber — publish_shared's sync path must sit at the
+        // publish(1 sync sub) floor (dispatch + memo, no queue work); the
+        // handle clone here isolates the bus path from payload construction
+        let _stok = bus.subscribe("bench.shared.sync", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            let _ = bus.publish_shared("bench.shared.sync", Arc::clone(&payload_arc));
+        }
+        let mut best_sync = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish_shared("bench.shared.sync", Arc::clone(&payload_arc));
+            }
+            best_sync = best_sync.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // one async subscriber — the A/B subject line, production shape:
+        // fresh payload per publish, handle MOVED into the call
+        let _atok = bus.subscribe_async("bench.shared", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            let _ = bus.publish_shared(
+                "bench.shared",
+                Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 })),
+            );
+        }
+        let mut best_shared = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish_shared(
+                    "bench.shared",
+                    Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 })),
+                );
+            }
+            best_shared = best_shared.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // build isolate: shared-arc payload (one atomic inc) vs the owned
+        // deep-clone build line in bench_event_bus_publish; the handlers
+        // form (Arc::from(Vec::new())) matches the owned isolate so the
+        // ONLY delta between the two build lines is the payload repr.
+        let build_shared = || AsyncTask {
+            event: "bench.shared".into(),
+            payload: TaskPayload::Shared(Arc::clone(&payload_arc)),
+            leaders: Vec::new(),
+            handlers: Arc::from(Vec::new()),
+        };
+        for _ in 0..10_000u32 {
+            drop(build_shared());
+        }
+        let mut best_build = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                drop(build_shared());
+            }
+            best_build = best_build.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH publish_shared: publish_shared(1 sync sub) {:.0} ns/op, publish_shared(1 async sub) {:.0} ns/op, task build(shared) {:.0} ns/op (min of {rounds}x{iters})",
+            best_sync * 1e9,
+            best_shared * 1e9,
+            best_build * 1e9
         );
     }
 }
