@@ -584,6 +584,13 @@ fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved
 const ASYNC_EVENT_INLINE: bool = true;
 const INLINE_EVENT_CAP: usize = 23;
 
+/// TASK-174 A/B toggle: when true, an all-unowned async dispatch (no
+/// queued handler belongs to a module) pushes an empty leaders Vec —
+/// zero heap allocs; when false, the full parallel Vec is collected
+/// unconditionally (round-13 baseline). See queue_async for the
+/// correctness argument.
+const ASYNC_LEADERS_ZEROALLOC: bool = true;
+
 /// Heap-free event-name storage for queued async tasks (TASK-173): the
 /// build path previously paid one `to_string()` allocation (and the worker
 /// paid its deallocation) per task. Names up to 23 bytes live in the task's
@@ -629,7 +636,7 @@ struct AsyncTask {
     /// Phantom guards keep the module mappings alive while their handlers
     /// sit in the queue or run: a reload cannot dlclose a module whose async
     /// handlers are still pending or in flight (active-count protocol).
-    leaders: Vec<Option<super::hot_reload::ModuleGuard>>,
+    leaders: Vec<Option<crate::platform::hot_reload::ModuleGuard>>,
     handlers: Resolved,
 }
 
@@ -784,7 +791,7 @@ fn dispatch(handlers: &[(Option<(Box<str>, u64)>, Handler)], event: &str, payloa
     for (owner, handler) in handlers.iter() {
         let guard = owner
             .as_ref()
-            .and_then(|(id, _)| super::hot_reload::guard_module(id));
+            .and_then(|(id, _)| crate::platform::hot_reload::guard_module(id));
         if owner.is_some() && guard.is_none() {
             report_skipped_reload(&owner.as_ref().expect("owner checked").0, event);
             continue;
@@ -1019,14 +1026,31 @@ impl EventBus {
         // Quiescence: every queued handler keeps its module's guard alive
         // until the pool has run it (see AsyncTask::leaders), so a hot
         // reload waits instead of dlclosing under pending handlers.
-        let leaders = list
-            .iter()
-            .map(|(owner, _)| {
-                owner
-                    .as_ref()
-                    .and_then(|(id, _)| super::hot_reload::guard_module(id))
-            })
-            .collect();
+        // TASK-174: the parallel leaders array exists for the reload-safety
+        // protocol — run() consults leaders.get_mut(i) only to release a
+        // module guard for OWNED handlers (the skip branch requires
+        // owner.is_some()), so when no queued handler belongs to a module
+        // there is nothing to guard and nothing to release: an out-of-range
+        // get_mut yields None exactly like a Some(None) slot. The
+        // all-unowned shape (global subscribe_async) then pushes a
+        // Vec::new() — zero heap allocs on the build path. The mixed /
+        // some-owned shape keeps the full parallel collect: an owned
+        // handler whose slot read None would be skipped as mid-reload, so
+        // leaders.len()==list.len() must hold whenever any owner exists.
+        let leaders: Vec<Option<crate::platform::hot_reload::ModuleGuard>> = if
+            ASYNC_LEADERS_ZEROALLOC
+            && !list.iter().any(|(owner, _)| owner.is_some())
+        {
+            Vec::new()
+        } else {
+            list.iter()
+                .map(|(owner, _)| {
+                    owner
+                        .as_ref()
+                        .and_then(|(id, _)| crate::platform::hot_reload::guard_module(id))
+                })
+                .collect()
+        };
         self.pool.push(AsyncTask {
             event: event.into(),
             payload: payload.clone(),
