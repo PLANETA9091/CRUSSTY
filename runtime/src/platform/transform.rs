@@ -1574,7 +1574,25 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
 /// error).
 fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
     edits.sort_by_key(|e| e.offset());
-    let mut out: Vec<u8> = Vec::with_capacity(data.len() + 64);
+    // TASK-216 exact capacity: out never exceeds data + the total Insert
+    // payload. Proof per group: with no Set in the group, chunk_len =
+    // sum(inserts) and replaced = 0; with a Set, the Set arm CLEARS the
+    // chunk, so chunk_len = set size = replaced (net zero, co-located
+    // inserts are overridden). Hence out_len = data + sum(chunk_len -
+    // replaced) <= data + sum(insert bytes) — no realloc ever fires.
+    let insert_bytes: usize = edits
+        .iter()
+        .map(|e| match e {
+            Edit::Insert(_, b) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() + insert_bytes);
+    // TASK-216 scratch chunk: one buffer reused across offset groups (the
+    // per-group clear below replaces the old fresh Vec::new() per group —
+    // that shape paid a malloc/free pair for EVERY group). Byte-identical:
+    // the chunk is fully rewritten per group and consumed before the next.
+    let mut chunk: Vec<u8> = Vec::new();
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < edits.len() {
@@ -1583,7 +1601,7 @@ fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
             return Err(format!("edit at offset {off} beyond end of class file"));
         }
         out.extend_from_slice(&data[pos..off]);
-        let mut chunk: Vec<u8> = Vec::new();
+        chunk.clear();
         let mut replaced = 0usize;
         while i < edits.len() && edits[i].offset() == off {
             match edits[i] {
