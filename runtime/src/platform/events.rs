@@ -744,6 +744,17 @@ struct AsyncTask {
 /// write-set across two lines with zero visible code change. The const gate
 /// below pins the property at compile time — if it fires, re-verify the
 /// packing before touching anything else.
+/// TASK-214 ordering contract: every access to `idle`, `dropped` and
+/// `dropping` happens under the queue mutex (the bench side's lock-free
+/// readers only poll these words for quiescence / shed counts and derive no
+/// ordering from them), so the mutex's own Release/Acquire provides all
+/// cross-thread ordering. Each field is a single variable — its value
+/// semantics are ordering-independent (coherence) — and RMWs read the
+/// latest modification-order value for every ordering, so Relaxed
+/// everywhere is value-identical to the previous SeqCst while removing the
+/// compiler barriers from the dispatch loops that fat LTO + one CGU inline
+/// end-to-end (TASK-213). The TASK-212 layout gate below still pins the
+/// write-set line.
 struct AsyncPool {
     queue: Mutex<VecDeque<AsyncTask>>,
     condvar: Condvar,
@@ -825,9 +836,13 @@ impl AsyncPool {
     /// TASK-170 hysteresis, shared by the spin and park pop paths: the
     /// drop-burst latch resets only when the queue genuinely drains (below
     /// half capacity) — one eprintln per overload episode, never a flood.
+    /// Relaxed (TASK-214): runs under the queue lock on every successful
+    /// pop — the mutex orders it against the pusher's swap; Relaxed also
+    /// lowers the store to a plain mov instead of an implicit xchg on this
+    /// per-pop drain path.
     fn latch_reset(&self, queue: &VecDeque<AsyncTask>) {
         if queue.len() < self.cap / 2 {
-            self.dropping.store(false, Ordering::SeqCst);
+            self.dropping.store(false, Ordering::Relaxed);
         }
     }
 
@@ -860,9 +875,11 @@ impl AsyncPool {
             // commit to the wait; decrement as soon as it returns so the
             // count never includes an awake worker for longer than the
             // wake-to-decrement window.
-            self.idle.fetch_add(1, Ordering::SeqCst);
+            // Relaxed (TASK-214): both RMWs hold the queue lock — the
+            // mutex orders them against the pusher's gate snapshot.
+            self.idle.fetch_add(1, Ordering::Relaxed);
             queue = self.condvar.wait(queue).unwrap_or_else(|p| p.into_inner());
-            self.idle.fetch_sub(1, Ordering::SeqCst);
+            self.idle.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -1344,8 +1361,10 @@ impl EventBus {
     }
 
     /// Total events dropped by the backpressure cap since bus creation.
+    /// Relaxed (TASK-214): monotone counter, no consumer derives ordering
+    /// from it — single-variable value semantics are ordering-independent.
     pub fn async_dropped(&self) -> usize {
-        self.pool.dropped.load(Ordering::SeqCst)
+        self.pool.dropped.load(Ordering::Relaxed)
     }
 
     /// Emit a lifecycle event on the bus itself, guarded against re-entrant
@@ -1369,8 +1388,11 @@ impl AsyncPool {
         let mut queue = lock(&self.queue);
         if queue.len() >= self.cap {
             queue.pop_front();
-            self.dropped.fetch_add(1, Ordering::SeqCst);
-            if !self.dropping.swap(true, Ordering::SeqCst) {
+            // Both Relaxed (TASK-214): under the queue lock; the swap is an
+            // RMW and reads the latest modification-order value for any
+            // ordering, so the once-per-burst log decision is unchanged.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            if !self.dropping.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[crussty:events] async dispatch queue at capacity ({}) — dropping oldest pending events",
                     self.cap
@@ -1396,7 +1418,9 @@ impl AsyncPool {
         // that lock here, so this snapshot is exact for the decision
         // instant; len evolves by +-1 under the same lock, so the equality
         // is the crossing detector, not a coincidence filter.
-        let idle = self.idle.load(Ordering::SeqCst);
+        // Relaxed (TASK-214): the lock already serializes every idle
+        // mutator with this reader — the snapshot stays exact.
+        let idle = self.idle.load(Ordering::Relaxed);
         if idle > 0 && queue.len() == ASYNC_WORKERS - idle + 1 {
             self.condvar.notify_one();
         }
