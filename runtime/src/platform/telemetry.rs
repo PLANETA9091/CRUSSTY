@@ -1326,6 +1326,223 @@ mod bench_hotpath {
         );
     }
 
+    /// TASK-209 stages decomposition of the snapshot read family. The
+    /// ledger's snapshot_hit lockfree line (98 ns at the 32-labeled
+    /// shape) is the REAL entry `snapshot_json_write` into a caller
+    /// buffer plus the bench consumer fold — the ledger carries NO
+    /// mechanism split for it (unlike transform/cflh/enqueue-iso). The
+    /// candidate terms: (1) the CACHE MUTEX the hit path takes per call
+    /// (the TASK-199 "lock-free" part is only the snapshot data lock —
+    /// the cache lock serializes readers vs the miss-path writer), (2)
+    /// the tps memo fast path (two ring loads + compares, ring-keyed —
+    /// no clock read), (3) the 3x extend_from_slice memcpy of the
+    /// pre-encoded JSON (the Ext API contract — the copy IS the
+    /// delivery; the C consumer already has the zero-copy 15 ns line
+    /// via c_fill), (4) the bench consumer fold over the produced
+    /// bytes. Arms: e2e_empty (fixed machinery floor at ~zero output
+    /// size — the control) | e2e32 (the ledger line, verbatim) |
+    /// machinery (lock + destructure + memo resolve + gen compare, no
+    /// extends, no consumer) | machinery-nomemo (lock + gen compare
+    /// only — the delta prices the memo fast path vs the mutex) |
+    /// produce (clear + real write, black_box len, no fold) |
+    /// copy-replica (lock + memo + verbatim 3x extend, the exact hit
+    /// branch) | consume (fold over a prefilled buffer only). Printed arithmetic: memcpy = produce - machinery; sum =
+    /// machinery + memcpy + consume must account for e2e32. A
+    /// byte-stability gate (two consecutive writes equal) is asserted
+    /// before any timing. Runs SOLO (filtered run only): resets the
+    /// shared snapshot and leaves 32 metrics published at the end
+    /// (harmless — every solo bench resets its own starting state).
+    #[test]
+    #[ignore]
+    fn bench_snapshot_read_stages_iso() {
+        test_reset_snapshot();
+
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut buf = Vec::with_capacity(4096);
+
+        // Local generic timer (house pattern): black_boxed u64 return,
+        // min of {rounds} rounds x {iters} iters, 10k warmup calls.
+        fn time(
+            label: &'static str,
+            rounds: u32,
+            iters: u32,
+            mut f: impl FnMut() -> u64,
+        ) -> (&'static str, f64) {
+            for _ in 0..10_000u32 {
+                std::hint::black_box(f());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    std::hint::black_box(f());
+                }
+                best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            (label, best * 1e9)
+        }
+        // The consumer fold MUST be the house inline u8 idiom (the same
+        // expression bench_snapshot_hit_ab times) — a u64-accumulating
+        // cast fold does NOT vectorize and reads as a phantom ~530 ns
+        // consumer term (measured 565 vs the ledger's 98-total line —
+        // the discrepancy is the fold codegen, not the snapshot path).
+        let fold = |buf: &Vec<u8>| -> u64 {
+            buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)) as u64
+        };
+
+        // ---- empty-snapshot control: the fixed cost at ~zero output
+        // size (machinery + tiny memcpy + tiny fold) ----
+        for _ in 0..10_000u32 {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(fold(&buf));
+        }
+        let mut g1 = Vec::with_capacity(4096);
+        let mut g2 = Vec::with_capacity(4096);
+        snapshot_json_write(&mut g1);
+        snapshot_json_write(&mut g2);
+        assert!(!g1.is_empty());
+        assert_eq!(g1, g2, "snapshot hit must be byte-stable (empty)");
+        let empty_bytes = g1.len();
+        let e2e_empty = time("e2e_empty", rounds, iters, || {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            fold(&buf)
+        });
+
+        // ---- 32-labeled fixture: the ledger shape (same as
+        // bench_snapshot_hit_ab) ----
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("c.bench.hit.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+        for _ in 0..10_000u32 {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(fold(&buf));
+        }
+        g1.clear();
+        g2.clear();
+        snapshot_json_write(&mut g1);
+        snapshot_json_write(&mut g2);
+        assert!(!g1.is_empty());
+        assert_eq!(g1, g2, "snapshot hit must be byte-stable (32 labeled)");
+        let out_bytes = g1.len();
+
+        // e2e — the ledger line, verbatim shape.
+        let e2e32 = time("e2e32", rounds, iters, || {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            fold(&buf)
+        });
+
+        // machinery — the lock + hit decision ONLY (no output work).
+        let machinery = time("machinery", rounds, iters, || {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let SnapshotJsonCache {
+                gen: cached_gen,
+                valid: cached_valid,
+                tps_memo,
+                ..
+            } = &mut *cache;
+            let resolved = tps_memo_resolve(tps_memo);
+            let gen = SNAP_GEN.load(Ordering::Relaxed);
+            let hit = resolved && *cached_valid && *cached_gen == gen;
+            gen + hit as u64
+        });
+
+        // machinery-nomemo — lock + gen compare ONLY: machinery minus
+        // this arm prices the tps memo fast path (the residual is the
+        // cache mutex + field loads — the DESIGN-front number).
+        let machinery_nomemo = time("machinery_nomemo", rounds, iters, || {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let SnapshotJsonCache {
+                gen: cached_gen,
+                valid: cached_valid,
+                ..
+            } = &mut *cache;
+            let gen = SNAP_GEN.load(Ordering::Relaxed);
+            let hit = *cached_valid && *cached_gen == gen;
+            gen + hit as u64
+        });
+
+        // produce — clear + the REAL write, consumer fold replaced by a
+        // black_boxed len/first-byte read.
+        let produce = time("produce", rounds, iters, || {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            (buf.len() as u64) + (buf[0] as u64)
+        });
+
+        // copy-replica — the verbatim hit branch (lock + memo resolve +
+        // 3x extend) with the consumer fold: must re-derive e2e32 (the
+        // replica-agreement check).
+        let copy_replica = time("copy_replica", rounds, iters, || {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let SnapshotJsonCache {
+                prefix,
+                suffix,
+                tps_memo,
+                ..
+            } = &mut *cache;
+            if !tps_memo_resolve(tps_memo) {
+                panic!("steady-state memo resolve must hold under the gate");
+            }
+            let tps_bytes_len = tps_memo.bytes_len;
+            let tps_bytes = &tps_memo.bytes[..tps_bytes_len];
+            buf.clear();
+            buf.extend_from_slice(prefix);
+            buf.extend_from_slice(tps_bytes);
+            buf.extend_from_slice(suffix);
+            drop(cache);
+            fold(&buf)
+        });
+
+        // consume — the bench consumer alone: fold over a prefilled
+        // buffer (no lock, no write).
+        let cbuf = g1.clone();
+        let consume = time("consume", rounds, iters, || fold(&cbuf));
+
+        let memcpy = produce.1 - machinery.1;
+        let memo = machinery.1 - machinery_nomemo.1;
+        let sum = machinery.1 + memcpy + consume.1;
+        println!(
+            "BENCH snapshot read stages: e2e32 {:.0} | e2e_empty {:.0} | machinery(lock+memo+gen) {:.0} (nomemo {:.0} -> memo {:.0}) | produce(lock+memo+memcpy) {:.0} | copy-replica {:.0} | consume-fold-only {:.0}; out {} bytes (empty control {} bytes); memcpy=produce-machinery {:.0}; sum machinery+memcpy+consume {:.0} vs e2e32 {:.0} (min of {rounds}x{iters})",
+            e2e32.1,
+            e2e_empty.1,
+            machinery.1,
+            machinery_nomemo.1,
+            memo,
+            produce.1,
+            copy_replica.1,
+            consume.1,
+            out_bytes,
+            empty_bytes,
+            memcpy,
+            sum,
+            e2e32.1,
+        );
+        // Replica-agreement gate: the verbatim hit-branch replica must
+        // re-derive the e2e line (same lock + memo + memcpy + fold work;
+        // 35% tolerance = codegen-layout noise, not mechanism drift).
+        assert!(
+            (copy_replica.1 - e2e32.1).abs() <= e2e32.1 * 0.35,
+            "copy replica must agree with e2e32: {:.0} vs {:.0}",
+            copy_replica.1,
+            e2e32.1
+        );
+    }
+
     /// TASK-201 A/B subject: the C snapshot entry's steady-state read.
     /// Arm A = the verbatim pre-201 fill cycle (cache lock + clear +
     /// snapshot_json_write_inner(Own) + NUL push — no fast check, no
