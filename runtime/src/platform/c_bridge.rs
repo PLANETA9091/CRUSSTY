@@ -1648,15 +1648,36 @@ mod tests {
     ///                    second insert is the in-place value update, so
     ///                    the walk is two inserts and the ONLY malloc is
     ///                    the BTreeMap node): prices node alloc/free +
-    ///                    insert machinery + wrap + drop.
+    ///                    insert machinery + wrap + drop. TASK-218: this
+    ///                    arm is LEGACY-RECORD only — its same-key-replace
+    ///                    shape is NOT the production path (two DISTINCT
+    ///                    keys into a fresh map) and its number exceeds the
+    ///                    whole construct it decomposes (131 vs 80), so
+    ///                    the additive check strings+map cannot close; the
+    ///                    arithmetic contradiction alone proves the arm
+    ///                    misprices (the construct contains exactly ONE
+    ///                    node malloc — a 131 ns node term cannot fit in an
+    ///                    80 ns construct).
+    ///   map_node       — TASK-218 production-shaped node arm: clone+drop
+    ///                    of a prebuilt single-entry empty-key map per
+    ///                    iteration = the node malloc/free + wrap/drop
+    ///                    profile with ZERO key mallocs (an empty String
+    ///                    clone does not allocate) and no insert machinery.
+    ///   map_machinery  — TASK-218 production-shaped machinery arm: a
+    ///                    prebuilt two-entry map (real keys tick/drained,
+    ///                    asserted equal to the fast path's Value) hit with
+    ///                    2x get_mut + value write per iteration = pure
+    ///                    search/update machinery, zero allocs of any kind.
     ///   serde_direct   — the fallback arm, context line.
     /// Gates asserted BEFORE any timing: (1) PARITY — the fast path's
     /// Value equals serde's on the fixture; (2) replica agreement — the
     /// fold-replica folds exactly the alphanumeric bytes of the fixture
     /// (independent runtime sum, not a hand constant); (3) construct
-    /// equality — construct_only's Value equals the fast path's. Sum
-    /// checks printed: scan + construct vs e2e; strings + map vs
-    /// construct.
+    /// equality — construct_only's Value equals the fast path's; (4) the
+    /// machinery map equals the fast path's Value. Sum checks printed:
+    /// scan + construct vs e2e; strings + node + machinery vs construct
+    /// (TASK-218 additive check; the legacy strings+map sum is dropped
+    /// from the print as broken-by-shape).
     #[test]
     #[ignore]
     fn bench_c_publish_parse_stages_iso() {
@@ -1758,6 +1779,28 @@ mod tests {
             "construct replica diverges from the fast path"
         );
 
+        // TASK-218 arm fixtures. node_map: single entry, empty key — the
+        // clone prices node malloc/free + wrap/drop with zero key mallocs.
+        // mach_map: the production-shaped two-entry map; its equality with
+        // the fast path's Value is gate 4.
+        let node_map: serde_json::Map<String, Value> = {
+            let mut m = serde_json::Map::new();
+            m.insert(String::new(), serde_json::Number::from(1u64).into());
+            m
+        };
+        let mut mach_map: serde_json::Map<String, Value> = {
+            let mut m = serde_json::Map::new();
+            m.insert(String::from("tick"), serde_json::Number::from(1u64).into());
+            m.insert(String::from("drained"), serde_json::Number::from(0u64).into());
+            m
+        };
+        // Gate 4: the machinery map equals the fast path's Value.
+        assert_eq!(
+            Value::Object(mach_map.clone()),
+            fast,
+            "machinery map diverges from the fast path"
+        );
+
         let iters = 200_000u32;
         let rounds = 5;
 
@@ -1819,15 +1862,45 @@ mod tests {
             best_serde = best_serde.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
 
+        // TASK-218: node arm — clone+drop of the single-entry empty-key map.
+        let mut best_node = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(node_map.clone());
+            }
+            best_node = best_node.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // TASK-218: machinery arm — 2x get_mut + value write on the prebuilt
+        // two-entry map (values rewritten to themselves: idempotent, zero
+        // allocs, the map persists across iterations).
+        let mut best_mach = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                if let Some(v) = mach_map.get_mut("tick") {
+                    *v = serde_json::Number::from(1u64).into();
+                }
+                if let Some(v) = mach_map.get_mut("drained") {
+                    *v = serde_json::Number::from(0u64).into();
+                }
+                black_box(mach_map.len());
+            }
+            best_mach = best_mach.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
         println!(
-            "BENCH c_publish_parse_stages: e2e_fast {:.0} = scan {:.0} + construct {:.0} (sum {:.0}); construct = strings {:.0} + map {:.0} (sum {:.0}); serde-direct {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH c_publish_parse_stages: e2e_fast {:.0} = scan {:.0} + construct {:.0} (sum {:.0}); construct = strings {:.0} + node {:.0} + machinery {:.0} (sum {:.0}); legacy map-replace {:.0}; serde-direct {:.0} ns/op (min of {rounds}x{iters})",
             best_e2e * 1e9,
             best_scan * 1e9,
             best_construct * 1e9,
             (best_scan + best_construct) * 1e9,
             best_strings * 1e9,
+            best_node * 1e9,
+            best_mach * 1e9,
+            (best_strings + best_node + best_mach) * 1e9,
             best_map * 1e9,
-            (best_strings + best_map) * 1e9,
             best_serde * 1e9
         );
     }
