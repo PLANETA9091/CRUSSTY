@@ -722,6 +722,28 @@ struct AsyncTask {
 /// forever (daemon threads); the queue is a `Mutex<VecDeque>` + `Condvar`
 /// with drop-oldest overflow, since `std::sync::mpsc::sync_channel` would
 /// block the publisher (backpressure by blocking) instead of shedding load.
+///
+/// TASK-212 cache-line write-set gate. Measured packing on linux/x86_64
+/// (rustc 1.98: `Mutex<VecDeque<T>>` 40 B, `Condvar` 4 B, `OnceLock<()>` 4 B,
+/// `size_of::<Self>()` 80 B): the compiler lays the fields out so that — with
+/// the 16-byte Arc strong/weak header prepended — the heap object splits as
+/// line 0 `[strong, weak, queue(lock word at +16), cap]` and line 1
+/// `[dropped, idle, condvar, workers, dropping]`. That is exactly the
+/// coherence-optimal arrangement the Round-42 write-set analysis asks for:
+/// the ONLY line that ping-pongs between the publisher and the workers on
+/// every queue handoff is the lock word's line (inherent to the
+/// `Mutex<VecDeque>` repr — the lock-free queue repr is the owner-input
+/// DESIGN front), while the entire cross-core write-set {`dropped` RMW +
+/// `dropping` swap on the shed path, `idle` RMW on the worker park path,
+/// `latch_reset` store} plus the condvar word shares ONE line, so
+/// drain-episode traffic costs one line, not two. Co-locating anything with
+/// the lock line is impossible by budget (40 B queue + 16 B Arc header
+/// leaves 8 B of line 0, already taken by the read-only `cap`).
+/// The arrangement is compiler-packing luck, not a guarantee: a std upgrade
+/// that shifts `Mutex`'s size or a new field can silently scatter the
+/// write-set across two lines with zero visible code change. The const gate
+/// below pins the property at compile time — if it fires, re-verify the
+/// packing before touching anything else.
 struct AsyncPool {
     queue: Mutex<VecDeque<AsyncTask>>,
     condvar: Condvar,
@@ -744,6 +766,27 @@ struct AsyncPool {
     /// push paid it for nothing.
     idle: AtomicUsize,
 }
+
+// TASK-212 layout gate (compile-time, zero runtime cost). Offsets are
+// struct-relative; the Arc heap allocation prepends a 16-byte strong/weak
+// header, so heap line 0 covers struct bytes 0..48 and heap line 1 covers
+// 48..112 (on the measured packing: queue 0..40, cap 40..48, dropped 48..56,
+// idle 56..64, condvar 64..68, workers 68..72, dropping 72..73, size 80).
+// The invariant: the cross-core write-set {dropped, dropping, idle} must all
+// start on heap line 1 and stay mutually within one 64-byte line, keeping
+// the lock-word line free of any other writer. Fires on std upgrades or
+// field changes that re-pack the struct — see the struct doc above.
+const _: () = {
+    use std::mem::offset_of;
+    // dropped opens the write-set line (heap offset >= 64).
+    assert!(offset_of!(AsyncPool, dropped) >= 48);
+    // idle and dropping end within 48 struct bytes of dropped's start
+    // (= one 64-byte heap line from dropped's position).
+    assert!(offset_of!(AsyncPool, idle) + 8 - offset_of!(AsyncPool, dropped) <= 48);
+    assert!(offset_of!(AsyncPool, dropping) + 1 - offset_of!(AsyncPool, dropped) <= 48);
+    // The whole object spans at most two lines.
+    assert!(std::mem::size_of::<AsyncPool>() + 16 <= 128);
+};
 
 impl AsyncPool {
     fn new(cap: usize) -> Self {
