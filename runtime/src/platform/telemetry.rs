@@ -652,12 +652,29 @@ pub fn push_tick_time(tick_ns: u64) {
 /// (TASK-162). Lock-free (TASK-164): one fetch_add + two atomic stores —
 /// the window average is computed lazily by [`snapshot`].
 pub fn push_tick_time_at(at: Instant, tick_ns: u64) {
-    let i = (RING_HEAD.fetch_add(1, Ordering::Relaxed) & (RING_CAP as u64 - 1)) as usize;
-    RING_NS[i].store(tick_ns, Ordering::Relaxed);
     let epoch = *RING_EPOCH.get_or_init(Instant::now);
     let ts = at.saturating_duration_since(epoch).as_nanos() as u64;
+    ring_store(ts, tick_ns);
+}
+
+/// TASK-195: precomputed-timestamp ingestion — the tick boundary's TSC
+/// clock already yields process-relative nanoseconds, so the ring takes
+/// the stamp directly instead of re-converting an Instant against
+/// [`RING_EPOCH`] (one OnceLock load + one 128-bit multiply less per
+/// tick). EPOCH CONTRACT: within a process the per-tick path uses exactly
+/// ONE of [`push_tick_time_at`] (vDSO epoch) / this fn (TSC epoch) — ring
+/// timestamps are difference-consumed only, so either alone is sound and
+/// mixing is not (solo benches may cross forms; every tps-asserting test
+/// resets the ring and uses a single form).
+pub fn push_tick_time_ts(ts_ns: u64, tick_ns: u64) {
+    ring_store(ts_ns, tick_ns);
+}
+
+fn ring_store(ts_ns: u64, tick_ns: u64) {
+    let i = (RING_HEAD.fetch_add(1, Ordering::Relaxed) & (RING_CAP as u64 - 1)) as usize;
+    RING_NS[i].store(tick_ns, Ordering::Relaxed);
     // Offset by +1 so 0 stays the "empty slot" sentinel.
-    RING_TS[i].store(ts.saturating_add(1), Ordering::Release);
+    RING_TS[i].store(ts_ns.saturating_add(1), Ordering::Release);
 }
 
 /// 60s-window TPS over the ring, computed at snapshot time (cold). The
@@ -1118,6 +1135,26 @@ mod tests {
         let t = Instant::now();
         push_tick_time_at(t, 50_000_000);
         push_tick_time_at(t + Duration::from_secs(61), 40_000_000);
+        let s2 = snapshot();
+        assert!((s2.tps - 25.0).abs() < 1e-6, "tps {} != 25", s2.tps);
+    }
+
+    #[test]
+    fn tsc_epoch_ring_window_math() {
+        // TASK-195: the TSC-fed ring (push_tick_time_ts, caller-supplied
+        // process-relative ns) must produce identical window semantics to
+        // the Instant-fed path — same math on the same ring.
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+        for i in 0..100u64 {
+            push_tick_time_ts(1_000_000_000 + i * 50_000_000, 50_000_000);
+        }
+        let s = snapshot();
+        assert!((s.tps - 20.0).abs() < 1e-6, "tps {} != 20", s.tps);
+
+        reset_state();
+        push_tick_time_ts(1_000_000_000, 50_000_000);
+        push_tick_time_ts(1_000_000_000 + 61_000_000_000, 40_000_000);
         let s2 = snapshot();
         assert!((s2.tps - 25.0).abs() < 1e-6, "tps {} != 25", s2.tps);
     }

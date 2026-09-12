@@ -106,7 +106,7 @@ use serde_json::json;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A unit of work the kernel scheduled (identified opaquely by the module).
 #[derive(Debug, Clone)]
@@ -395,14 +395,14 @@ pub fn on_tick_boundary() -> usize {
         // async subscriber is listening.
         bus.publish_shared(TICK_BOUNDARY, Arc::new(json!({ "tick": tick, "drained": drained })));
     }
-    let epoch = *MONO_EPOCH.get_or_init(Instant::now);
-    // One clock read per tick (TASK-162): the boundary duration and the TPS
-    // window timestamp share this instant instead of paying a second read.
-    let at = now();
-    let now_ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+    // TASK-195: one calibrated rdtsc read per tick — the same invariant-TSC
+    // oscillator the vDSO CLOCK_MONOTONIC serves, without the 24 ns vDSO
+    // call. The fallback arm keeps the verbatim TASK-162 shape (one vDSO
+    // read; boundary duration and TPS window timestamp still share it).
+    let (now_ns, at) = boundary_clock();
     let prev = LAST_BOUNDARY_NS.swap(now_ns, Ordering::Relaxed);
     if prev != u64::MAX {
-        push_tick_sample_at(at, now_ns.saturating_sub(prev));
+        push_tick_sample(now_ns.saturating_sub(prev), now_ns, at);
     }
     drained
 }
@@ -419,17 +419,129 @@ fn now() -> Instant {
     Instant::now()
 }
 
+/// TASK-195 boundary-clock toggle: `true` = direct invariant-TSC read,
+/// calibrated once against the vDSO clock; `false` = verbatim TASK-162
+/// shape (one vDSO read per boundary). On invariant-TSC hardware both
+/// clocks read the SAME oscillator — only the ~24 ns/op vDSO call overhead
+/// goes away.
+#[cfg(target_arch = "x86_64")]
+const TSC_CLOCK: bool = true;
+
+/// Calibrated TSC rate: nanoseconds per cycle as f64 bits. Published
+/// (Relaxed) BEFORE [`TSC_EPOCH`]; valid only while the epoch is non-zero.
+#[cfg(target_arch = "x86_64")]
+static TSC_RATE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrated TSC epoch cycle — the cycle the boundary ns counter starts
+/// from. 0 = not calibrated (or calibration failed); published (Release)
+/// AFTER [`TSC_RATE_BITS`], so an Acquire load that observes a non-zero
+/// epoch also observes the rate.
+#[cfg(target_arch = "x86_64")]
+static TSC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes the one-time calibration.
+#[cfg(target_arch = "x86_64")]
+static TSC_CALIBRATING: OnceLock<()> = OnceLock::new();
+
+/// Reads the boundary clock: `(ns since a process-fixed instant,
+/// Option<Instant>)`. Both arms are monotonic and process-fixed; consumers
+/// use DIFFERENCES of the ns value only. The Instant is `Some` only on the
+/// fallback (vDSO) arm — the TSC arm carries no Instant at all, which is
+/// what kills the second conversion downstream (see
+/// [`crate::platform::telemetry::push_tick_time_ts`]).
+fn boundary_clock() -> (u64, Option<Instant>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if TSC_CLOCK {
+            if let Some(ns) = tsc_now_ns() {
+                return (ns, None);
+            }
+        }
+    }
+    let at = now();
+    let epoch = *MONO_EPOCH.get_or_init(Instant::now);
+    let ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+    (ns, Some(at))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn tsc_now_ns() -> Option<u64> {
+    let t0 = TSC_EPOCH.load(Ordering::Acquire);
+    let t0 = if t0 != 0 {
+        t0
+    } else {
+        TSC_CALIBRATING.get_or_init(calibrate_tsc);
+        let t0 = TSC_EPOCH.load(Ordering::Acquire);
+        if t0 == 0 {
+            return None; // calibration failed permanently — caller falls back
+        }
+        t0
+    };
+    let rate = f64::from_bits(TSC_RATE_BITS.load(Ordering::Relaxed));
+    let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+    Some((cycles as f64 * rate) as u64)
+}
+
+/// One-time calibration against the vDSO clock: CPUID-gated on the
+/// invariant TSC (leaf 8000_0007h EDX bit 8 — constant rate, so duration
+/// differences between boundaries are exact up to the calibration rate
+/// error), then a 10 ms vDSO window pins ns-per-cycle to ~10 ppm —
+/// sub-microsecond systematic error on 50 ms ticks, two orders below tick
+/// noise. The 10 ms lands once, on the first boundary read of the process
+/// (server startup; ticks there are orders of magnitude longer). On
+/// success the rate is published first and the epoch second (Release), so
+/// lock-free readers never see a rate without its epoch.
+#[cfg(target_arch = "x86_64")]
+fn calibrate_tsc() {
+    use core::arch::x86_64::{_rdtsc, __cpuid_count};
+    let cal = || -> Option<(u64, f64)> {
+        unsafe {
+            let max_ext = __cpuid_count(0x8000_0000, 0);
+            if max_ext.eax < 0x8000_0007 {
+                return None;
+            }
+            let leaf = __cpuid_count(0x8000_0007, 0);
+            if leaf.edx & (1 << 8) == 0 {
+                return None;
+            }
+            let c0 = _rdtsc();
+            let i0 = Instant::now();
+            std::thread::sleep(Duration::from_millis(10));
+            let i1 = Instant::now();
+            let c1 = _rdtsc();
+            let ns = i1.duration_since(i0).as_nanos() as f64;
+            let cycles = c1.wrapping_sub(c0);
+            let rate = ns / cycles as f64;
+            if cycles < 1_000_000 || c1 == 0 || !(0.01..=100.0).contains(&rate) {
+                return None;
+            }
+            Some((c1, rate))
+        }
+    };
+    if let Some((epoch, rate)) = cal() {
+        TSC_RATE_BITS.store(rate.to_bits(), Ordering::Relaxed);
+        TSC_EPOCH.store(epoch, Ordering::Release);
+    }
+}
+
 /// Feed one tick duration into the telemetry TPS window. Split from
 /// [`on_tick_boundary`] so test builds record samples locally instead of
 /// mutating the process-global window (see the module docs, "Test seam").
+/// TASK-195: the TSC arm (`at == None`) carries its own process-relative
+/// nanoseconds — the ring takes the stamp directly with no second clock
+/// conversion per tick; the fallback arm keeps the exact pre-TASK-195
+/// shape (Instant through the epoch conversion in telemetry).
 #[cfg(not(test))]
-fn push_tick_sample_at(at: Instant, ns: u64) {
-    crate::platform::telemetry::push_tick_time_at(at, ns);
+fn push_tick_sample(ns: u64, ts_ns: u64, at: Option<Instant>) {
+    match at {
+        None => crate::platform::telemetry::push_tick_time_ts(ts_ns, ns),
+        Some(at) => crate::platform::telemetry::push_tick_time_at(at, ns),
+    }
 }
 
 #[cfg(test)]
-fn push_tick_sample_at(at: Instant, ns: u64) {
-    let _ = at; // the local window records durations only
+fn push_tick_sample(ns: u64, ts_ns: u64, at: Option<Instant>) {
+    let _ = (ts_ns, at); // the local window records durations only
     TICK_SAMPLES.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().push(ns);
 }
 
@@ -622,6 +734,35 @@ mod tests {
         assert!(take_routed().is_empty());
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tsc_boundary_clock_monotonic_and_vdso_rate() {
+        // The TSC arm is the production boundary clock on this arch: no
+        // Instant, strictly non-decreasing, and its rate over a ~20 ms
+        // window matches the vDSO clock within 2% (both read the same
+        // oscillator; calibration pins the ratio to ~10 ppm, the wide band
+        // leaves room for sleep-window scheduling jitter).
+        let mut prev = 0u64;
+        for _ in 0..10_000 {
+            let (ns, at) = boundary_clock();
+            assert!(at.is_none(), "TSC arm must not carry an Instant");
+            assert!(ns >= prev, "boundary clock regressed: {ns} < {prev}");
+            prev = ns;
+        }
+        let (t0, _) = boundary_clock();
+        let i0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let (t1, _) = boundary_clock();
+        let i1 = Instant::now();
+        let tsc_ns = t1 - t0;
+        let vdso_ns = u64::try_from(i1.duration_since(i0).as_nanos()).unwrap_or(u64::MAX);
+        let ratio = tsc_ns as f64 / vdso_ns as f64;
+        assert!(
+            (0.98..=1.02).contains(&ratio),
+            "tsc/vdso rate ratio {ratio} out of band"
+        );
+    }
+
     #[test]
     fn on_tick_boundary_drains_injected_and_publishes() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -768,6 +909,95 @@ mod bench_hotpath {
     /// Reset the last-boundary baseline (u64::MAX sentinel = no baseline).
     fn reset_last_boundary_for_tests() {
         LAST_BOUNDARY_NS.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    /// TASK-195 A/B: the boundary clock read alone — BEFORE arm is the
+    /// verbatim pre-195 expression (vDSO read + epoch conversion), AFTER
+    /// arm is boundary_clock() (calibrated rdtsc, no Instant). The
+    /// end-to-end effect (ring write included) is the tick_boundary line in
+    /// bench_scheduler_hotpath.
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn bench_boundary_clock_ab() {
+        let iters = 200_000u32;
+        let rounds = 5;
+        // warm both clocks (calibration once, off the clock)
+        let _ = boundary_clock();
+        let mut best_vdso = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let epoch = *MONO_EPOCH.get_or_init(Instant::now);
+                let at = now();
+                let ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+                std::hint::black_box(ns);
+            }
+            best_vdso = best_vdso.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_tsc = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (ns, at) = boundary_clock();
+                std::hint::black_box((ns, at.is_none()));
+            }
+            best_tsc = best_tsc.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH boundary clock: vDSO {:.0} ns/op, tsc {:.0} ns/op (min of {rounds}x{iters})",
+            best_vdso * 1e9,
+            best_tsc * 1e9
+        );
+
+        // Production-shape arms (no test seam): the exact post-publish
+        // sequence of on_tick_boundary in both eras, against the real ring
+        // and the real LAST_BOUNDARY_NS swap. Isolates the clock + ingestion
+        // win from the test-build seam cost the tick_boundary line carries.
+        let mut best_prod_before = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let at = now();
+                let epoch = *MONO_EPOCH.get_or_init(Instant::now);
+                let ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap_or(u64::MAX);
+                let prev = LAST_BOUNDARY_NS.swap(ns, Ordering::Relaxed);
+                if prev != u64::MAX {
+                    crate::platform::telemetry::push_tick_time_at(at, ns.saturating_sub(prev));
+                }
+                std::hint::black_box(prev);
+            }
+            best_prod_before = best_prod_before.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_prod_after = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (ns, at) = boundary_clock();
+                let prev = LAST_BOUNDARY_NS.swap(ns, Ordering::Relaxed);
+                if prev != u64::MAX {
+                    crate::platform::telemetry::push_tick_time_ts(ns, ns.saturating_sub(prev));
+                }
+                std::hint::black_box((prev, at.is_none()));
+            }
+            best_prod_after = best_prod_after.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        // raw rdtsc floor on this CPU (what the TSC arm is made of)
+        let mut best_rdtsc = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(unsafe { core::arch::x86_64::_rdtsc() });
+            }
+            best_rdtsc = best_rdtsc.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH boundary prod-shape: pre-195 {:.0} ns/op, post-195 {:.0} ns/op, raw rdtsc {:.0} ns/op (min of {rounds}x{iters})",
+            best_prod_before * 1e9,
+            best_prod_after * 1e9,
+            best_rdtsc * 1e9
+        );
+        reset_last_boundary_for_tests();
     }
 }
 
