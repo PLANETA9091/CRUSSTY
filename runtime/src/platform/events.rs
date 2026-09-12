@@ -2012,6 +2012,196 @@ mod bench_hotpath {
         );
     }
 
+    /// TASK-196 A/B: what does building one AsyncTask actually cost in
+    /// PRODUCTION, and what part of the legacy `task build` line (92 ns)
+    /// is bench fixture, not code? The two fixture isolates above time
+    /// `handlers: Arc::from(Vec::new())` — a fresh Arc-header malloc AND
+    /// its dealloc (both inside the timed build+drop) per op. Production
+    /// never pays that on the enqueue path: `async_targets` resolves the
+    /// handler list from the immutable compiled view, and under
+    /// RESOLVE_SHARED_EXACT=true (TASK-175) the no-patterns shape returns
+    /// `Arc::clone(slot.list)` — one atomic increment, zero mallocs; the
+    /// empty case is a shared static (`empty_resolved`). Payload side:
+    /// under ASYNC_PAYLOAD_SHARED=true (TASK-176) `queue_async_shared`
+    /// MOVES the caller's handle in — zero atomics at build (the dec
+    /// happens worker-side after the handler ran); the isolate below pays
+    /// one inc/dec pair the production move avoids, so it is a
+    /// CONSERVATIVE upper bound. Leaders: ASYNC_LEADERS_ZEROALLOC=true +
+    /// owner-less handlers = `Vec::new()`, verbatim `build_leaders` shape
+    /// (the scan is timed, matching the real caller). Event: InlineEvent
+    /// (TASK-173), 11 bytes inline, no malloc. Consequence: if the
+    /// prod-shape shared arm lands <=10 ns, production task construction
+    /// is PROVEN <=10 ns (it does strictly less work than this arm).
+    /// Micro-isolates decompose the legacy 92 ns ledger: fixture
+    /// empty-Arc malloc/free, view-share inc/dec, InlineEvent memcpy,
+    /// Value deep clone (the legacy `publish` repr — the only real,
+    /// non-fixture term, and the reason the legacy path costs what it
+    /// costs). Existing fixture lines above are kept verbatim as the
+    /// cross-build noise check; this bench adds the production-shape
+    /// lines, it does not redefine history.
+    #[test]
+    #[ignore]
+    fn bench_task_build_ab() {
+        let payload = serde_json::json!({ "tick": 1u64, "drained": 0u64 });
+        let payload_arc = Arc::new(payload.clone());
+        // Production-faithful resolved list: one owner-less handler behind
+        // the Arc<[(owner, Handler)]> slice the view shares per publish
+        // (RESOLVE_SHARED_EXACT shape). Built once, outside the loops.
+        let bench_handler: Handler = Arc::new(|_: &str, _: &Value| {});
+        let prod_list: Resolved = Arc::from(vec![(None, bench_handler)]);
+        let iters = 200_000u32;
+        let rounds = 5;
+        const TASK_EVENT: &str = "bench.async";
+        let mut fold = 0u64; // observability guard against elision
+
+        fn time_arm(
+            name: &'static str,
+            mut op: impl FnMut() -> u64,
+            fold: &mut u64,
+            iters: u32,
+            rounds: u32,
+        ) -> (&'static str, f64) {
+            for _ in 0..10_000u32 {
+                *fold = fold.wrapping_add(op());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    *fold = fold.wrapping_add(op());
+                }
+                best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            (name, best * 1e9)
+        }
+        let results = [
+            // A — legacy fixture line (verbatim bench_event_bus_publish arm)
+            time_arm(
+                "owned fixture (Arc::from(Vec::new()))",
+                || {
+                    drop(AsyncTask {
+                        event: TASK_EVENT.into(),
+                        payload: TaskPayload::Owned(payload.clone()),
+                        leaders: Vec::new(),
+                        handlers: Arc::from(Vec::new()),
+                    });
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            // B — shared fixture line (verbatim bench_event_publish_shared arm)
+            time_arm(
+                "shared fixture (Arc::from(Vec::new()))",
+                || {
+                    drop(AsyncTask {
+                        event: TASK_EVENT.into(),
+                        payload: TaskPayload::Shared(Arc::clone(&payload_arc)),
+                        leaders: Vec::new(),
+                        handlers: Arc::from(Vec::new()),
+                    });
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            // C — legacy publish() task construction, production shape:
+            // deep-cloned payload (the repr legacy publish dictates) +
+            // view-shared handler list + zero-alloc leaders scan
+            time_arm(
+                "owned prod-shape (view-shared list)",
+                || {
+                    drop(AsyncTask {
+                        event: TASK_EVENT.into(),
+                        payload: TaskPayload::Owned(payload.clone()),
+                        leaders: build_leaders(&prod_list),
+                        handlers: Arc::clone(&prod_list),
+                    });
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            // D — publish_shared task construction, production shape,
+            // CONSERVATIVE: the isolate clones the handle (inc/dec) where
+            // the production call MOVES it in (zero atomics) — production
+            // is strictly cheaper than this arm by that pair
+            time_arm(
+                "shared prod-shape (conservative move-bound)",
+                || {
+                    drop(AsyncTask {
+                        event: TASK_EVENT.into(),
+                        payload: TaskPayload::Shared(Arc::clone(&payload_arc)),
+                        leaders: build_leaders(&prod_list),
+                        handlers: Arc::clone(&prod_list),
+                    });
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            // Micro-isolates: the legacy 92 ns ledger, term by term
+            time_arm(
+                "iso: fixture empty-Arc malloc+free",
+                || {
+                    let empty: Resolved = Arc::from(Vec::new());
+                    drop(empty);
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            time_arm(
+                "iso: view-share inc/dec (resolved list)",
+                || {
+                    drop(Arc::clone(&prod_list));
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            time_arm(
+                "iso: InlineEvent::from (11B inline) + read",
+                || {
+                    let e: InlineEvent = TASK_EVENT.into();
+                    let n = e.as_str().len();
+                    drop(e);
+                    n as u64
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+            time_arm(
+                "iso: Value deep clone (owned payload repr)",
+                || {
+                    drop(payload.clone());
+                    0
+                },
+                &mut fold,
+                iters,
+                rounds,
+            ),
+        ];
+        let mut line = String::from("BENCH task_build_ab:");
+        for (name, ns) in &results {
+            line.push_str(&format!(" [{name}] {:.0} ns/op,", ns));
+        }
+        line.push_str(&format!(
+            " fold {fold} (min of {rounds}x{iters})"
+        ));
+        println!("{line}");
+        // Fold guard is never expected to trip (arms return 0 or tiny lens);
+        // it exists so the compiler cannot prove the loops side-effect-free.
+        assert!(fold != u64::MAX);
+    }
+
     /// TASK-177 integral: the dispatcher pays one module guard per owned
     /// handler. Seed a registry entry, subscribe one sync handler inside a
     /// registration window (owner = ("bench-own-mod", 1)), then publish —
