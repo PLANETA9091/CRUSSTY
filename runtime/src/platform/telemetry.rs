@@ -37,7 +37,7 @@
 //! works everywhere so the Windows build stays functional.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,21 @@ pub const MAX_HANDLERS: usize = 16;
 /// Snapshot storage. The outer mutex allows swapping the snapshot in tests;
 /// the inner mutex guards the data itself.
 static SNAPSHOT: Mutex<Option<Arc<Mutex<Snapshot>>>> = Mutex::new(None);
+
+/// TASK-202: lock-free mirror of the metric-list fullness for the C
+/// entry's pre-parse gate ([`metrics_full`]). Maintained by
+/// [`publish_metric`] UNDER the data lock it already holds (stored right
+/// after the push; the full-state drop path returns BEFORE the store, so
+/// the hot publish path pays zero), read by the gate with one Relaxed
+/// load — the data-lock pair leaves the C metric entry entirely. The
+/// list is append-only in production (no removal API by design), so the
+/// flag is monotone TRUE once set; a reader can only observe a stale
+/// FALSE during the one lock-hold that fills the list (the gate then
+/// lets the parse run and publish_metric drops the metric — the same
+/// observable class as the documented TASK-180 ON/OFF difference:
+/// return code 0 vs -2 for malformed labels in that one-call transition
+/// window). Test resets clear it (tests re-fill the list).
+static METRICS_FULL_FLAG: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static LISTENER: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(unix)]
@@ -399,18 +414,45 @@ pub fn publish_metric(
         labels,
         unit: unit.map(str::to_string),
     });
+    // TASK-202: mirror the fullness for the lock-free pre-parse gate
+    // (written under the data lock — the authoritative state; the
+    // full-state drop path above returns before this store, so the
+    // steady-state publish pays nothing).
+    if s.metrics.len() >= MAX_METRICS && !METRICS_FULL_FLAG.load(Ordering::Relaxed) {
+        METRICS_FULL_FLAG.store(true, Ordering::Relaxed);
+    }
     bump_snapshot_gen(); // TASK-194: invalidate the pre-encoded JSON cache
 }
 
 /// Exact pre-parse gate for the C entry (TASK-180): `true` once the metric
 /// list is at [`MAX_METRICS`] — from then on [`publish_metric`] drops every
 /// further metric, so a caller that still has to PARSE its labels payload
-/// may skip that work (the parsed map would be unobservable). The check
-/// takes the same two uncontended locks the publish itself would take
-/// (~30-40 ns) — an order of magnitude below the serde parse it saves.
-/// Recomputed under the lock every call, so snapshot swaps in tests cannot
-/// desynchronize it.
+/// may skip that work (the parsed map would be unobservable).
+/// TASK-202: the check is now LOCK-FREE — one Relaxed load of the
+/// fullness flag that publish_metric maintains under the data lock it
+/// already holds (see [`METRICS_FULL_FLAG`]); the pre-202 shape
+/// recomputed the answer under the data lock on every call, costing the
+/// C metric entry a full lock pair (~25-30 ns) on its hot path. Exact in
+/// both steady states; stale-false only during the one lock-hold that
+/// fills the list — in that window the gate lets the parse run and
+/// publish_metric drops the metric, the same observable class as the
+/// documented TASK-180 ON/OFF difference in the full state (malformed
+/// labels: 0 gated vs -2 parsed).
 pub fn metrics_full() -> bool {
+    // TASK-202: lock-free — one Relaxed load of the flag maintained by
+    // publish_metric under the data lock (see METRICS_FULL_FLAG). The
+    // pre-202 shape recomputed the answer under the data lock on every
+    // call (~25-30 ns of lock pair on the C metric entry's hot path);
+    // the flag is exact in both steady states and stale-false only in
+    // the one-call fill transition (documented on the static).
+    METRICS_FULL_FLAG.load(Ordering::Relaxed)
+}
+
+/// Test/bench-only: the pre-TASK-202 gate shape, kept verbatim as the
+/// A/B arm (bench_cmetric_gate_ab): recompute the fullness under the
+/// data lock, exactly what metrics_full() did before the flag.
+#[cfg(test)]
+pub(crate) fn metrics_full_checked() -> bool {
     let snap = snapshot_arc();
     let s = snap.lock().unwrap_or_else(|p| p.into_inner());
     s.metrics.len() >= MAX_METRICS
@@ -784,6 +826,7 @@ fn split_tps_span(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 pub(crate) fn test_reset_snapshot() {
     *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    METRICS_FULL_FLAG.store(false, Ordering::Relaxed); // TASK-202: tests re-fill the list
     bump_snapshot_gen(); // TASK-194: the swap must invalidate the JSON cache
 }
 
@@ -1921,6 +1964,7 @@ mod tests {
 
     fn reset_state() {
         *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        METRICS_FULL_FLAG.store(false, Ordering::Relaxed); // TASK-202: tests re-fill the list
         bump_snapshot_gen(); // TASK-194: the swap must invalidate the JSON cache
         RING_HEAD.store(0, Ordering::Relaxed);
         for slot in RING_TS.iter() {

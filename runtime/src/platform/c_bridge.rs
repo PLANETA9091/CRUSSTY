@@ -43,7 +43,12 @@ pub const C_ENTRY_PREGATE: bool = true;
 /// documented observable difference is the error code for a MALFORMED
 /// labels string in the full state (0 instead of -2, the parse never ran);
 /// the 0 / -1 / -2 contract is unchanged in every state where a metric
-/// could actually be accepted.
+/// could actually be accepted. TASK-202: the full check itself is now
+/// lock-free (one Relaxed load of telemetry's fullness flag — the
+/// pre-202 shape paid a full data-lock pair here on every call); the
+/// stale-false transition window is documented on telemetry's
+/// METRICS_FULL_FLAG and is the same observable class as the difference
+/// above.
 pub const TELEM_PREGATE: bool = true;
 
 /// TASK-181 A/B toggle: serialize the C snapshot entry's JSON in place.
@@ -960,6 +965,7 @@ pub static PLATFORM_API: CPlatformApi = CPlatformApi {
 mod tests {
     use super::*;
     use std::hint::black_box;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1005,6 +1011,102 @@ mod tests {
         );
         assert!(events::global().unsubscribe("c.gate.sync", &sub));
         assert_eq!(unsafe { n_events_publish(evs.as_ptr(), pj.as_ptr()) }, 0);
+    }
+
+    /// TASK-202: the lock-free pre-parse gate contract — the flag is
+    /// maintained by publish_metric (the Rust path included), exact in
+    /// both steady states, cleared by the test resets, and the C entry's
+    /// 0/-2 codes follow the state through the transition. Holds the
+    /// module TEST_LOCK (the metric list is shared global state); note
+    /// telemetry-module tests may still interleave (cross-module locks),
+    /// so no ABSOLUTE list-length asserts — only the flag and the codes.
+    #[test]
+    fn cmetric_gate_flag_contract() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        telemetry::test_reset_snapshot();
+        assert!(!telemetry::metrics_full(), "fresh state: room");
+
+        // room contract via the C entry: accepted / malformed rejected.
+        let nm = CString::new("c.gate.contract").unwrap();
+        let lb = CString::new("{\"k\":\"v\"}").unwrap();
+        let bad = CString::new("{nope").unwrap();
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb.as_ptr()) },
+            0,
+            "room: valid labels accepted"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), bad.as_ptr()) },
+            -2,
+            "room: malformed labels rejected before any cap logic"
+        );
+        assert!(!telemetry::metrics_full(), "one metric published: still room");
+
+        // fill DIRECTLY via the Rust publish path (it maintains the flag
+        // too) — the flag must land exactly when the list hits the cap.
+        let mut i = 0u64;
+        while !telemetry::metrics_full() {
+            let n = format!("c.gate.fill.{i}");
+            telemetry::publish_metric(&n, i as f64, None, None);
+            i += 1;
+            assert!(i < 10_000, "metric list never filled");
+        }
+
+        // full contract via the C entry: capped 0 for valid labels, and
+        // the documented gate decision 0 for malformed (parse skipped).
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 2.0, std::ptr::null(), lb.as_ptr()) },
+            0,
+            "full: the metric is capped"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 2.0, std::ptr::null(), bad.as_ptr()) },
+            0,
+            "full: the gate skips the parse (documented)"
+        );
+
+        // concurrent: Rust publishers racing the gate readers — the list
+        // is already full here, so the publishers all drop early (no gen
+        // churn) and every reader code must be 0 (valid labels: 0 in the
+        // room state via accept, 0 in the full state via the cap).
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for t in 0..2u32 {
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let n = format!("c.gate.race.{t}.{i}");
+                    telemetry::publish_metric(&n, i as f64, None, None);
+                    i += 1;
+                }
+            }));
+        }
+        for _ in 0..2000u32 {
+            let rc =
+                unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb.as_ptr()) };
+            assert_eq!(rc, 0, "gate reader code must be 0 in every state");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("publisher thread must not panic");
+        }
+
+        // reset clears the flag -> room contract again.
+        telemetry::test_reset_snapshot();
+        assert!(!telemetry::metrics_full(), "reset must clear the flag");
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb.as_ptr()) },
+            0,
+            "room again: accepted"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), bad.as_ptr()) },
+            -2,
+            "room again: malformed rejected"
+        );
+        telemetry::test_reset_snapshot(); // leave a clean room state
     }
 
     /// TASK-179 A/B subject: the full C publish entry. Line 1 is the gate
@@ -1306,6 +1408,111 @@ mod tests {
             "BENCH c_telemetry: c_metric(full, labels4) {:.0} ns/op, c_metric(full, no labels) {:.0} ns/op (min of {rounds}x{iters})",
             best_labeled * 1e9,
             best_null * 1e9
+        );
+    }
+
+    /// TASK-202 A/B subject: the C metric entry's pre-parse gate. Arm A =
+    /// the verbatim pre-202 gate (cstr(name) + the fullness recomputed
+    /// UNDER THE DATA LOCK via metrics_full_checked + return); arm B =
+    /// the real entry (the fullness is one Relaxed flag load). Lines:
+    /// labels4 (the parse payload is present but the gate fires before
+    /// it in the full state) and NULL labels (control). The list is
+    /// filled to the cap first — the production steady state (append-only,
+    /// periodic publishers live here forever). Runs SOLO (filtered run
+    /// only): resets the shared snapshot and fills the list to the cap;
+    /// the parallel suite must never see that state — hence #[ignore].
+    #[test]
+    #[ignore]
+    fn bench_cmetric_gate_ab() {
+        telemetry::test_reset_snapshot();
+
+        let nm = CString::new("c.bench.gate").unwrap();
+        // fill to the cap (unique names, no labels)
+        let mut i = 0u64;
+        while !telemetry::metrics_full() {
+            let n = CString::new(format!("c.gate.fill.{i}")).unwrap();
+            telemetry::publish_metric(n.to_str().unwrap(), i as f64, None, None);
+            i += 1;
+            assert!(i < 10_000, "metric list never filled");
+        }
+
+        // Arm A: the pre-202 gate body, verbatim (data lock per call).
+        let entry_pre202 = || -> i32 {
+            let name = unsafe { cstr(nm.as_ptr()) };
+            if name.is_empty() {
+                return -1;
+            }
+            if TELEM_PREGATE && telemetry::metrics_full_checked() {
+                return 0;
+            }
+            0
+        };
+
+        let lb4 = CString::new(
+            "{\"region\":\"eu-central-1\",\"world\":\"overworld\",\"dim\":\"nether\",\"tier\":2}",
+        )
+        .unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // ---- line 1: full + labeled ----
+        for _ in 0..10_000u32 {
+            black_box(entry_pre202());
+            black_box(unsafe {
+                n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb4.as_ptr())
+            });
+        }
+        let mut best_labeled_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(entry_pre202());
+            }
+            best_labeled_a = best_labeled_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_labeled_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb4.as_ptr())
+                });
+            }
+            best_labeled_b = best_labeled_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- line 2: full + NULL labels (control) ----
+        for _ in 0..10_000u32 {
+            black_box(entry_pre202());
+            black_box(unsafe {
+                n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), std::ptr::null())
+            });
+        }
+        let mut best_null_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(entry_pre202());
+            }
+            best_null_a = best_null_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_null_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), std::ptr::null())
+                });
+            }
+            best_null_b = best_null_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH cmetric gate A/B: lock-gate labels4 {:.0} -> flag-gate {:.0} ns/op, lock-gate null {:.0} -> flag-gate {:.0} ns/op (min of {rounds}x{iters})",
+            best_labeled_a * 1e9,
+            best_labeled_b * 1e9,
+            best_null_a * 1e9,
+            best_null_b * 1e9
         );
     }
 
