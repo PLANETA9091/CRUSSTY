@@ -1930,6 +1930,20 @@ mod bench_hotpath {
     use super::tests::with_cap;
     use std::time::{Duration, Instant};
 
+    /// TASK-210 regime instrumentation: the three async/enqueue arms
+    /// (publish(1 async sub), task build+push, publish(1 async saturated))
+    /// print their regime inline — shed count over the timed rounds and
+    /// worst-of-rounds spread — ADDED ALONGSIDE unchanged headline
+    /// statistics (same warmups, same sample counts, same min-of
+    /// methodology: historical bands stay comparable). Motivating study
+    /// (3 fresh-process solo runs on unmodified HEAD): the deterministic
+    /// arms of this bench reproduce exactly (no subs / 1 sync / glob /
+    /// zero-subs 2/9/7/2 ns flat, task build 90-91 = 1.1%) while the
+    /// async arms are the TASK-208 chaotic regime printing raw scalars —
+    /// publish(1 async sub) 617-956 = 55% spread, build+push 460-528 =
+    /// 15%, saturated 503-644 = 28%. The sibling benches already quote
+    /// their regime (TASK-208 enqueue-iso, Round-38 pattern); this bench
+    /// was the last headline surface printing bare scalars.
     #[test]
     #[ignore]
     fn bench_event_bus_publish() {
@@ -2002,13 +2016,23 @@ mod bench_hotpath {
             let _ = bus.publish("bench.async", &payload);
         }
         let mut best_async = f64::MAX;
+        // TASK-210: regime fields for the distributional arms — the shed
+        // count over the timed rounds and worst-of-rounds travel inline
+        // with the unchanged min (same warmups, same rounds, same min-of
+        // methodology: historical bands stay comparable; the ledger quotes
+        // the regime, not a fake scalar — TASK-208 finding).
+        let sheds_before = bus.pool.dropped.load(Ordering::SeqCst);
+        let mut worst_async = f64::MIN;
         for _ in 0..rounds {
             let start = Instant::now();
             for _ in 0..iters {
                 let _ = bus.publish("bench.async", &payload);
             }
-            best_async = best_async.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let per = start.elapsed().as_secs_f64() / f64::from(iters);
+            best_async = best_async.min(per);
+            worst_async = worst_async.max(per);
         }
+        let sheds_async = bus.pool.dropped.load(Ordering::SeqCst) - sheds_before;
         // pool.push isolated from queue_async (TASK-169): (a) build-only
         // per-op cost of one AsyncTask (to_string + Value clone + allocs),
         // (b) build + push — the delta is the enqueue critical section
@@ -2035,13 +2059,18 @@ mod bench_hotpath {
             pool.push(build_task());
         }
         let mut best_push = f64::MAX;
+        let sheds_before = pool.dropped.load(Ordering::SeqCst);
+        let mut worst_push = f64::MIN;
         for _ in 0..rounds {
             let start = Instant::now();
             for _ in 0..iters {
                 pool.push(build_task());
             }
-            best_push = best_push.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let per = start.elapsed().as_secs_f64() / f64::from(iters);
+            best_push = best_push.min(per);
+            worst_push = worst_push.max(per);
         }
+        let sheds_push = pool.dropped.load(Ordering::SeqCst) - sheds_before;
         // Saturated regime (TASK-170): the handler does real work so the
         // publisher outpaces the pool; the queue sits at capacity and
         // drop-oldest sheds. This is the shape where the notify cost
@@ -2059,23 +2088,37 @@ mod bench_hotpath {
             let _ = bus.publish("bench.async.slow", &payload);
         }
         let mut best_sat = f64::MAX;
+        let sheds_before = pool.dropped.load(Ordering::SeqCst);
+        let mut worst_sat = f64::MIN;
         for _ in 0..rounds {
             let start = Instant::now();
             for _ in 0..iters {
                 let _ = bus.publish("bench.async.slow", &payload);
             }
-            best_sat = best_sat.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let per = start.elapsed().as_secs_f64() / f64::from(iters);
+            best_sat = best_sat.min(per);
+            worst_sat = worst_sat.max(per);
         }
+        let sheds_sat = pool.dropped.load(Ordering::SeqCst) - sheds_before;
         println!(
-            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op, publish(1 async sub) {:.0} ns/op, task build {:.0} ns/op, task build+push {:.0} ns/op, publish(1 async saturated) {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH events: publish(no subs) {:.0} ns/op, publish(1 sync sub) {:.0} ns/op, has_subscribers(1 pattern) {:.0} ns/op, has_subscribers(zero subs) {:.0} ns/op, publish(1 async sub) {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}), task build {:.0} ns/op, task build+push {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}), publish(1 async saturated) {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}) (min of {rounds}x{iters})",
             best_none * 1e9,
             best_one * 1e9,
             best_glob * 1e9,
             best_empty * 1e9,
             best_async * 1e9,
+            sheds_async,
+            worst_async / best_async,
+            worst_async * 1e9,
             best_build * 1e9,
             best_push * 1e9,
-            best_sat * 1e9
+            sheds_push,
+            worst_push / best_push,
+            worst_push * 1e9,
+            best_sat * 1e9,
+            sheds_sat,
+            worst_sat / best_sat,
+            worst_sat * 1e9
         );
     }
 
@@ -2092,6 +2135,14 @@ mod bench_hotpath {
     /// The build(shared) isolate is toggle-independent (it constructs the
     /// Shared variant directly), so it doubles as a cross-build noise
     /// check against the owned task build line in bench_event_bus_publish.
+    /// TASK-210 regime instrumentation: publish_shared(1 async sub) — the
+    /// one distributional arm of this bench — prints its regime inline
+    /// (shed count over the timed rounds + worst-of-rounds spread) beside
+    /// the unchanged min; the deterministic arms (sync 19 ns, build(shared)
+    /// 34 ns — 0% across 3 fresh solo runs on unmodified HEAD) stay bare.
+    /// The async arm measured 785-947 ns = 21% spread across the same 3
+    /// runs while printing a raw scalar — the Round-38 pattern extended to
+    /// the last headline surface (headline methodology untouched).
     #[test]
     #[ignore]
     fn bench_event_publish_shared() {
@@ -2127,6 +2178,11 @@ mod bench_hotpath {
             );
         }
         let mut best_shared = f64::MAX;
+        // TASK-210: regime fields for the distributional arm (same pattern
+        // as the sibling benches — TASK-208/TASK-210: the ledger quotes the
+        // regime, the min stays methodology-identical).
+        let sheds_before = bus.pool.dropped.load(Ordering::SeqCst);
+        let mut worst_shared = f64::MIN;
         for _ in 0..rounds {
             let start = Instant::now();
             for _ in 0..iters {
@@ -2135,8 +2191,11 @@ mod bench_hotpath {
                     Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 })),
                 );
             }
-            best_shared = best_shared.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let per = start.elapsed().as_secs_f64() / f64::from(iters);
+            best_shared = best_shared.min(per);
+            worst_shared = worst_shared.max(per);
         }
+        let sheds_shared = bus.pool.dropped.load(Ordering::SeqCst) - sheds_before;
 
         // build isolate: shared-arc payload (one atomic inc) vs the owned
         // deep-clone build line in bench_event_bus_publish; the handlers
@@ -2160,9 +2219,12 @@ mod bench_hotpath {
             best_build = best_build.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
         println!(
-            "BENCH publish_shared: publish_shared(1 sync sub) {:.0} ns/op, publish_shared(1 async sub) {:.0} ns/op, task build(shared) {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH publish_shared: publish_shared(1 sync sub) {:.0} ns/op, publish_shared(1 async sub) {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}), task build(shared) {:.0} ns/op (min of {rounds}x{iters})",
             best_sync * 1e9,
             best_shared * 1e9,
+            sheds_shared,
+            worst_shared / best_shared,
+            worst_shared * 1e9,
             best_build * 1e9
         );
     }
