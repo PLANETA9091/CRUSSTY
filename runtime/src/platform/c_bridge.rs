@@ -29,6 +29,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Table version. MUST match `CPB_VERSION` in cplug-abi.
 pub const CPB_VERSION: u32 = 1;
 
+/// TASK-179 A/B toggle: gate the C-entry JSON parse behind the
+/// zero-subscriber check. `false` = pre-TASK-179 shape (the payload is
+/// always parsed; publish's own gate then rejects it when nothing is
+/// subscribed). Semantics are identical in both states — the payload is
+/// unobservable without subscribers (publish drops it untouched).
+pub const C_ENTRY_PREGATE: bool = true;
+
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
         return "";
@@ -108,12 +115,24 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
     if event.is_empty() {
         return 0;
     }
+    // Borrowed global handle (TASK-163 pattern): the owned global() clone
+    // costs ~5 Arc refcount pairs per call — hot C publishes pay it for
+    // nothing, the &'static handle serves gate and publish alike.
+    let bus = events::global_ref();
+    // TASK-179 pre-parse gate: when nothing was ever subscribed, publish()
+    // would drop the payload untouched and return 0 — skip the JSON parse
+    // entirely. Same acquire load publish's own fast gate uses; semantics
+    // identical (the payload is unobservable without subscribers), the
+    // race window shortens exactly like the in-publish gate does.
+    if C_ENTRY_PREGATE && !bus.may_have_subscribers() {
+        return 0;
+    }
     let payload: Value = if payload_json.is_null() {
         Value::Null
     } else {
         serde_json::from_str(cstr(payload_json)).unwrap_or(Value::Null)
     };
-    events::global().publish(event, &payload)
+    bus.publish(event, &payload)
 }
 
 unsafe extern "C" fn n_events_unsubscribe(token: u64) -> i32 {
@@ -629,3 +648,115 @@ pub static PLATFORM_API: CPlatformApi = CPlatformApi {
     side_table_key: Some(n_side_table_key),
     side_table_named: Some(n_side_table_named),
 };
+
+// ---------------------------------------------------------------------------
+// tests (TASK-179: C-entry pre-parse gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Semantics of the C entry must be identical in both A/B states: the
+    /// gate only skips work whose result publish would drop untouched.
+    #[test]
+    fn c_entry_pregate_matches_publish_visibility() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        // zero subscribers: valid JSON, malformed JSON and a NULL payload
+        // pointer all report 0 (gate ON: the parse never runs; gate OFF:
+        // the parsed value reaches publish's fast gate and is dropped —
+        // the returned count is the same 0).
+        let ev = CString::new("c.gate.nosub").unwrap();
+        let pj = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+        let bad = CString::new("{not json").unwrap();
+        assert_eq!(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) }, 0);
+        assert_eq!(unsafe { n_events_publish(ev.as_ptr(), bad.as_ptr()) }, 0);
+        assert_eq!(unsafe { n_events_publish(ev.as_ptr(), std::ptr::null()) }, 0);
+
+        // one sync subscriber: delivery identical to publish — valid JSON
+        // parsed into the payload, malformed JSON -> Null, NULL pointer ->
+        // Null; an empty (NULL) event name is rejected by the entry itself.
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let s2 = Arc::clone(&seen);
+        let sub = events::global().subscribe("c.gate.sync", Arc::new(move |_, payload| {
+            s2.lock().unwrap().push(payload.clone());
+        }));
+        let evs = CString::new("c.gate.sync").unwrap();
+        assert_eq!(unsafe { n_events_publish(evs.as_ptr(), pj.as_ptr()) }, 1);
+        assert_eq!(unsafe { n_events_publish(evs.as_ptr(), bad.as_ptr()) }, 1);
+        assert_eq!(unsafe { n_events_publish(evs.as_ptr(), std::ptr::null()) }, 1);
+        assert_eq!(unsafe { n_events_publish(std::ptr::null(), pj.as_ptr()) }, 0);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                serde_json::json!({ "tick": 1u64, "drained": 0u64 }),
+                Value::Null,
+                Value::Null,
+            ],
+            "payload delivery through the C entry matches publish"
+        );
+        assert!(events::global().unsubscribe("c.gate.sync", &sub));
+        assert_eq!(unsafe { n_events_publish(evs.as_ptr(), pj.as_ptr()) }, 0);
+    }
+
+    /// TASK-179 A/B subject: the full C publish entry. Line 1 is the gate
+    /// case — nothing ever subscribed on the global bus, so with the gate
+    /// ON the JSON parse never runs; with it OFF every call parses the
+    /// payload and drops it in publish's fast gate. Line 2 (one sync
+    /// subscriber) must be toggle-independent within noise: the parse is
+    /// required for delivery in both states, the gate adds one acquire
+    /// load. Global-bus state evolves identically in both builds (the
+    /// subscribe happens after line 1), so the pair is directly
+    /// comparable; line 1 is deterministic because a filtered bench run
+    /// executes only this test (fresh global bus, gens == 0).
+    #[test]
+    #[ignore]
+    fn bench_c_events_publish() {
+        let ev = CString::new("c.bench.nosub").unwrap();
+        let pj = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // line 1: zero subscribers on the global bus
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+        }
+        let mut best_none = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+            }
+            best_none = best_none.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // line 2: one sync subscriber — parse required for delivery in
+        // both states; the trivial handler matches the publish(1 sync sub)
+        // harness shape in events.rs so the lines stay comparable.
+        let sub = events::global().subscribe("c.bench.sync", Arc::new(|_, _| {}));
+        let evs = CString::new("c.bench.sync").unwrap();
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_events_publish(evs.as_ptr(), pj.as_ptr()) });
+        }
+        let mut best_sync = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(evs.as_ptr(), pj.as_ptr()) });
+            }
+            best_sync = best_sync.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.sync", &sub);
+
+        println!(
+            "BENCH c_publish: c_publish(no subs) {:.0} ns/op, c_publish(1 sync sub) {:.0} ns/op (min of {rounds}x{iters})",
+            best_none * 1e9,
+            best_sync * 1e9
+        );
+    }
+}

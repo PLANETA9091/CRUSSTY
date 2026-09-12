@@ -1047,6 +1047,20 @@ impl EventBus {
         removed
     }
 
+    /// Pre-parse gate for foreign entries (TASK-179): ONE acquire load of
+    /// the combined generation counter — the same word [`publish`]'s own
+    /// fast gate reads. `false` proves nothing was EVER subscribed on this
+    /// bus, so a publish would drop the payload untouched and return 0;
+    /// a caller that still has to BUILD or parse its payload may skip that
+    /// work entirely. Concurrency contract is identical to the in-publish
+    /// gate: a subscriber racing the publish window may or may not observe
+    /// the call (no ordering is promised) — the check only shortens the
+    /// window; it grants no new guarantee and removes none.
+    #[inline]
+    pub fn may_have_subscribers(&self) -> bool {
+        self.gens.load(Ordering::Acquire) != 0
+    }
+
     /// Publish an event; returns the number of sync handlers invoked.
     /// Async handlers for this event are queued as one task and dispatched
     /// on the pool.
