@@ -1928,7 +1928,7 @@ mod bench_hotpath {
     //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_events`.
     use super::*;
     use super::tests::with_cap;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     #[ignore]
@@ -2165,6 +2165,414 @@ mod bench_hotpath {
             best_shared * 1e9,
             best_build * 1e9
         );
+    }
+
+    /// TASK-205 iso decomposition: publish_shared(1 async sub) 540-632 ns —
+    /// the last ledger line never split into build / push / wake terms.
+    /// The headline shape (bench_event_publish_shared) times the WHOLE
+    /// production call: a fresh `Arc<Value>` per publish (scheduler.rs:396
+    /// builds one per tick boundary) MOVED into publish_shared, which
+    /// memo-hits, sync-dispatches nothing, builds the AsyncTask and pushes
+    /// it into the pool where a worker drains it. This bench splits those
+    /// terms. All loop arms are context-independent (local pools/buses,
+    /// min of 5x200k, one run); the notify reference lines are
+    /// min-of-samples — a futex wake cannot be driven at a 200k rate
+    /// against a worker that must re-park between samples.
+    ///   framing_sync  — publish_shared(1 sync sub): the whole non-queue
+    ///                   part through the same memo/dispatch machinery
+    ///                   (the handle-clone shape of the sibling bench)
+    ///   payload_build — the caller-side term: fresh Arc<Value> per
+    ///                   publish, no bus involved
+    ///   enq_e2e       — real pool.push at the headline composition (fresh
+    ///                   payload + task build + push, workers active,
+    ///                   back-to-back SATURATED regime). REGIME FINDING
+    ///                   banked by this bench: on the 2-core box the
+    ///                   publisher and the workers are CPU-saturating
+    ///                   threads competing for both cores — the queue
+    ///                   reaches the cap, the load-shed path runs, and the
+    ///                   line is distributional by construction (the
+    ///                   mechanism behind the ledger's "wake-dominated
+    ///                   noisy class"). Zero-shed is NOT asserted; the
+    ///                   shed count is printed instead.
+    ///   enq_prebuilt  — ANTI-shape reference: one long-lived handle
+    ///                   cloned per push — the cross-core counter line the
+    ///                   TASK-176 doc warns about, quantified (same
+    ///                   saturated regime, shed count printed)
+    ///   enq_cadence   — the PRODUCTION-cadence arm: one task in flight,
+    ///                   workers parked before every push (the crossing
+    ///                   detector fires the real notify), per-iteration
+    ///                   latency push -> drained -> re-parked sampled min
+    ///                   and median — the per-publish cost at tick
+    ///                   cadence including the futex wake + schedule
+    ///   enq_serial    — single-thread replica of push+pop+run+drop: the
+    ///                   total per-task WORK with zero cross-core
+    ///                   coordination (replica skips ensure_workers, so
+    ///                   no worker exists; idle stays 0 and the notify
+    ///                   gate is the verbatim-off branch)
+    ///   worker_drain  — drain-bound per-task cost: 16384 tasks
+    ///                   replica-prefilled while both workers are parked
+    ///                   (replica pushes never notify), then ONE manual
+    ///                   notify_one wakes a single worker and the serial
+    ///                   drain is timed end-to-end
+    ///   notify lines  — the wake term: notify_one against a condvar
+    ///                   nobody ever waited on vs against a registered-
+    ///                   idle worker (the futex wake the TASK-170 doc
+    ///                   prices at 0.3-3.5us — confirmed or refuted with
+    ///                   numbers; the no-waiter line includes two
+    ///                   Instant reads ~40ns and is overhead-bound if the
+    ///                   glibc fast path skips the syscall)
+    #[test]
+    #[ignore]
+    fn bench_publish_shared_enqueue_iso() {
+        // Byte-identical to the headline arm's event (Inline variant, 12B
+        // <= INLINE_EVENT_CAP) — no repr drift between the shapes.
+        const EVENT: &str = "bench.shared";
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut fold = 0u64; // observability guard against elision
+
+        fn time_arm(
+            name: &'static str,
+            mut op: impl FnMut() -> u64,
+            fold: &mut u64,
+            iters: u32,
+            rounds: u32,
+        ) -> (&'static str, f64) {
+            for _ in 0..10_000u32 {
+                *fold = fold.wrapping_add(op());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    *fold = fold.wrapping_add(op());
+                }
+                best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            (name, best * 1e9)
+        }
+
+        // framing_sync — the non-queue part through the memo machinery.
+        let bus = with_cap(64);
+        let _stok = bus.subscribe("bench.iso.frame", Arc::new(|_, _| {}));
+        let frame_arc = Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }));
+        for _ in 0..10_000u32 {
+            let _ = bus.publish_shared("bench.iso.frame", Arc::clone(&frame_arc));
+        }
+        let framing = time_arm(
+            "framing publish_shared(1 sync sub)",
+            || {
+                let _ = bus.publish_shared("bench.iso.frame", Arc::clone(&frame_arc));
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+
+        // The production task shape, built fresh per push — verbatim with
+        // what queue_async_shared_with assembles for the scheduler call
+        // (owner-less list => build_leaders is the zeroalloc Vec::new).
+        let iso_handler: Handler = Arc::new(|_: &str, _: &Value| {});
+        let iso_list: Resolved = Arc::from(vec![(None, iso_handler)]);
+        let mk_task = |payload: Arc<Value>| AsyncTask {
+            event: EVENT.into(),
+            payload: TaskPayload::Shared(payload),
+            leaders: build_leaders(&iso_list),
+            handlers: Arc::clone(&iso_list),
+        };
+
+        // payload_build — the caller-side term (scheduler.rs:396 shape).
+        let payload_build = time_arm(
+            "payload build (fresh Arc<Value>)",
+            || {
+                drop(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 })));
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+
+        // enq_e2e — real pool.push, workers active, headline composition.
+        let pool = Arc::new(AsyncPool::new(64));
+        for _ in 0..10_000u32 {
+            pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+        }
+        let sheds_before = pool.dropped.load(Ordering::SeqCst);
+        let enq_e2e = time_arm(
+            "enqueue e2e (real push, workers active)",
+            || {
+                pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+        let sheds_e2e = pool.dropped.load(Ordering::SeqCst) - sheds_before;
+
+        // enq_prebuilt — the TASK-176 anti-shape, quantified: the same
+        // pool, the same workers, but the payload handle is ONE long-lived
+        // Arc cloned per push (publisher-side inc, worker-side dec on the
+        // same counter line).
+        let prebuilt = Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }));
+        for _ in 0..10_000u32 {
+            pool.push(mk_task(Arc::clone(&prebuilt)));
+        }
+        let sheds_before = pool.dropped.load(Ordering::SeqCst);
+        let enq_prebuilt = time_arm(
+            "enqueue prebuilt handle (anti-shape)",
+            || {
+                pool.push(mk_task(Arc::clone(&prebuilt)));
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+        let sheds_prebuilt = pool.dropped.load(Ordering::SeqCst) - sheds_before;
+
+        // enq_serial — the push body VERBATIM (shed branch included though
+        // unreachable at depth <= 1; idle == 0 keeps the notify gate off)
+        // with ensure_workers skipped, plus the worker-side pop + run + drop
+        // serialized onto the same thread: the total per-task work with
+        // zero cross-core coordination. `gate=false` mutes ONLY the notify
+        // branch — used by the drain refill below, where idle == 2 would
+        // make the verbatim crossing fire on the FIRST refill push
+        // (len == 1 == 2 - 2 + 1) and let a worker steal tasks mid-fill.
+        #[inline(never)]
+        fn push_replica(pool: &AsyncPool, task: AsyncTask, gate: bool) {
+            let mut queue = lock(&pool.queue);
+            if queue.len() >= pool.cap {
+                queue.pop_front();
+                pool.dropped.fetch_add(1, Ordering::SeqCst);
+                if !pool.dropping.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "[crussty:events] async dispatch queue at capacity ({}) — dropping oldest pending events",
+                        pool.cap
+                    );
+                }
+            }
+            queue.push_back(task);
+            if gate {
+                let idle = pool.idle.load(Ordering::SeqCst);
+                if idle > 0 && queue.len() == ASYNC_WORKERS - idle + 1 {
+                    pool.condvar.notify_one();
+                }
+            }
+        }
+        let ser_pool = AsyncPool::new(64);
+        let ser_prebuilt = Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }));
+        for _ in 0..10_000u32 {
+            push_replica(&ser_pool, mk_task(Arc::clone(&ser_prebuilt)), true);
+            let t = ser_pool.pop();
+            ser_pool.run(t);
+        }
+        let enq_serial = time_arm(
+            "enqueue serial (push+pop+run+drop, one thread)",
+            || {
+                push_replica(&ser_pool, mk_task(Arc::clone(&ser_prebuilt)), true);
+                let t = ser_pool.pop();
+                ser_pool.run(t);
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+
+        // worker_drain — drain-bound per-task cost, one worker, deep queue,
+        // zero spawn pollution and zero push interference: the workers are
+        // spawned by one real push and left to park; every round replica-
+        // prefills the queue while idle == ASYNC_WORKERS (replica never
+        // notifies), then ONE manual notify_one wakes exactly one worker
+        // and the drain to empty is timed. The divisor is the length
+        // observed at the notify instant, so a stray steal cannot skew the
+        // number.
+        const DRAIN_TASKS: usize = 16384;
+        let drain_pool = Arc::new(AsyncPool::new(DRAIN_TASKS * 2));
+        drain_pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+        let parked_deadline = Instant::now() + Duration::from_secs(5);
+        while drain_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+            assert!(
+                Instant::now() < parked_deadline,
+                "drain workers must reach the parked state before the refill"
+            );
+            std::hint::spin_loop();
+        }
+        let mut best_drain = f64::MAX;
+        let mut drain_len = DRAIN_TASKS;
+        for _ in 0..3 {
+            while drain_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+                std::hint::spin_loop();
+            }
+            for _ in 0..DRAIN_TASKS {
+                push_replica(
+                    &drain_pool,
+                    mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))),
+                    false,
+                );
+            }
+            let start_len = lock(&drain_pool.queue).len();
+            let t0 = Instant::now();
+            // The manual wake MUST be issued under the queue lock — the
+            // exact discipline the real push uses. A bare notify can land
+            // inside the worker's fetch_add -> wait-commit window (the
+            // worker is idle-counted but not yet futex-registered), be
+            // lost, and leave the worker asleep on a full queue while this
+            // loop reads idle == ASYNC_WORKERS instantly (observed as a
+            // ~0 ns/task artifact pre-fix). Under the lock the window
+            // cannot overlap: the park path holds the lock from fetch_add
+            // until wait() releases it, so a lock-held notify always finds
+            // a registered waiter (or an awake worker that will re-check).
+            {
+                let _q = lock(&drain_pool.queue);
+                drain_pool.condvar.notify_one();
+            }
+            // Drain-complete signal WITHOUT touching the queue lock, in TWO
+            // phases: idle == ASYNC_WORKERS is AMBIGUOUS (both parked OR
+            // the woken worker not yet scheduled to run its fetch_sub —
+            // observed as a ~4us "drain" of 16384 tasks). Phase 1 waits for
+            // the dip (the worker's fetch_sub proves it actually woke);
+            // phase 2 waits for the return (it parks only after finding
+            // the queue empty under the lock — the drain is done). A
+            // try_lock poller here would steal probes from the worker and
+            // inflate the line; the atomic poll costs it nothing. The one
+            // spin-window the worker runs before re-parking is a fixed
+            // ~us tail over 16384 tasks — noise at ns/task scale.
+            while drain_pool.idle.load(Ordering::SeqCst) == ASYNC_WORKERS {
+                std::hint::spin_loop();
+            }
+            while drain_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+                std::hint::spin_loop();
+            }
+            let per = t0.elapsed().as_secs_f64() * 1e9 / start_len.max(1) as f64;
+            if per < best_drain {
+                best_drain = per;
+                drain_len = start_len;
+            }
+        }
+
+        // enq_cadence — the production-cadence arm: exactly one task in
+        // flight, both workers parked before every push, so THIS push is
+        // the crossing (len == ASYNC_WORKERS - idle + 1) and fires the
+        // real notify; the sample covers push + futex wake + scheduler
+        // dispatch + drain + the worker's spin-window re-park. This is
+        // the per-publish cost a tick-boundary caller actually pays.
+        let cad_pool = Arc::new(AsyncPool::new(64));
+        cad_pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+        let cad_deadline = Instant::now() + Duration::from_secs(5);
+        while cad_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+            assert!(
+                Instant::now() < cad_deadline,
+                "cadence workers must reach the parked state"
+            );
+            std::hint::spin_loop();
+        }
+        let cad_iters = 2000usize;
+        let mut cad_samples = Vec::with_capacity(cad_iters);
+        for _ in 0..cad_iters {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cad_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+                assert!(
+                    Instant::now() < deadline,
+                    "cadence worker must re-park between iterations"
+                );
+                std::hint::spin_loop();
+            }
+            let t0 = Instant::now();
+            cad_pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+            loop {
+                let mut settled = cad_pool.idle.load(Ordering::SeqCst) == ASYNC_WORKERS;
+                if settled {
+                    if let Ok(queue) = cad_pool.queue.try_lock() {
+                        settled = queue.is_empty();
+                    }
+                }
+                if settled {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            cad_samples.push(t0.elapsed().as_secs_f64() * 1e9);
+        }
+        cad_samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in elapsed"));
+        let cad_min = cad_samples[0];
+        let cad_med = cad_samples[cad_iters / 2];
+
+        // notify lines — the wake term, min of samples. no_waiter: a
+        // condvar nobody ever waited on (glibc __wrefs fast path?).
+        // parked: one registered-idle worker re-parked before every sample
+        // (the sample is the futex(WAKE) syscall on the publisher side).
+        let bare_pool = AsyncPool::new(64);
+        let mut best_no_waiter = f64::MAX;
+        for _ in 0..4096usize {
+            let t0 = Instant::now();
+            bare_pool.condvar.notify_one();
+            let ns = t0.elapsed().as_secs_f64() * 1e9;
+            if ns < best_no_waiter {
+                best_no_waiter = ns;
+            }
+        }
+        let np_pool = Arc::new(AsyncPool::new(64));
+        np_pool.push(mk_task(Arc::new(serde_json::json!({ "tick": 1u64, "drained": 0u64 }))));
+        let np_deadline = Instant::now() + Duration::from_secs(5);
+        while np_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+            assert!(
+                Instant::now() < np_deadline,
+                "notify workers must reach the parked state"
+            );
+            std::hint::spin_loop();
+        }
+        let mut best_parked = f64::MAX;
+        for _ in 0..256usize {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while np_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
+                assert!(
+                    Instant::now() < deadline,
+                    "worker must re-park between notify samples"
+                );
+                std::hint::spin_loop();
+            }
+            let t0 = Instant::now();
+            // Lock-held notify — the production pusher shape (the crossing
+            // decision runs under the queue lock; a bare notify could be
+            // lost in the fetch_add -> wait-commit window).
+            {
+                let _q = lock(&np_pool.queue);
+                np_pool.condvar.notify_one();
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9;
+            if ns < best_parked {
+                best_parked = ns;
+            }
+        }
+
+        println!(
+            "BENCH publish_shared_enqueue_iso: [{}] {:.0} ns/op, [{}] {:.0} ns/op, [{}] {:.0} ns/op (sheds {}), [{}] {:.0} ns/op (sheds {}), [{}] {:.0} ns/op; worker_drain {:.0} ns/task ({} tasks, single worker, min of 3); cadence push->drained min {:.0} / med {:.0} ns ({} iters); notify no-waiter {:.0} ns / parked {:.0} ns (min of samples); fold {} (loops min of {rounds}x{iters})",
+            framing.0,
+            framing.1,
+            payload_build.0,
+            payload_build.1,
+            enq_e2e.0,
+            enq_e2e.1,
+            sheds_e2e,
+            enq_prebuilt.0,
+            enq_prebuilt.1,
+            sheds_prebuilt,
+            enq_serial.0,
+            enq_serial.1,
+            best_drain,
+            drain_len,
+            cad_min,
+            cad_med,
+            cad_iters,
+            best_no_waiter,
+            best_parked,
+            fold,
+        );
+        assert!(fold != u64::MAX);
     }
 
     /// TASK-196 A/B: what does building one AsyncTask actually cost in
