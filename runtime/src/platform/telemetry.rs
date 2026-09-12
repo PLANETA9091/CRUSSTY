@@ -154,6 +154,17 @@ struct SnapshotJsonCache {
     tps_memo: TpsMemo,
     scratch_a: Vec<u8>,
     scratch_b: Vec<u8>,
+    /// TASK-200: the C-entry output buffer. The C snapshot read's whole
+    /// buffer cycle (clear + assemble + NUL push) runs under the ONE
+    /// cache lock — the pre-200 `SNAP_BUF: Mutex<Vec<u8>>` in c_bridge
+    /// was redundant writer-serialization, because snapshot_json_write
+    /// already held the cache lock across its entire call body (hit and
+    /// miss alike). The pointer handed to C stays valid until the next
+    /// call: the Vec lives in this static (never freed), and the NUL
+    /// terminator is appended under the lock after every write (serde
+    /// JSON output cannot contain a raw 0x00 — control characters are
+    /// escaped), so the terminator is the only NUL in the buffer.
+    c_buf: Vec<u8>,
     valid: bool,
 }
 
@@ -245,25 +256,31 @@ impl Default for SnapshotJsonCache {
             },
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
+            c_buf: Vec::new(),
             valid: false,
         }
     }
 }
 
-/// Cache lock discipline (TASK-199 revision): the cache lock is the ONLY
-/// lock on the HIT path — a hit assembles the output purely from the
-/// cached ranges + memo bytes and never touches the live snapshot, so the
-/// SNAP_GEN load on the hit path is lock-free and linearized (stale gen =
-/// coherent pre-mutation snapshot; bumped gen = the miss path below). The
-/// data lock is taken ONLY on the miss/rebuild path, in cache -> data
-/// order, with the generation RE-VERIFIED under the data lock (another
-/// reader may have refilled while we waited). Safety invariants: nothing
-/// that holds the data lock may acquire the cache lock (every mutator
-/// bumps SNAP_GEN with one atomic fetch_add while holding the data lock
-/// and never touches the cache; no other site locks this static —
-/// grep-verified single acquisition point), so no inverse order can form.
-/// The cache lock itself remains a leaf. No other code touches this
-/// static.
+/// Cache lock discipline (TASK-199 revision, TASK-200 acquisition
+/// points): the cache lock is the ONLY lock on the HIT path — a hit
+/// assembles the output purely from the cached ranges + memo bytes and
+/// never touches the live snapshot, so the SNAP_GEN load on the hit path
+/// is lock-free and linearized (stale gen = coherent pre-mutation
+/// snapshot; bumped gen = the miss path below). The data lock is taken
+/// ONLY on the miss/rebuild path, in cache -> data order, with the
+/// generation RE-VERIFIED under the data lock (another reader may have
+/// refilled while we waited). Safety invariants: nothing that holds the
+/// data lock may acquire the cache lock (every mutator bumps SNAP_GEN
+/// with one atomic fetch_add while holding the data lock and never
+/// touches the cache), so no inverse order can form. TASK-200: the cache
+/// lock ALSO serializes the C-entry output buffer (`c_buf` — the whole
+/// clear + assemble + NUL cycle runs under it in [`snapshot_c_entry`]);
+/// the two PROD acquisition points are [`snapshot_json_write`] and
+/// [`snapshot_c_entry`], both cache-first, both in this file
+/// (grep-verified: every other `.lock()` on this static is test/bench
+/// code), so the cache lock remains a leaf in production. No other prod
+/// code touches this static.
 static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache {
     gen: 0,
     prefix: Vec::new(),
@@ -283,6 +300,7 @@ static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache 
     },
     scratch_a: Vec::new(),
     scratch_b: Vec::new(),
+    c_buf: Vec::new(),
     valid: false,
 });
 
@@ -431,13 +449,45 @@ pub fn metrics_full() -> bool {
 /// nesting unchanged and still the only nesting; mutators only bump
 /// SNAP_GEN under the data lock and never touch the cache — no inverse
 /// order can form). The caller may hold its own buffer mutex around this
-/// with no inverse order anywhere. Single call site (the C entry);
-/// #[inline(never)] keeps the serializer out of the caller's code region
-/// (TASK-181).
+/// with no inverse order anywhere (TASK-200: the C entry no longer holds
+/// one — see [`snapshot_c_entry`]). Call sites (TASK-200): the
+/// TELEM_SNAP_ONELOCK=false C-entry arm (kept verbatim for the A/B
+/// toggle), benches and parity tests; the default C entry goes through
+/// [`snapshot_c_entry`]. #[inline(never)] keeps the serializer out of
+/// the caller's code region (TASK-181).
 #[inline(never)]
 #[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
 pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
+    let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    snapshot_json_write_inner(&mut cache, SnapshotOut::Ext(out));
+}
+
+/// Output target for [`snapshot_json_write_inner`] (TASK-200): an
+/// externally owned buffer (the legacy entry shape, benches, parity
+/// tests) or the cache's own C-entry buffer ([`snapshot_c_entry`] — the
+/// write then happens under the cache lock the caller already holds, so
+/// no second lock is needed to serialize C-entry writers).
+enum SnapshotOut<'a> {
+    Ext(&'a mut Vec<u8>),
+    Own,
+}
+
+/// The write body (doc on [`snapshot_json_write`]); the caller must hold
+/// the cache lock when `out` is [`SnapshotOut::Own`] — that lock IS the
+/// C-entry writer serialization (TASK-200). With [`SnapshotOut::Ext`]
+/// the caller needs no lock: [`snapshot_json_write`] acquires the cache
+/// lock and delegates here.
+#[inline(never)]
+fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>) {
     if !TELEM_SNAP_CACHE {
+        // SnapshotOut::Own with the cache OFF: the caller
+        // (snapshot_c_entry) holds the cache lock for the whole call, so
+        // the write into the shared c_buf stays serialized even though
+        // this branch never touches the other cache fields.
+        let out: &mut Vec<u8> = match out {
+            SnapshotOut::Ext(v) => v,
+            SnapshotOut::Own => &mut cache.c_buf,
+        };
         // Pre-TASK-194 shape, kept verbatim for the A/B toggle.
         let tps = ring_tps().unwrap_or_else(current_tps);
         let snap = snapshot_arc();
@@ -458,8 +508,9 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
     // leaf lock; TASK-199: the hit path runs under the CACHE LOCK ONLY.
     // The struct destructure splits the field borrows (the borrow checker
     // cannot prove disjointness through `cache.field` alone inside one
-    // fn).
-    let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    // fn). The caller (snapshot_json_write) or the lock-holding caller
+    // (snapshot_c_entry, TASK-200) acquired the cache lock; this body
+    // never re-locks it.
     let SnapshotJsonCache {
         gen: cached_gen,
         valid: cached_valid,
@@ -468,7 +519,12 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
         tps_memo,
         scratch_a,
         scratch_b,
+        c_buf,
     } = &mut *cache;
+    let out: &mut Vec<u8> = match out {
+        SnapshotOut::Ext(v) => v,
+        SnapshotOut::Own => c_buf,
+    };
     // Resolve the live tps + its serde bytes (steady state: zero ring
     // scan, zero format — two loads + compares). Byte-identical to the
     // verbatim expression by the TpsMemo value contract.
@@ -547,6 +603,46 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
             out.extend_from_slice(b"{}");
         }
     }
+}
+
+/// TASK-200: the C telemetry snapshot entry's whole buffer cycle under
+/// the ONE cache lock. The pre-200 C shape (c_bridge, kept verbatim
+/// behind the TELEM_SNAP_ONELOCK toggle) locked a dedicated
+/// `SNAP_BUF: Mutex<Vec<u8>>` around clear + [`snapshot_json_write`] +
+/// the NUL push — a SECOND lock pair on the hot path, redundant for
+/// writer serialization because snapshot_json_write already holds the
+/// SNAP_JSON_CACHE cache lock across its ENTIRE call body (hit and miss
+/// alike): two concurrent C-entry writes serialize on the cache lock
+/// exactly as they serialized on the buffer mutex, so the buffer mutex
+/// added nothing the cache lock did not already provide. This fn moves
+/// the buffer INTO the cache struct (plain `c_buf` field behind the
+/// existing cache Mutex — no unsafe, no new sync primitives) and serves
+/// the whole cycle (clear + assemble + NUL) under that one lock.
+///
+/// CONTRACT (identical to the pre-200 C entry, TASK-181): returns a
+/// NUL-terminated JSON object pointer, valid until the NEXT call to this
+/// fn (from any thread); the buffer lives in the cache static and is
+/// never freed; serde JSON output cannot contain a raw 0x00 (control
+/// characters are escaped), so the appended terminator is the only NUL
+/// in the buffer. Writer serialization: the cache lock (single
+/// acquisition point, grep-verified — the same discipline as the
+/// TASK-199 static doc). Reader exposure UNCHANGED: the pointer is
+/// consumed outside any lock under the valid-until-next-call contract —
+/// exactly as the pre-200 shape, where the buffer mutex guard was
+/// released before the C consumer read the pointer (the mutex never
+/// protected readers, only writers). Lock nesting is SHALLOWER than
+/// pre-200: the SNAP_BUF-mutex -> cache -> data chain loses its first
+/// level; cache -> data (miss path) is unchanged and remains the only
+/// nesting. #[inline(never)] keeps the serializer out of the caller's
+/// code region (TASK-181 discipline).
+#[inline(never)]
+pub(crate) fn snapshot_c_entry() -> *const std::os::raw::c_char {
+    let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.c_buf.clear();
+    snapshot_json_write_inner(&mut cache, SnapshotOut::Own);
+    let buf = &mut cache.c_buf;
+    buf.push(0);
+    buf.as_ptr() as *const std::os::raw::c_char
 }
 
 /// Split point between two serializations of the SAME snapshot whose only
@@ -993,6 +1089,7 @@ mod bench_hotpath {
                 tps_memo,
                 scratch_a: _scratch_a,
                 scratch_b: _scratch_b,
+                c_buf: _c_buf,
             } = &mut *cache;
             if !tps_memo_resolve(tps_memo) {
                 *cached_valid = false;
@@ -1028,6 +1125,7 @@ mod bench_hotpath {
                     tps_memo,
                     scratch_a: _scratch_a2,
                     scratch_b: _scratch_b2,
+                    c_buf: _c_buf2,
                 } = &mut *cache;
                 if !tps_memo_resolve(tps_memo) {
                     *cached_valid = false;
@@ -2138,5 +2236,190 @@ mod tests {
         assert!(out3.starts_with("400"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// TASK-200: the single-lock C entry — byte parity, pointer
+    /// stability, and the serialization proof. Holds the module TEST_LOCK
+    /// (state must settle between captures; parallel metric-publishing
+    /// tests void the round and the capture retries, the same
+    /// probe-guarded discipline as `tps_memo_parity_and_states`).
+    /// (a) Byte parity: the snapshot_c_entry output (up to and including
+    ///     the NUL) is bit-identical to clear + snapshot_json_write +
+    ///     push(0) into a local buffer — same body, same memo bytes, the
+    ///     only difference is WHERE the target buffer lives.
+    /// (b) Steady-state pointer stability: two successive calls return
+    ///     the SAME pointer (equal content length under a stable
+    ///     generation, so no realloc — the same exposure class as the
+    ///     pre-200 static buffer, which also kept its pointer stable
+    ///     across equal-length rewrites).
+    /// (c) Serialization proof: a snapshot_c_entry call issued while the
+    ///     test holds the SNAP_JSON_CACHE lock must BLOCK until release —
+    ///     a buffer write outside the lock would complete immediately.
+    ///     This is what pins "the whole cycle lives under the cache lock"
+    ///     against regressions (the single-lock discipline IS the writer
+    ///     serialization now).
+    #[test]
+    fn snapshot_c_entry_single_lock_parity() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // (a) probe-guarded byte parity, empty state then labeled state.
+        // Probe = the same triple the tps_memo capture uses (content gen,
+        // ring head, fallback tps bits) — any input the JSON depends on.
+        let probe = || {
+            (
+                SNAP_GEN.load(Ordering::Relaxed),
+                RING_HEAD.load(Ordering::Relaxed),
+                TPS_LAST_BITS.load(Ordering::Relaxed),
+            )
+        };
+        let mut labeled = 0u32;
+        loop {
+            let mut local = Vec::new();
+            let p0 = probe();
+            let c_ptr = snapshot_c_entry();
+            let c_bytes =
+                unsafe { std::ffi::CStr::from_ptr(c_ptr) }.to_bytes_with_nul().to_vec();
+            let p1 = probe();
+            snapshot_json_write(&mut local);
+            local.push(0);
+            let p2 = probe();
+            if p0 == p1 && p1 == p2 {
+                assert_eq!(c_bytes, local, "c-entry output must be bit-identical to the write+push shape");
+                assert_eq!(*c_bytes.last().unwrap(), 0, "output is NUL-terminated");
+                break;
+            }
+            labeled += 1;
+            assert!(labeled < 1000, "snapshot state never settled for c-entry parity");
+        }
+
+        // labeled state: 4 metrics with labels (fills the assemble path),
+        // then the same parity capture again.
+        for i in 0..4u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("c.entry.parity.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+        let mut attempts = 0u32;
+        loop {
+            let mut local = Vec::new();
+            let p0 = probe();
+            let c_ptr = snapshot_c_entry();
+            let c_bytes =
+                unsafe { std::ffi::CStr::from_ptr(c_ptr) }.to_bytes_with_nul().to_vec();
+            let p1 = probe();
+            snapshot_json_write(&mut local);
+            local.push(0);
+            let p2 = probe();
+            if p0 == p1 && p1 == p2 {
+                assert_eq!(c_bytes, local, "labeled state: bit-identical output");
+                let v: serde_json::Value = serde_json::from_slice(
+                    &c_bytes[..c_bytes.len() - 1],
+                )
+                .expect("valid JSON");
+                assert_eq!(v["metrics"].as_array().unwrap().len(), 4);
+                break;
+            }
+            attempts += 1;
+            assert!(attempts < 1000, "snapshot state never settled for labeled parity");
+        }
+
+        // (b) pointer stability across two equal-content calls.
+        let mut attempts = 0u32;
+        loop {
+            let p0 = probe();
+            let a = snapshot_c_entry();
+            let b = snapshot_c_entry();
+            let p1 = probe();
+            if p0 == p1 {
+                assert_eq!(a, b, "steady state: no realloc between equal-length calls, pointer stable");
+                break;
+            }
+            attempts += 1;
+            assert!(attempts < 1000, "snapshot state never settled for pointer stability");
+        }
+
+        // (c) serialization proof: hold the cache lock; the entry must
+        // block until it is released.
+        let hold = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let h = std::thread::spawn(move || {
+            let p = snapshot_c_entry();
+            let _ = tx.send(p as usize);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            rx.try_recv().is_err(),
+            "c entry must BLOCK while the cache lock is held — a buffer write outside the lock would have completed"
+        );
+        drop(hold);
+        let ptr = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("c entry completes after the cache lock is released");
+        assert!(ptr != 0, "released call returns a valid pointer");
+        h.join().unwrap();
+
+        // post-serialization validity: the released call's output parses.
+        let p = snapshot_c_entry();
+        let b = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(b).expect("valid JSON after unblock");
+        assert!(v["tps"].is_number(), "numeric tps after unblock");
+    }
+
+    /// TASK-200: concurrent C-entry writer liveness. 3 writer threads x
+    /// 2k calls each + a set_mem mutator forcing generation bumps (miss
+    /// path) under the writers — the run must complete without deadlock
+    /// (cache -> data nesting under C-entry contention) and the
+    /// post-join output must parse as valid JSON with a numeric tps. The
+    /// returned pointers are never DEREFERENCED by the writers (the
+    /// valid-until-next-call contract forbids consuming a pointer across
+    /// other threads' calls; the pre-200 shape had the identical reader
+    /// exposure — torn-output detection is by construction, the race
+    /// here exercises writer serialization + liveness). Holds the module
+    /// TEST_LOCK so the hot gen-bump churn does not starve the
+    /// probe-guarded captures of parallel telemetry tests.
+    #[test]
+    fn snapshot_c_entry_concurrent_liveness() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let mut handles = Vec::new();
+        for _ in 0..3u32 {
+            let tx = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..2000u32 {
+                    // Pointer VALUE only — never dereferenced (contract).
+                    std::hint::black_box(snapshot_c_entry() as usize);
+                }
+                let _ = tx.send(());
+            }));
+        }
+        // mutator: gen bumps force the miss path (data-lock rebuild)
+        // under the writers — cache -> data nesting under contention.
+        for i in 0..6000u32 {
+            set_mem((i % 64 + 1).into(), 64);
+            std::thread::yield_now();
+        }
+        drop(done_tx);
+        for h in handles {
+            h.join().expect("writer thread must not panic");
+        }
+        // All 3 writers reported OR the channel closed — with 3 sends
+        // buffered the recv loop drains them; liveness is that join()
+        // returned at all (a deadlock would hang the test to the
+        // harness timeout).
+        let _ = done_rx.recv_timeout(Duration::from_secs(1));
+
+        // post-join: no concurrent writers left — race-free read.
+        let p = snapshot_c_entry();
+        let b = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(b).expect("valid JSON after the race");
+        assert!(v["tps"].is_number(), "numeric tps after the race");
+        assert!(v["metrics"].is_array(), "metrics array present after the race");
     }
 }

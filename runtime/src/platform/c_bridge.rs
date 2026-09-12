@@ -59,6 +59,22 @@ pub const TELEM_PREGATE: bool = true;
 /// the only NUL — CString semantics preserved).
 pub const TELEM_SNAP_INPLACE: bool = true;
 
+/// TASK-200 A/B toggle: the C-entry snapshot buffer cycle under the ONE
+/// cache lock. `true` = telemetry::snapshot_c_entry serves the whole
+/// cycle (clear + assemble + NUL push) under the SNAP_JSON_CACHE cache
+/// lock — the pre-200 SNAP_BUF Mutex pair is off the hot path. Writer
+/// serialization is UNCHANGED: snapshot_json_write already held the
+/// cache lock across its entire call body (hit and miss alike), so two
+/// concurrent C-entry writes serialize on the cache lock exactly as they
+/// serialized on the buffer mutex. The reader contract is UNCHANGED:
+/// pointer valid until the next call (from any thread), consumed outside
+/// any lock — exactly as the pre-200 shape, where the mutex guard was
+/// released before the C consumer read the pointer (the mutex never
+/// protected readers, only writers). `false` = the pre-TASK-200 shape
+/// kept verbatim for the A/B bench (and as the byte-identity reference
+/// implementation).
+pub const TELEM_SNAP_ONELOCK: bool = true;
+
 /// TASK-193 A/B toggle: hand-rolled fast-path parse for the flat payload
 /// shapes C producers actually emit (null/true/false, integers, escape-free
 /// strings, flat objects/arrays of exactly those leaves). ANYTHING the
@@ -462,16 +478,35 @@ static SNAP: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
 /// terminator is appended after every write, and serde JSON output cannot
 /// contain a raw 0x00 byte (control characters are escaped), so the
 /// terminator is the only NUL in the buffer.
+/// TASK-200: this static now serves ONLY the TELEM_SNAP_ONELOCK=false A/B
+/// arm below (and the A/B bench arm that re-derives the same shape); the
+/// default path keeps the buffer inside the telemetry cache struct
+/// (SnapshotJsonCache::c_buf) under the ONE cache lock.
 static SNAP_BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 
 unsafe extern "C" fn n_telemetry_snapshot_json() -> *const c_char {
     if TELEM_SNAP_INPLACE {
-        let buf = SNAP_BUF.get_or_init(|| Mutex::new(Vec::with_capacity(4096)));
-        let mut guard = buf.lock().unwrap();
-        guard.clear();
-        telemetry::snapshot_json_write(guard.as_mut());
-        guard.push(0);
-        guard.as_ptr() as *const c_char
+        if TELEM_SNAP_ONELOCK {
+            // TASK-200: the whole buffer cycle (clear + assemble + NUL)
+            // runs under the ONE cache lock inside
+            // telemetry::snapshot_c_entry — the pre-200 SNAP_BUF mutex
+            // pair is off the hot path. Writer serialization unchanged
+            // (the cache lock already spanned every snapshot_json_write
+            // call); reader exposure unchanged (the pointer is consumed
+            // outside any lock under the TASK-181 valid-until-next-call
+            // contract); lock nesting SHALLOWER (the mutex -> cache ->
+            // data chain loses its first level).
+            telemetry::snapshot_c_entry()
+        } else {
+            // Pre-TASK-200 shape, kept verbatim for the A/B toggle (the
+            // byte-identity test re-derives this shape independently).
+            let buf = SNAP_BUF.get_or_init(|| Mutex::new(Vec::with_capacity(4096)));
+            let mut guard = buf.lock().unwrap();
+            guard.clear();
+            telemetry::snapshot_json_write(guard.as_mut());
+            guard.push(0);
+            guard.as_ptr() as *const c_char
+        }
     } else {
         // Pre-TASK-181 shape, kept verbatim for the A/B toggle (the
         // byte-identity test re-derives this shape independently).
@@ -1425,6 +1460,103 @@ mod tests {
             "BENCH snapshot_json: snapshot_json(0 metrics) {:.0} ns/op, snapshot_json(32 labeled) {:.0} ns/op (min of {rounds}x{iters})",
             best_empty * 1e9,
             best_32 * 1e9
+        );
+    }
+
+    /// TASK-200 A/B subject: the C snapshot entry's buffer locking.
+    /// Arm A = the verbatim pre-200 shape (SNAP_BUF OnceLock<Mutex> load
+    /// + mutex pair around clear + snapshot_json_write + NUL push); arm
+    /// B = telemetry::snapshot_c_entry (the whole cycle under the ONE
+    /// cache lock — the buffer lives in the cache struct, no second lock
+    /// acquisition, no OnceLock hop). Lines: empty metric list (control)
+    /// and 32 labeled metrics. Byte-identity between the shapes is
+    /// asserted by snapshot_c_entry_single_lock_parity (telemetry) and
+    /// the solo telemetry_snapshot_inplace_byte_identical (which runs on
+    /// the default arm-B entry). Runs SOLO (filtered run only): resets
+    /// the shared snapshot and leaves 32 metrics published at the end
+    /// (harmless — every solo bench resets its own starting state).
+    #[test]
+    #[ignore]
+    fn bench_snapshot_centry_ab() {
+        telemetry::test_reset_snapshot();
+
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // Arm A: the pre-200 entry body, verbatim (the TELEM_SNAP_ONELOCK
+        // = false arm re-derives exactly this shape).
+        let entry_legacy = || -> *const c_char {
+            let buf = SNAP_BUF.get_or_init(|| Mutex::new(Vec::with_capacity(4096)));
+            let mut guard = buf.lock().unwrap();
+            guard.clear();
+            telemetry::snapshot_json_write(guard.as_mut());
+            guard.push(0);
+            guard.as_ptr() as *const c_char
+        };
+
+        // ---- line 1: empty metric list (control) ----
+        for _ in 0..10_000u32 {
+            black_box(entry_legacy());
+            black_box(telemetry::snapshot_c_entry());
+        }
+        let mut best_empty_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(entry_legacy());
+            }
+            best_empty_a = best_empty_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_empty_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(telemetry::snapshot_c_entry());
+            }
+            best_empty_b = best_empty_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- 32 labeled metrics (4 label pairs each) ----
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            telemetry::publish_metric(
+                &format!("c.bench.centry.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+        for _ in 0..10_000u32 {
+            black_box(entry_legacy());
+            black_box(telemetry::snapshot_c_entry());
+        }
+        let mut best_32_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(entry_legacy());
+            }
+            best_32_a = best_32_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_32_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(telemetry::snapshot_c_entry());
+            }
+            best_32_b = best_32_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH centry A/B: mutex empty {:.0} ns/op -> single-lock empty {:.0} ns/op, mutex 32-labeled {:.0} ns/op -> single-lock 32-labeled {:.0} ns/op (min of {rounds}x{iters})",
+            best_empty_a * 1e9,
+            best_empty_b * 1e9,
+            best_32_a * 1e9,
+            best_32_b * 1e9
         );
     }
 }
