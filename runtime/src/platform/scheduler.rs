@@ -428,14 +428,39 @@ fn now() -> Instant {
 const TSC_CLOCK: bool = true;
 
 /// Calibrated TSC rate: nanoseconds per cycle as f64 bits. Published
-/// (Relaxed) BEFORE [`TSC_EPOCH`]; valid only while the epoch is non-zero.
+/// (Relaxed) BEFORE [`TSC_RECIP`] and [`TSC_EPOCH`]; retained as the
+/// calibration record (the hot path converts through [`TSC_RECIP`], the
+/// stages bench keeps measuring the f64 shape as the replaced arm).
 #[cfg(target_arch = "x86_64")]
 static TSC_RATE_BITS: AtomicU64 = AtomicU64::new(0);
 
+/// Calibrated TSC rate in u32.32 fixed point — nanoseconds per cycle with
+/// 32 fractional bits. Published (Relaxed) AFTER [`TSC_RATE_BITS`] and
+/// BEFORE [`TSC_EPOCH`], so the epoch's Release store orders it for Acquire
+/// readers exactly like the rate. The hot path multiplies by this instead
+/// of the f64 rate: on x86-64 `zext(i64) * zext(i64) -> i128` has zero high
+/// halves, so the whole convert lowers to ONE `mulq` + `shrd` — vs the
+/// measured ~7 ns cvtsi2sd+mulsd+cvttsd2si chain
+/// (bench_boundary_tsc_stages_iso: raw 13 = sub 13 < conv 20 = convconst
+/// 20, the loads and branch are free, the f64 math is the cost).
+/// Quantization: the grid is ABSOLUTE (2^-32 ns/cyc steps), so the
+/// duration error is dcycles * |r'-r| <= dur * 2^-33 / rate — for real
+/// invariant-TSC rates (0.1..=1 ns/cyc, i.e. 1-10 GHz; the cal() guard
+/// floor 0.01 would be a 100 GHz TSC, which does not exist) that is
+/// <= 2 ns on a 50 ms tick and <= 50 ns on a 60 s window, four orders of
+/// magnitude under the 10 ppm calibration error (500 ns / 600 us).
+/// Overflow: cycles < 2^64,
+/// recip < 2^39 (rate <= 100 ns/cyc), product < 2^103 < 2^128; the shifted
+/// result is ns-since-epoch and fits u64 for ~584 years of uptime.
+/// Monotone: floor of a nondecreasing linear map with a constant positive
+/// factor. Value gate: `tsc_fixed_point_matches_f64_shape`.
+#[cfg(target_arch = "x86_64")]
+static TSC_RECIP: AtomicU64 = AtomicU64::new(0);
+
 /// Calibrated TSC epoch cycle — the cycle the boundary ns counter starts
 /// from. 0 = not calibrated (or calibration failed); published (Release)
-/// AFTER [`TSC_RATE_BITS`], so an Acquire load that observes a non-zero
-/// epoch also observes the rate.
+/// AFTER [`TSC_RATE_BITS`] and [`TSC_RECIP`], so an Acquire load that
+/// observes a non-zero epoch also observes the rate and the reciprocal.
 #[cfg(target_arch = "x86_64")]
 static TSC_EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -477,9 +502,11 @@ fn tsc_now_ns() -> Option<u64> {
         }
         t0
     };
-    let rate = f64::from_bits(TSC_RATE_BITS.load(Ordering::Relaxed));
+    // u32.32 fixed-point convert (TASK-215): one mulq + shrd on x86-64 —
+    // see TSC_RECIP for the overflow/monotonicity/precision contract.
+    let recip = TSC_RECIP.load(Ordering::Relaxed);
     let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
-    Some((cycles as f64 * rate) as u64)
+    Some(((cycles as u128 * recip as u128) >> 32) as u64)
 }
 
 /// One-time calibration against the vDSO clock: CPUID-gated on the
@@ -520,6 +547,10 @@ fn calibrate_tsc() {
     };
     if let Some((epoch, rate)) = cal() {
         TSC_RATE_BITS.store(rate.to_bits(), Ordering::Relaxed);
+        // u32.32 reciprocal (TASK-215): the hot path's integer convert.
+        // rate in 0.01..=100 ns/cyc -> recip in [2^25.3, 2^38.6]: nonzero,
+        // fits u64, product bound holds (see TSC_RECIP).
+        TSC_RECIP.store((rate * 4294967296.0).round() as u64, Ordering::Relaxed);
         TSC_EPOCH.store(epoch, Ordering::Release);
     }
 }
@@ -633,6 +664,50 @@ mod tests {
         }
         if let Some(s) = TICK_SAMPLES.get() {
             s.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+    }
+
+    /// TASK-215 value gate for the u32.32 fixed-point boundary convert
+    /// (TSC_RECIP): against the f64 shape it replaces, durations
+    /// (differences — the documented consumer contract) must agree to
+    /// `dur * 2^-32 + 3 ns` and be monotone in cycles. Rates pinned to the
+    /// REAL invariant-TSC envelope (0.25-1.0 ns/cyc = 1-4 GHz): the grid is
+    /// absolute, so at the cal() guard's pathological floor (0.01 = a
+    /// 100 GHz TSC) the relative quantization would grow to ~56 ns per
+    /// 60 s — such hardware does not exist and the guard stays wide only
+    /// as a safety net. Pure math — no TSC, no globals; runs in the suite.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn tsc_fixed_point_matches_f64_shape() {
+        let rates: [f64; 5] = [1.0 / 3.0, 0.29, 0.42, 0.5, 1.0];
+        for &rate in &rates {
+            let recip = (rate * 4294967296.0).round() as u64;
+            assert!(recip > 0, "recip underflow at rate {rate}");
+            assert!((rate * 4294967296.0).round() < (1u64 << 39) as f64);
+            // Monotone in cycles, absolute agreement at read granularity.
+            let mut prev = 0u64;
+            for i in 0..64 {
+                let cycles = 1u64 << i;
+                let fix = ((cycles as u128 * recip as u128) >> 32) as u64;
+                assert!(fix >= prev, "fixed point went backwards at 2^{i}");
+                prev = fix;
+            }
+            // Duration agreement across realistic spans: 50 ms tick, 1 s,
+            // 60 s tps window. f64 shape is the reference.
+            for &dur_ns in &[50_000_000.0, 1_000_000_000.0, 60_000_000_000.0] {
+                let c0 = 123_456_789_012_345u64; // ~1.3 h uptime at 3 GHz
+                let dcycles = (dur_ns / rate) as u64;
+                let f64_dur =
+                    (((c0 + dcycles) as f64 * rate) as u64) - ((c0 as f64 * rate) as u64);
+                let fix_dur = ((((c0 + dcycles) as u128 * recip as u128) >> 32) as u64)
+                    - (((c0 as u128 * recip as u128) >> 32) as u64);
+                let bound = (dur_ns * 2.3283064365386963e-10) + 3.0; // 2^-32 + truncation
+                let diff = (fix_dur as f64 - f64_dur as f64).abs();
+                assert!(
+                    diff <= bound,
+                    "fixed/f64 duration mismatch {diff} > {bound} ns at dur {dur_ns}, rate {rate}"
+                );
+            }
         }
     }
 
@@ -998,6 +1073,133 @@ mod bench_hotpath {
             best_rdtsc * 1e9
         );
         reset_last_boundary_for_tests();
+    }
+
+    /// TASK-215: internal decomposition of the TSC boundary arm — the
+    /// isolated tsc read (~20 ns) vs the raw rdtsc floor (~13 ns): where
+    /// does the machinery go? Arms (all steady-state, calibration warmed
+    /// off-clock, 10k warmup per arm, min-of-5x200k, outputs black_boxed):
+    ///   raw       — _rdtsc() alone (the documented floor, in-context)
+    ///   sub       — + wrapping_sub(epoch) with the epoch loaded per-iter
+    ///   conv      — the shipped math verbatim (both loads + f64 convert),
+    ///               minus the zero-check branch and the Option
+    ///   convconst — the same math with t0/rate hoisted into locals (pure
+    ///               convert throughput floor; per-iter loads excluded)
+    ///   tsc_now   — the shipped tsc_now_ns() (adds the branch)
+    ///   boundary  — the shipped boundary_clock() (adds wrapper + tuple)
+    /// Isolate deltas are indicative only (Round-37 codegen-context
+    /// confound: isolates over/under-sum the composite). Pre-timing gates:
+    /// calibration landed (boundary returns the TSC shape) and 1000
+    /// steady-state reads non-decreasing (monotonicity). LEVER RULE
+    /// pre-registered: a term is leverable only at >= 2 ns; otherwise the
+    /// decomposition closes the boundary floor with in-tree numbers
+    /// (Round-41 pattern — verdict, no production change).
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn bench_boundary_tsc_stages_iso() {
+        use core::arch::x86_64::_rdtsc;
+        let iters = 200_000u32;
+        let rounds = 5;
+        // Gates: TSC shape active + monotonic steady state + calibrated.
+        let (first_ns, first_at) = boundary_clock();
+        assert!(first_at.is_none(), "TSC arm must be the default shape");
+        let mut prev = first_ns;
+        for _ in 0..1000 {
+            let (ns, _) = boundary_clock();
+            assert!(ns >= prev, "boundary_clock went backwards");
+            prev = ns;
+        }
+        let t0 = TSC_EPOCH.load(Ordering::Relaxed);
+        assert!(t0 != 0, "epoch must be calibrated before timing");
+        let rate = f64::from_bits(TSC_RATE_BITS.load(Ordering::Relaxed));
+        let mut raw = f64::MAX;
+        let mut sub = f64::MAX;
+        let mut conv = f64::MAX;
+        let mut convconst = f64::MAX;
+        let mut tscnow = f64::MAX;
+        let mut boundary = f64::MAX;
+        for _ in 0..rounds {
+            for _ in 0..10_000u32 {
+                std::hint::black_box(unsafe { _rdtsc() });
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(unsafe { _rdtsc() });
+            }
+            raw = raw.min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            for _ in 0..10_000u32 {
+                let c = unsafe { _rdtsc() }.wrapping_sub(TSC_EPOCH.load(Ordering::Relaxed));
+                std::hint::black_box(c);
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                let c = unsafe { _rdtsc() }.wrapping_sub(TSC_EPOCH.load(Ordering::Relaxed));
+                std::hint::black_box(c);
+            }
+            sub = sub.min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            for _ in 0..10_000u32 {
+                let ns = (unsafe { _rdtsc() }
+                    .wrapping_sub(TSC_EPOCH.load(Ordering::Relaxed))
+                    as f64
+                    * f64::from_bits(TSC_RATE_BITS.load(Ordering::Relaxed)))
+                    as u64;
+                std::hint::black_box(ns);
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                let ns = (unsafe { _rdtsc() }
+                    .wrapping_sub(TSC_EPOCH.load(Ordering::Relaxed))
+                    as f64
+                    * f64::from_bits(TSC_RATE_BITS.load(Ordering::Relaxed)))
+                    as u64;
+                std::hint::black_box(ns);
+            }
+            conv = conv.min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            let (t0c, ratec) = (std::hint::black_box(t0), std::hint::black_box(rate));
+            for _ in 0..10_000u32 {
+                let ns = (unsafe { _rdtsc() }.wrapping_sub(t0c) as f64 * ratec) as u64;
+                std::hint::black_box(ns);
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                let ns = (unsafe { _rdtsc() }.wrapping_sub(t0c) as f64 * ratec) as u64;
+                std::hint::black_box(ns);
+            }
+            convconst = convconst.min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            for _ in 0..10_000u32 {
+                std::hint::black_box(tsc_now_ns());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(tsc_now_ns());
+            }
+            tscnow = tscnow.min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            for _ in 0..10_000u32 {
+                let (ns, at) = boundary_clock();
+                std::hint::black_box((ns, at.is_none()));
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (ns, at) = boundary_clock();
+                std::hint::black_box((ns, at.is_none()));
+            }
+            boundary = boundary.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH boundary tsc stages: raw {:.0} | +sub {:.0} | +conv {:.0} | convconst {:.0} | tsc_now {:.0} | boundary {:.0} (min of {rounds}x{iters})",
+            raw * 1e9,
+            sub * 1e9,
+            conv * 1e9,
+            convconst * 1e9,
+            tscnow * 1e9,
+            boundary * 1e9
+        );
     }
 }
 
