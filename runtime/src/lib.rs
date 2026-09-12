@@ -650,12 +650,25 @@ fn class_file_name(data: &[u8]) -> Option<&str> {
     // One walk (TASK-163): record each entry's start offset into a STACK
     // table — no heap allocation, no second pass. Pools beyond the table
     // (rare) fall back to the storage-free two-pass walker below.
+    // TASK-207: the offs table is `MaybeUninit` — the `[0u32; 1024]`
+    // zero-init cost ~106 ns/op (911 -> 801 on the fixed A/B fixture) when
+    // the table is live, and the walk leaves it untouched otherwise.
+    // Soundness: the walk below writes offs[1..cp_count] before ANY read;
+    // the resolution tail reads only offs[this_idx] and offs[name_idx], and
+    // both indices are guarded to `1..cp_count` right before the read
+    // (offs[0] is never read — `this_idx == 0` is rejected first). Every
+    // initialized-read slot is therefore written first, exactly like the
+    // pre-207 zeroed array.
     if cp_count <= 1024 {
-        let mut offs = [0u32; 1024];
+        // SAFETY: `[MaybeUninit<u32>; 1024]` of uninit is valid to create
+        // (u32 has no validity constraints); every slot later read via
+        // assume_init is written in the walk first (see block comment).
+        let mut offs: [std::mem::MaybeUninit<u32>; 1024] =
+            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         let mut idx = 10usize;
         let mut i = 1usize;
         while i < cp_count {
-            offs[i] = idx as u32;
+            offs[i] = std::mem::MaybeUninit::new(idx as u32);
             let tag = *data.get(idx)?;
             idx += match tag {
                 1 => 3 + u16_at(idx + 1)? as usize,
@@ -675,7 +688,11 @@ fn class_file_name(data: &[u8]) -> Option<&str> {
         if this_idx == 0 || this_idx >= cp_count {
             return None;
         }
-        let cat = offs[this_idx] as usize;
+        let cat = unsafe {
+            // SAFETY: this_idx is in 1..cp_count and offs[this_idx] was
+            // written by the walk above.
+            offs[this_idx].assume_init()
+        } as usize;
         if *data.get(cat)? != 7 {
             return None;
         }
@@ -683,7 +700,11 @@ fn class_file_name(data: &[u8]) -> Option<&str> {
         if name_idx == 0 || name_idx >= cp_count {
             return None;
         }
-        let nat = offs[name_idx] as usize;
+        let nat = unsafe {
+            // SAFETY: name_idx is in 1..cp_count and offs[name_idx] was
+            // written by the walk above.
+            offs[name_idx].assume_init()
+        } as usize;
         if *data.get(nat)? != 1 {
             return None;
         }
@@ -1226,16 +1247,27 @@ mod bench_hotpath {
     use std::time::Instant;
 
     /// A representative mid-size class: ~300 constant-pool entries, a
-    /// 40-char internal name — the shape of a typical kernel class.
+    /// ~40-char internal name — the shape of a typical kernel class.
+    ///
+    /// TASK-207 FIX (bench trap #4): the pre-207 fixture was MALFORMED and
+    /// `class_file_name` returned `None` on it — the 826 ns ledger line was
+    /// the walk plus a FAILURE tail, not a successful extraction. Three
+    /// defects: (1) the name Utf8 declared length 40 but
+    /// "java/util/concurrent/ConcurrentHashMap" is 37 bytes; (2) the Class
+    /// entry was pushed as slot 302 while cp_count=300 leaves valid slots
+    /// 1..=299 — it sat past the pool end; (3) `this_class = slots-1 = 299`
+    /// pointed at the name Utf8 itself (tag 1, not 7) — resolution could
+    /// only fail. The fixed fixture: 299 fillers (slots 1..=299), name Utf8
+    /// slot 300 with its REAL length, Class entry slot 301, this_class=301.
     fn representative_class() -> Vec<u8> {
         let mut b = Vec::with_capacity(8192);
         b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
         b.extend_from_slice(&[0, 0]); // minor
         b.extend_from_slice(&[0, 65]); // major 65
-        let slots = 300u16;
+        let slots = 302u16;
         b.extend_from_slice(&slots.to_be_bytes()); // cp_count
         let mut i = 1usize;
-        while i < (slots as usize) - 1 {
+        while i < (slots as usize) - 2 {
             // Utf8 filler entry (varied lengths 8..40)
             let len = 8 + (i % 32);
             b.push(1);
@@ -1243,15 +1275,17 @@ mod bench_hotpath {
             b.extend(std::iter::repeat(b'x').take(len));
             i += 1;
         }
-        // last slot: the name
+        // slot 300: the name Utf8, length = REAL byte length
+        let name: &[u8] = b"java/util/concurrent/ConcurrentHashMap";
         b.push(1);
-        b.extend_from_slice(&(40u16).to_be_bytes());
-        b.extend_from_slice(b"java/util/concurrent/ConcurrentHashMap");
+        b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        b.extend_from_slice(name);
+        // slot 301: Class entry pointing at the name Utf8
         b.push(7);
-        b.extend_from_slice(&((slots - 1)).to_be_bytes());
-        b.extend_from_slice(&[0, 0x21]);
-        b.extend_from_slice(&(slots - 1).to_be_bytes());
-        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(&((slots - 2)).to_be_bytes());
+        b.extend_from_slice(&[0, 0x21]); // access_flags
+        b.extend_from_slice(&(slots - 1).to_be_bytes()); // this_class -> slot 301
+        b.extend_from_slice(&[0, 0]); // super_class = 0
         b
     }
 
@@ -1326,6 +1360,275 @@ mod bench_hotpath {
             b2 * 1e9,
             b3 * 1e9
         );
+    }
+
+    /// TASK-207: stage decomposition of the cflh class_file_name line
+    /// (826 ns in the ledger). Independent min-of-5x200k arms over the same
+    /// fixture bytes:
+    ///   - `e2e`        — the real `class_file_name` (verbatim `[0u32;1024]`
+    ///                    offs table + resolution tail)
+    ///   - `walk`       — pass-1 replica: tag stepping only, no offs table,
+    ///                    no resolution
+    ///   - `walk+offs`  — pass-1 replica WITH the offs-table stores (the
+    ///                    TASK-163 resolution structure), no tail
+    ///   - `e2e-noinit` — full replica with the offs table as `MaybeUninit`
+    ///                    (the walk writes every slot 1..cp_count before any
+    ///                    read; reads are confined to written slots by the
+    ///                    same guards the real entry uses) — isolates the
+    ///                    4 KiB zero-init if the compiler emits one for
+    ///                    `[0u32; 1024]`
+    /// Correctness gate BEFORE timing: the real entry and both replicas must
+    /// agree, and the fixture must resolve to a name at all — a malformed
+    /// fixture that silently resolves to `None` would bench the walk plus a
+    /// failure tail instead of the extraction (the trap this round found in
+    /// the pre-207 representative_class).
+    #[test]
+    #[ignore]
+    fn bench_cflh_stages_iso() {
+        use std::hint::black_box;
+        let data = representative_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let real = class_file_name(&data);
+        let repl = cflh_replica(&data);
+        let repl_noinit = cflh_replica_noinit(&data);
+        println!(
+            "cflh fixture gate: real={real:?} replica={repl:?} noinit={repl_noinit:?}"
+        );
+        assert_eq!(real, repl, "replica must agree with the real entry");
+        assert_eq!(real, repl_noinit, "noinit replica must agree");
+        assert!(real.is_some(), "fixture must be a VALID class (name resolves)");
+
+        fn time(label: &str, rounds: u32, iters: u32, mut f: impl FnMut()) {
+            for _ in 0..10_000u32 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            println!(
+                "BENCH cflh stage {label}: {:.0} ns/op (min of {rounds}x{iters})",
+                best * 1e9
+            );
+        }
+
+        time("e2e", rounds, iters, || {
+            black_box(class_file_name(black_box(&data)));
+        });
+        time("walk", rounds, iters, || {
+            black_box(cflh_walk_only(black_box(&data)));
+        });
+        time("walk+offs", rounds, iters, || {
+            black_box(cflh_walk_offs(black_box(&data)));
+        });
+        time("e2e-noinit", rounds, iters, || {
+            black_box(cflh_replica_noinit(black_box(&data)));
+        });
+    }
+
+    /// Pass-1 replica: step the pool exactly like `class_file_name` does,
+    /// recording nothing and resolving nothing. Returns the pool-end offset.
+    fn cflh_walk_only(data: &[u8]) -> Option<usize> {
+        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        let u16_at = |i: usize| -> Option<u16> {
+            if i + 2 > data.len() {
+                return None;
+            }
+            Some(u16::from_be_bytes([data[i], data[i + 1]]))
+        };
+        let cp_count = u16_at(8)? as usize;
+        if cp_count == 0 {
+            return None;
+        }
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            let tag = *data.get(idx)?;
+            idx += match tag {
+                1 => 3 + u16_at(idx + 1)? as usize,
+                7 | 8 | 16 | 19 | 20 => 3,
+                15 => 4,
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
+                5 | 6 => 9,
+                _ => return None,
+            };
+            i += match tag {
+                5 | 6 => 2,
+                _ => 1,
+            };
+        }
+        Some(idx)
+    }
+
+    /// Pass-1 replica WITH the offs-table stores (verbatim `[0u32; 1024]`
+    /// zeroed table like the real entry), no resolution tail.
+    fn cflh_walk_offs(data: &[u8]) -> Option<usize> {
+        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        let u16_at = |i: usize| -> Option<u16> {
+            if i + 2 > data.len() {
+                return None;
+            }
+            Some(u16::from_be_bytes([data[i], data[i + 1]]))
+        };
+        let cp_count = u16_at(8)? as usize;
+        if cp_count == 0 {
+            return None;
+        }
+        if cp_count > 1024 {
+            return None; // bench fixture stays under the table cap
+        }
+        let mut offs = [0u32; 1024];
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            offs[i] = idx as u32;
+            let tag = *data.get(idx)?;
+            idx += match tag {
+                1 => 3 + u16_at(idx + 1)? as usize,
+                7 | 8 | 16 | 19 | 20 => 3,
+                15 => 4,
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
+                5 | 6 => 9,
+                _ => return None,
+            };
+            i += match tag {
+                5 | 6 => 2,
+                _ => 1,
+            };
+        }
+        Some(idx)
+    }
+
+    /// Full verbatim replica of `class_file_name` (zeroed offs table).
+    fn cflh_replica(data: &[u8]) -> Option<&str> {
+        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        let u16_at = |i: usize| -> Option<u16> {
+            if i + 2 > data.len() {
+                return None;
+            }
+            Some(u16::from_be_bytes([data[i], data[i + 1]]))
+        };
+        let cp_count = u16_at(8)? as usize;
+        if cp_count == 0 || cp_count > 1024 {
+            return None;
+        }
+        let mut offs = [0u32; 1024];
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            offs[i] = idx as u32;
+            let tag = *data.get(idx)?;
+            idx += match tag {
+                1 => 3 + u16_at(idx + 1)? as usize,
+                7 | 8 | 16 | 19 | 20 => 3,
+                15 => 4,
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
+                5 | 6 => 9,
+                _ => return None,
+            };
+            i += match tag {
+                5 | 6 => 2,
+                _ => 1,
+            };
+        }
+        let this_idx = u16_at(idx + 2)? as usize;
+        if this_idx == 0 || this_idx >= cp_count {
+            return None;
+        }
+        let cat = offs[this_idx] as usize;
+        if *data.get(cat)? != 7 {
+            return None;
+        }
+        let name_idx = u16_at(cat + 1)? as usize;
+        if name_idx == 0 || name_idx >= cp_count {
+            return None;
+        }
+        let nat = offs[name_idx] as usize;
+        if *data.get(nat)? != 1 {
+            return None;
+        }
+        let len = u16_at(nat + 1)? as usize;
+        let start = nat + 3;
+        if start + len > data.len() {
+            return None;
+        }
+        std::str::from_utf8(&data[start..start + len]).ok()
+    }
+
+    /// Full replica of `class_file_name` with the offs table as
+    /// `MaybeUninit` — identical walk and tail, but no 4 KiB zero-init.
+    /// Soundness: the walk writes offs[1..cp_count] before the tail reads;
+    /// the tail reads only offs[this_idx] and offs[name_idx] with both
+    /// indices guarded to `1..cp_count` exactly like the real entry (offs[0]
+    /// is never read — `this_idx == 0` is rejected first).
+    fn cflh_replica_noinit(data: &[u8]) -> Option<&str> {
+        use std::mem::MaybeUninit;
+        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        let u16_at = |i: usize| -> Option<u16> {
+            if i + 2 > data.len() {
+                return None;
+            }
+            Some(u16::from_be_bytes([data[i], data[i + 1]]))
+        };
+        let cp_count = u16_at(8)? as usize;
+        if cp_count == 0 || cp_count > 1024 {
+            return None;
+        }
+        let mut offs: [MaybeUninit<u32>; 1024] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut idx = 10usize;
+        let mut i = 1usize;
+        while i < cp_count {
+            offs[i] = MaybeUninit::new(idx as u32);
+            let tag = *data.get(idx)?;
+            idx += match tag {
+                1 => 3 + u16_at(idx + 1)? as usize,
+                7 | 8 | 16 | 19 | 20 => 3,
+                15 => 4,
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
+                5 | 6 => 9,
+                _ => return None,
+            };
+            i += match tag {
+                5 | 6 => 2,
+                _ => 1,
+            };
+        }
+        let this_idx = u16_at(idx + 2)? as usize;
+        if this_idx == 0 || this_idx >= cp_count {
+            return None;
+        }
+        let cat = unsafe { offs[this_idx].assume_init() } as usize;
+        if *data.get(cat)? != 7 {
+            return None;
+        }
+        let name_idx = u16_at(cat + 1)? as usize;
+        if name_idx == 0 || name_idx >= cp_count {
+            return None;
+        }
+        let nat = unsafe { offs[name_idx].assume_init() } as usize;
+        if *data.get(nat)? != 1 {
+            return None;
+        }
+        let len = u16_at(nat + 1)? as usize;
+        let start = nat + 3;
+        if start + len > data.len() {
+            return None;
+        }
+        std::str::from_utf8(&data[start..start + len]).ok()
     }
 
     #[test]
