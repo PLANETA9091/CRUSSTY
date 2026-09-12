@@ -1617,6 +1617,221 @@ mod tests {
         );
     }
 
+    /// TASK-211 decomposition: the c_publish parse term (fast path
+    /// 142-148 ns in the delivery-iso split) is the LAST >100 ns hot-path
+    /// term with no internal mechanism split — TASK-193 landed the
+    /// scanner + the parity corpus but priced parse as ONE number. Arms
+    /// (min of 5x200k; drop included wherever a Value/String is built,
+    /// matching the e2e shape):
+    ///   e2e_fast       — verbatim c_publish_parse(fixture): scan +
+    ///                    construct + drop
+    ///   scan_only      — fold-replica of the scanner's accept-path
+    ///                    control flow (scan_flat_object + scan_leaf for
+    ///                    the fixture's leaf class): walks the SAME bytes
+    ///                    with the same bounds checks, folds accepted
+    ///                    payload bytes into a u64 — NO Value built, NO
+    ///                    allocation. The input goes through black_box
+    ///                    per iteration so LLVM cannot constant-fold the
+    ///                    walk (the TASK-209 phantom-term lesson). The
+    ///                    replica prices the ACCEPT path only — the
+    ///                    rejection subtleties (leading zeros, bare '-',
+    ///                    non-integer leaves) are not replicated; they
+    ///                    cost nothing on the accepted shape.
+    ///   construct_only — verbatim fixture Value built directly
+    ///                    (Map::new + two owned key Strings + two
+    ///                    Numbers), dropped per iteration — construct +
+    ///                    drop with zero scanning.
+    ///   strings_only   — the two owned key Strings built+dropped per
+    ///                    iteration: prices the key malloc/free pairs.
+    ///   map_only       — Map::new + two Number inserts + Value wrap
+    ///                    with the SAME empty key (no key mallocs; the
+    ///                    second insert is the in-place value update, so
+    ///                    the walk is two inserts and the ONLY malloc is
+    ///                    the BTreeMap node): prices node alloc/free +
+    ///                    insert machinery + wrap + drop.
+    ///   serde_direct   — the fallback arm, context line.
+    /// Gates asserted BEFORE any timing: (1) PARITY — the fast path's
+    /// Value equals serde's on the fixture; (2) replica agreement — the
+    /// fold-replica folds exactly the alphanumeric bytes of the fixture
+    /// (independent runtime sum, not a hand constant); (3) construct
+    /// equality — construct_only's Value equals the fast path's. Sum
+    /// checks printed: scan + construct vs e2e; strings + map vs
+    /// construct.
+    #[test]
+    #[ignore]
+    fn bench_c_publish_parse_stages_iso() {
+        let payload = "{\"tick\":1,\"drained\":0}";
+
+        // Walk-replica of the scanner's accept path: fold instead of
+        // alloc. Bench-only (not production code): prices the fixture's
+        // scan — key spans via the scan_string_at walk (b.get bounds
+        // check per byte), integer leaves via the scan_leaf digit walk
+        // with the same structural-terminator check.
+        fn scan_fold_replica(s: &str) -> Option<u64> {
+            let b = s.as_bytes();
+            if b.len() < 2 || b[b.len() - 1] != b'}' {
+                return None;
+            }
+            let mut fold = 0u64;
+            let mut i = 1usize;
+            if b[i] == b'}' {
+                return Some(fold);
+            }
+            loop {
+                if b[i] != b'"' {
+                    return None;
+                }
+                let start = i + 1;
+                let mut j = start;
+                loop {
+                    let c = *b.get(j)?;
+                    if c == b'"' {
+                        break;
+                    }
+                    if c == b'\\' || c < 0x20 {
+                        return None;
+                    }
+                    fold = fold.wrapping_add(u64::from(c));
+                    j += 1;
+                }
+                i = j + 1;
+                if b.get(i) != Some(&b':') {
+                    return None;
+                }
+                i += 1;
+                match b[i] {
+                    b'-' | b'0'..=b'9' => {
+                        let mut j = i;
+                        if b[j] == b'-' {
+                            j += 1;
+                        }
+                        while j < b.len() && b[j].is_ascii_digit() {
+                            fold = fold.wrapping_add(u64::from(b[j]));
+                            j += 1;
+                        }
+                        match b.get(j) {
+                            None | Some(b',') | Some(b'}') | Some(b']') => {}
+                            _ => return None,
+                        }
+                        i = j;
+                    }
+                    _ => return None,
+                }
+                match b.get(i) {
+                    Some(b',') => i += 1,
+                    Some(b'}') => return Some(fold),
+                    _ => return None,
+                }
+            }
+        }
+
+        // Construct replica: the exact fixture Value, no scanning.
+        fn construct_fixture_value() -> Value {
+            let mut map = serde_json::Map::new();
+            map.insert(String::from("tick"), serde_json::Number::from(1u64).into());
+            map.insert(
+                String::from("drained"),
+                serde_json::Number::from(0u64).into(),
+            );
+            Value::Object(map)
+        }
+
+        // Gate 1: parity (the TASK-193 contract on the bench shape).
+        let fast = parse_payload_fast(payload).expect("fast path misses the bench shape");
+        let via_serde = serde_json::from_str::<Value>(payload).unwrap_or(Value::Null);
+        assert_eq!(fast, via_serde, "fast path diverged from serde on the bench shape");
+        // Gate 2: the fold-replica folds exactly the alphanumeric bytes.
+        let expected: u64 = payload
+            .bytes()
+            .filter(|b| b.is_ascii_alphanumeric())
+            .map(u64::from)
+            .sum();
+        assert_eq!(
+            scan_fold_replica(payload),
+            Some(expected),
+            "fold-replica does not agree with the independent byte sum"
+        );
+        // Gate 3: the construct replica equals the fast path's Value.
+        assert_eq!(
+            construct_fixture_value(),
+            fast,
+            "construct replica diverges from the fast path"
+        );
+
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let mut best_e2e = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(c_publish_parse(payload));
+            }
+            best_e2e = best_e2e.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_scan = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(scan_fold_replica(black_box(payload)));
+            }
+            best_scan = best_scan.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_construct = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(construct_fixture_value());
+            }
+            best_construct = best_construct.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_strings = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(String::from("tick"));
+                black_box(String::from("drained"));
+            }
+            best_strings = best_strings.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_map = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut m = serde_json::Map::new();
+                m.insert(String::new(), serde_json::Number::from(1u64).into());
+                m.insert(String::new(), serde_json::Number::from(0u64).into());
+                black_box(Value::Object(m));
+            }
+            best_map = best_map.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_serde = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(serde_json::from_str::<Value>(payload).unwrap_or(Value::Null));
+            }
+            best_serde = best_serde.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH c_publish_parse_stages: e2e_fast {:.0} = scan {:.0} + construct {:.0} (sum {:.0}); construct = strings {:.0} + map {:.0} (sum {:.0}); serde-direct {:.0} ns/op (min of {rounds}x{iters})",
+            best_e2e * 1e9,
+            best_scan * 1e9,
+            best_construct * 1e9,
+            (best_scan + best_construct) * 1e9,
+            best_strings * 1e9,
+            best_map * 1e9,
+            (best_strings + best_map) * 1e9,
+            best_serde * 1e9
+        );
+    }
+
     /// TASK-180: C telemetry entry state-independent contract. These two
     /// asserts hold regardless of the metric list state (parallel test
     /// processes may have it empty, partially filled or full): an empty
