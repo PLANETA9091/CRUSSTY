@@ -36,6 +36,23 @@ pub const CPB_VERSION: u32 = 1;
 /// unobservable without subscribers (publish drops it untouched).
 pub const C_ENTRY_PREGATE: bool = true;
 
+/// TASK-203 A/B toggle: gate-FIRST ordering for the C events publish
+/// entry — the TASK-179 gate runs BEFORE the event string is
+/// materialized, so the zero-subscriber steady state (the per-tick
+/// default shape) skips the cstr walk entirely (strlen + UTF-8
+/// validation): the entry is one global_ref + ONE acquire load + return
+/// 0. Implies C_ENTRY_PREGATE (the gate itself is unchanged; only its
+/// position moves). `false` = the verbatim pre-TASK-203 ordering
+/// (cstr -> empty-check -> gate), kept as the A/B arm. Semantics are
+/// identical in both states: behind the firing gate the entry returns 0 —
+/// the same 0 the old shape returned there for empty AND non-empty
+/// events (no dispatch runs; the payload and the event bytes are
+/// unobservable without subscribers — the same no-new-guarantee argument
+/// TASK-179 documents; a subscribe racing the window may or may not
+/// observe the call, the gate only shortens it, now a few ns earlier).
+/// A/B: bench_c_publish_gfirst_ab.
+pub const C_ENTRY_PREGATE_FIRST: bool = true;
+
 /// TASK-180 A/B toggle: gate the C telemetry entry's labels parse behind the
 /// metrics-full check. `false` = pre-TASK-180 shape (labels always parsed;
 /// publish_metric then drops the metric when the list is at MAX_METRICS).
@@ -371,6 +388,43 @@ fn scan_flat_array(s: &str) -> Option<Value> {
 }
 
 unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const c_char) -> usize {
+    // TASK-203: gate-first ordering (C_ENTRY_PREGATE_FIRST). With the
+    // toggle on, the TASK-179 gate consumes the event pointer FIRST —
+    // the zero-subscriber steady state never walks the event string.
+    // The fall-through body is the pre-203 shape minus the now-redundant
+    // second gate load (publish's own fast gate still re-reads gens).
+    if C_ENTRY_PREGATE_FIRST {
+        // Borrowed global handle (TASK-163 pattern): the owned global()
+        // clone costs ~5 Arc refcount pairs per call — hot C publishes
+        // pay it for nothing, the &'static handle serves gate and publish
+        // alike.
+        let bus = events::global_ref();
+        // TASK-179 pre-parse gate, TASK-203 position: when nothing was
+        // ever subscribed, publish() would drop the payload untouched and
+        // return 0 — skip the cstr walk AND the JSON parse entirely. Same
+        // acquire load publish's own fast gate uses; semantics identical
+        // (return 0 here matches the old shape's 0 for empty and
+        // non-empty events alike — nothing behind the gate is
+        // observable), the race window shortens exactly like the
+        // in-publish gate does.
+        if !bus.may_have_subscribers() {
+            return 0;
+        }
+        let event = cstr(event);
+        if event.is_empty() {
+            return 0;
+        }
+        let payload: Value = if payload_json.is_null() {
+            Value::Null
+        } else {
+            // TASK-193: fast path for the flat producer shapes, serde
+            // fallback for everything else — same Value in every case
+            // (see C_PUBLISH_FASTPARSE for the parity argument).
+            c_publish_parse(cstr(payload_json))
+        };
+        return bus.publish(event, &payload);
+    }
+    // Verbatim pre-TASK-203 shape (C_ENTRY_PREGATE_FIRST = false arm).
     let event = cstr(event);
     if event.is_empty() {
         return 0;
@@ -1162,6 +1216,161 @@ mod tests {
             "BENCH c_publish: c_publish(no subs) {:.0} ns/op, c_publish(1 sync sub) {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_sync * 1e9
+        );
+    }
+
+    /// TASK-203 A/B subject: the C events publish entry's gate-vs-cstr
+    /// ordering. Arm A = the verbatim pre-203 shape replicated locally
+    /// (cstr -> empty-check -> gate -> parse -> publish); arm B = the
+    /// REAL entry (C_ENTRY_PREGATE_FIRST = true: gate -> cstr ->
+    /// empty-check -> parse -> publish). Line 1 is the zero-subscriber
+    /// steady state (the per-tick default shape; requires a fresh global
+    /// bus — hence a filtered SOLO run, gens == 0; the "gfirst" filter
+    /// matches only this bench). NAMED to sort after bench_c_events_
+    /// publish: this bench's subscribe/unsubscribe cycle leaves the
+    /// global gens nonzero forever, and bench_c_events_publish's no-subs
+    /// line is the one ledger line that needs a never-subscribed bus —
+    /// this bench must never run before it in a shared sweep. Line 2 is
+    /// the one-sync-subscriber control: both arms parse and dispatch
+    /// there, so the pair must match within noise — the reorder must not
+    /// tax the with-subscriber path.
+    #[test]
+    #[ignore]
+    fn bench_c_publish_gfirst_ab() {
+        // Arm A: the pre-TASK-203 entry body, verbatim.
+        #[inline(never)]
+        unsafe fn arm_a_pre203(event: *const c_char, payload_json: *const c_char) -> usize {
+            let event = cstr(event);
+            if event.is_empty() {
+                return 0;
+            }
+            let bus = events::global_ref();
+            if C_ENTRY_PREGATE && !bus.may_have_subscribers() {
+                return 0;
+            }
+            let payload: Value = if payload_json.is_null() {
+                Value::Null
+            } else {
+                c_publish_parse(cstr(payload_json))
+            };
+            bus.publish(event, &payload)
+        }
+
+        let ev = CString::new("c.bench.gfirst").unwrap();
+        let pj = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // line 1: zero subscribers on the global bus (fresh in a solo run)
+        let mut lines = [(f64::MAX, f64::MAX); 2]; // (arm A, arm B) per line
+        for _ in 0..10_000u32 {
+            black_box(unsafe { arm_a_pre203(ev.as_ptr(), pj.as_ptr()) });
+            black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+        }
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { arm_a_pre203(ev.as_ptr(), pj.as_ptr()) });
+            }
+            lines[0].0 = lines[0].0.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+            }
+            lines[0].1 = lines[0].1.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // line 2: one sync subscriber — the parse + dispatch control
+        let sub = events::global().subscribe("c.bench.gfirst", Arc::new(|_, _| {}));
+        for _ in 0..10_000u32 {
+            black_box(unsafe { arm_a_pre203(ev.as_ptr(), pj.as_ptr()) });
+            black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+        }
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { arm_a_pre203(ev.as_ptr(), pj.as_ptr()) });
+            }
+            lines[1].0 = lines[1].0.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+            }
+            lines[1].1 = lines[1].1.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.gfirst", &sub);
+
+        println!(
+            "BENCH c_publish_gfirst_ab: no-subs pre-203 {:.0} vs gate-first {:.0} ns/op; 1-sync-sub pre-203 {:.0} vs gate-first {:.0} ns/op (min of {rounds}x{iters})",
+            lines[0].0 * 1e9,
+            lines[0].1 * 1e9,
+            lines[1].0 * 1e9,
+            lines[1].1 * 1e9,
+        );
+    }
+
+    /// TASK-203 in-suite contract: the gate-first ordering preserves the
+    /// C publish entry's observable contract in every state reachable
+    /// from a parallel suite run. State-INDEPENDENT lines (no assumption
+    /// about other tests' subscriptions on the global bus): a NULL event
+    /// and an empty event return 0 with AND without subscribers (behind
+    /// the firing gate the return is 0; on the fall-through path the
+    /// empty-check returns 0). The state-DEPENDENT lines use a UNIQUE
+    /// event name owned by this test: one sync subscriber -> 1, NULL
+    /// payload -> 1, malformed payload -> 1 (the TASK-193 fallback
+    /// parses to Value::Null and dispatch still runs), an empty event
+    /// name while subscribed -> 0, and after unsubscribe -> 0 (the gens
+    /// bump invalidates the dispatch memo). The empty-name-with-subs
+    /// line is the ordering-critical one: the gate must FALL THROUGH to
+    /// the empty-check when subscribers exist.
+    #[test]
+    fn c_events_pregate_first_contract() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let ev = CString::new("c.bench.gfirst.contract").unwrap();
+        let pj = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+
+        // state-independent: empty / NULL events are 0 in any bus state
+        assert_eq!(unsafe { n_events_publish(std::ptr::null(), pj.as_ptr()) }, 0);
+        assert_eq!(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) }, 0);
+
+        // state-dependent, unique name: the full dispatch path
+        let sub = events::global().subscribe("c.bench.gfirst.contract", Arc::new(|_, _| {}));
+        assert_eq!(
+            unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) },
+            1,
+            "one sync subscriber must be invoked"
+        );
+        assert_eq!(
+            unsafe { n_events_publish(ev.as_ptr(), std::ptr::null()) },
+            1,
+            "NULL payload publishes as Value::Null"
+        );
+        let bad = CString::new("{not json").unwrap();
+        assert_eq!(
+            unsafe { n_events_publish(ev.as_ptr(), bad.as_ptr()) },
+            1,
+            "malformed payload falls back to Null and dispatches"
+        );
+        assert_eq!(
+            unsafe { n_events_publish(std::ptr::null(), pj.as_ptr()) },
+            0,
+            "NULL event stays 0 while subscribers exist"
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { n_events_publish(empty.as_ptr(), pj.as_ptr()) },
+            0,
+            "empty event name stays 0 while subscribers exist (the gate must fall through to the empty-check)"
+        );
+        assert!(
+            events::global().unsubscribe("c.bench.gfirst.contract", &sub),
+            "unsubscribe must remove the test's own subscription"
+        );
+        assert_eq!(
+            unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) },
+            0,
+            "after unsubscribe the unique name dispatches nothing"
         );
     }
 
