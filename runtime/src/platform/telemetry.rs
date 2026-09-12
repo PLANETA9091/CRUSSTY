@@ -140,17 +140,88 @@ fn bump_snapshot_gen() {
 /// (never hand-rolled), so the cache-hit output is byte-identical to a
 /// fresh serialize as long as the content generation is unchanged. The
 /// live value (tps, ring-fed, changes per call in production) is patched
-/// between the two ranges at read time; `tps_buf`/`scratch_a`/`scratch_b`
-/// are reused so neither the hit nor the dirty path allocates in the
-/// steady state.
+/// between the two ranges at read time from the TASK-198 tps memo;
+/// `scratch_a`/`scratch_b` are reused so the dirty path does not
+/// allocate in the steady state either.
 struct SnapshotJsonCache {
     gen: u64,
     prefix: Vec<u8>,
     suffix: Vec<u8>,
-    tps_buf: Vec<u8>,
+    /// TASK-198: incremental 60s-window tps accumulator + cached serde
+    /// bytes for the live tps value (see [`TpsMemo`]). Replaces the
+    /// TASK-194 `tps_buf` — the per-hit serde f64 format it served is
+    /// gone from the steady-state read path entirely.
+    tps_memo: TpsMemo,
     scratch_a: Vec<u8>,
     scratch_b: Vec<u8>,
     valid: bool,
+}
+
+/// TASK-198: incremental state for the live tps on the snapshot READ path.
+///
+/// WHY: the landed snapshot_json lines are an empty-ring shape — the bench
+/// never pushes ticks, so `ring_tps()` returns None after one load. In
+/// production the per-tick path feeds the ring and `ring_tps()` scans up
+/// to RING_CAP (4096) slots per read (measured 1290 ns/op warm vs the
+/// landed 92 ns line): the TASK-194 cache win is masked behind that scan
+/// plus a per-read serde f64 format.
+///
+/// VALUE CONTRACT: the memo serves EXACTLY the verbatim expression
+/// `ring_tps().unwrap_or_else(current_tps)`:
+/// - Under monotone ingest (the epoch contract: one clock form per
+///   process on the per-tick path; TSC and vDSO monotone) the in-window
+///   population is a contiguous suffix of push order, so an
+///   add-on-consume + forward-evict-cursor accumulator reproduces the
+///   backward scan's (sum, n) exactly; the tps formula is applied to the
+///   same integers, so the f64 bits match.
+/// - Any anomaly (torn slot read, ts regression/dip = clock-form switch,
+///   ring reset, cursor lap past RING_CAP) forces a VERBATIM rebuild —
+///   the rebuild loop is a byte-for-byte clone of `ring_tps()`'s scan,
+///   so it is exact for arbitrary ring content.
+/// - The fallback arm (ring empty / newest sample in flight) serves
+///   `current_tps()` keyed on `TPS_LAST_BITS` — the same
+///   `unwrap_or_else` shape.
+/// - RACE CLASS (documented, not eliminated): with multiple concurrent
+///   producers a slot may be observed in flight (ts store not landed);
+///   the memo consumes the contiguous oldest written run while the
+///   verbatim scan consumes the contiguous newest one. Single-producer
+///   ingest (the production scheduler boundary thread) is exact; the
+///   multi-producer transient differs by in-flight samples — the same
+///   nondeterminism class the scan's own torn-guard exhibits.
+/// - THROUGHPUT BOUND: the cursor guards force a verbatim rebuild once
+///   the 60s window no longer fits the ring (>~68 ticks/s sustained).
+///   Beyond the bound the memo is cost-neutral (one scan per read, same
+///   as the verbatim shape), never worse.
+///
+/// The memo lives INSIDE the cache struct: one lock, one leaf, and the
+/// steady-state resolve is two atomic loads + two integer compares.
+struct TpsMemo {
+    /// false = next resolve must rebuild (anomaly or first use).
+    valid: bool,
+    /// true = tps/bytes describe a ring-derived value; false = fallback
+    /// (bits-keyed) value.
+    ring_keyed: bool,
+    /// Fallback key: TPS_LAST_BITS at resolve time.
+    k_bits: u64,
+    /// Absolute push index consumed THROUGH (every issued push below this
+    /// is reflected in a_sum/a_n or deliberately skipped as in-flight).
+    a_head: u64,
+    /// Absolute push index of the oldest still-counted sample (evict
+    /// cursor; only moves forward).
+    a_evict: u64,
+    /// Sum of tick_ns over [a_evict, a_head).
+    a_sum: u64,
+    /// Count of samples over [a_evict, a_head).
+    a_n: u64,
+    /// Stored ts (+1 form) of the last consumed sample — monotonicity
+    /// sentinel for regression/dip detection.
+    last_ts: u64,
+    /// Resolved value (ring formula or fallback bits).
+    tps: f64,
+    /// serde-formatted bytes of `tps` (produced by serde itself, never
+    /// hand-rolled — the TASK-194 byte-identity discipline).
+    bytes_len: usize,
+    bytes: [u8; 40],
 }
 
 impl Default for SnapshotJsonCache {
@@ -159,7 +230,19 @@ impl Default for SnapshotJsonCache {
             gen: 0,
             prefix: Vec::new(),
             suffix: Vec::new(),
-            tps_buf: Vec::new(),
+            tps_memo: TpsMemo {
+                valid: false,
+                ring_keyed: false,
+                k_bits: 0,
+                a_head: 0,
+                a_evict: 0,
+                a_sum: 0,
+                a_n: 0,
+                last_ts: 0,
+                tps: 0.0,
+                bytes_len: 0,
+                bytes: [0; 40],
+            },
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
             valid: false,
@@ -167,14 +250,33 @@ impl Default for SnapshotJsonCache {
     }
 }
 
-/// Cache lock is a LEAF taken after the snapshot data lock (same discipline
-/// as the data lock itself: nothing it guards takes another lock). No other
-/// code touches this static.
+/// Cache lock discipline (TASK-198 revision): the cache lock is now taken
+/// FIRST (before the snapshot data lock) because the tps memo inside it
+/// must resolve without holding the data lock. Safety invariant: NOTHING
+/// that holds the data lock may acquire the cache lock — every mutator
+/// bumps SNAP_GEN with one atomic fetch_add while holding the data lock
+/// and never touches the cache, and no other site locks this static
+/// (grep-verified single acquisition point). So cache→data is the only
+/// nesting that exists and no inverse order can form. The cache lock
+/// itself remains a leaf (nothing it guards takes another lock besides
+/// the data lock edge above). No other code touches this static.
 static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache {
     gen: 0,
     prefix: Vec::new(),
     suffix: Vec::new(),
-    tps_buf: Vec::new(),
+    tps_memo: TpsMemo {
+        valid: false,
+        ring_keyed: false,
+        k_bits: 0,
+        a_head: 0,
+        a_evict: 0,
+        a_sum: 0,
+        a_n: 0,
+        last_ts: 0,
+        tps: 0.0,
+        bytes_len: 0,
+        bytes: [0; 40],
+    },
     scratch_a: Vec::new(),
     scratch_b: Vec::new(),
     valid: false,
@@ -293,31 +395,37 @@ pub fn metrics_full() -> bool {
 /// the C-entry test `telemetry_snapshot_inplace_byte_identical`.
 ///
 /// TPS contract identical to [`snapshot`]: the serialized value carries
-/// `ring_tps().unwrap_or(current_tps)`. The value is read BEFORE the data
-/// lock is taken (both sources are lock-free atomics — TASK-162/164). On
-/// the OFF path it is applied as a transient in-place override of the
-/// stored field under the lock and restored right after serialization (no
+/// `ring_tps().unwrap_or(current_tps)`. On the OFF path the value is read
+/// before the data lock and applied as a transient in-place override of
+/// the stored field under the lock, restored right after serialization (no
 /// lock holder can observe the override mid-call; the stored field has no
 /// reader that does not override it). On the ON path the stored field is
-/// never read or written at all — the fresh tps is patched into the cached
-/// byte ranges, and the cache fill itself serializes with tps overridden
-/// to 0.0/1.0 (restored immediately), so the stored value is never baked
-/// into the cache either.
+/// never read or written at all — the TASK-198 tps memo resolves the SAME
+/// value (bit-identical under the monotone-ingest epoch contract; any
+/// anomaly falls back to a verbatim [`ring_tps`] rebuild — see the
+/// [`TpsMemo`] contract) together with its serde-formatted bytes, so the
+/// steady-state read pays NO ring scan and NO f64 format; the cached
+/// bytes are patched into the cached ranges, and the cache fill itself
+/// serializes with tps overridden to 0.0/1.0 (restored immediately), so
+/// the stored value is never baked into the cache either.
 ///
-/// Lock ordering: snapshot data lock first, then the cache lock (a leaf —
-/// nothing it guards takes another lock); the caller may hold its own
-/// buffer mutex around this with no inverse order anywhere. The ring scan
-/// that may run under the data lock is the bounded lock-free RING_CAP
-/// loop, not a mutex. Single call site (the C entry); #[inline(never)]
-/// keeps the serializer out of the caller's code region (TASK-181).
+/// Lock ordering (TASK-198 revision): cache lock FIRST (it holds the tps
+/// memo that must resolve lock-free of the data lock), then the snapshot
+/// data lock. Safety: nothing that holds the data lock ever acquires the
+/// cache lock (mutators only bump SNAP_GEN; single acquisition point —
+/// see the note on [`SNAP_JSON_CACHE`]). The ring reads inside the memo
+/// are the bounded lock-free RING_CAP loop, never a mutex. The caller may
+/// hold its own buffer mutex around this with no inverse order anywhere.
+/// Single call site (the C entry); #[inline(never)] keeps the serializer
+/// out of the caller's code region (TASK-181).
 #[inline(never)]
 #[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
 pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
-    let tps = ring_tps().unwrap_or_else(current_tps);
-    let snap = snapshot_arc();
-    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     if !TELEM_SNAP_CACHE {
         // Pre-TASK-194 shape, kept verbatim for the A/B toggle.
+        let tps = ring_tps().unwrap_or_else(current_tps);
+        let snap = snapshot_arc();
+        let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
         let saved = s.tps;
         s.tps = tps;
         let res = serde_json::to_writer(&mut *out, &*s);
@@ -330,35 +438,49 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
         }
         return;
     }
-    // TASK-194: generation-gated cache. The gen load happens under the
-    // data lock, and every mutator bumps the gen while holding the same
-    // lock, so the comparison cannot race a mutation. The struct
-    // destructure splits the field borrows (the borrow checker cannot
-    // prove disjointness through `cache.field` alone inside one fn).
-    let gen = SNAP_GEN.load(Ordering::Relaxed);
+    // TASK-194: generation-gated cache; TASK-198: cache lock first, then
+    // the tps memo resolve, then the data lock (ordering rationale on
+    // SNAP_JSON_CACHE). The struct destructure splits the field borrows
+    // (the borrow checker cannot prove disjointness through
+    // `cache.field` alone inside one fn).
     let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     let SnapshotJsonCache {
         gen: cached_gen,
         valid: cached_valid,
         prefix,
         suffix,
-        tps_buf,
+        tps_memo,
         scratch_a,
         scratch_b,
     } = &mut *cache;
-    if *cached_valid && *cached_gen == gen {
-        tps_buf.clear();
-        if serde_json::to_writer(&mut *tps_buf, &tps).is_ok() {
-            out.extend_from_slice(prefix);
-            out.extend_from_slice(tps_buf);
-            out.extend_from_slice(suffix);
-            return;
-        }
-        // Unreachable (f64 serialization is infallible): fall through and
-        // rebuild from scratch.
+    // Resolve the live tps + its serde bytes (steady state: zero ring
+    // scan, zero format — two loads + compares). Byte-identical to the
+    // verbatim expression by the TpsMemo value contract.
+    if !tps_memo_resolve(tps_memo) {
+        // Unreachable (f64 serialization is infallible): serve the legacy
+        // `{}` fallback and invalidate both layers so the next call retries.
+        tps_memo.valid = false;
+        *cached_valid = false;
+        out.clear();
+        out.extend_from_slice(b"{}");
+        return;
     }
-    // Dirty (first call, generation bump, or unreachable fallback):
-    // rebuild the prefix/suffix pair from the locked snapshot.
+    let tps_bytes_len = tps_memo.bytes_len;
+    let tps_bytes = &tps_memo.bytes[..tps_bytes_len];
+    let snap = snapshot_arc();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+    // The gen load happens under the data lock, and every mutator bumps
+    // the gen while holding the same lock, so the comparison cannot race
+    // a mutation.
+    let gen = SNAP_GEN.load(Ordering::Relaxed);
+    if *cached_valid && *cached_gen == gen {
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(tps_bytes);
+        out.extend_from_slice(suffix);
+        return;
+    }
+    // Dirty (first call or generation bump): rebuild the prefix/suffix
+    // pair from the locked snapshot.
     let saved = s.tps;
     s.tps = 0.0;
     scratch_a.clear();
@@ -384,16 +506,10 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
             *cached_gen = gen;
             *cached_valid = true;
             // Serve this call from the just-built cache (same assemble
-            // path as the hit branch).
-            tps_buf.clear();
-            if serde_json::to_writer(&mut *tps_buf, &tps).is_ok() {
-                out.extend_from_slice(prefix);
-                out.extend_from_slice(tps_buf);
-                out.extend_from_slice(suffix);
-                return;
-            }
-            out.clear();
-            out.extend_from_slice(b"{}");
+            // path as the hit branch; the tps bytes come from the memo).
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(tps_bytes);
+            out.extend_from_slice(suffix);
         }
         None => {
             // Unreachable: tps 0.0 vs 1.0 always differs at exactly one
@@ -434,6 +550,22 @@ fn split_tps_span(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
 pub(crate) fn test_reset_snapshot() {
     *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
     bump_snapshot_gen(); // TASK-194: the swap must invalidate the JSON cache
+}
+
+/// Test-only: zero the tick ring + the fallback tps bits (the same state
+/// the in-suite `reset_state` builds). The tps memo inside the JSON cache
+/// needs no explicit invalidation — its key (head / newest stored ts /
+/// fallback bits) cannot survive a zeroed ring, so the next read rebuilds.
+#[cfg(test)]
+pub(crate) fn test_reset_ring() {
+    RING_HEAD.store(0, Ordering::Relaxed);
+    for slot in RING_TS.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in RING_NS.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    TPS_LAST_BITS.store(0, Ordering::Relaxed);
 }
 
 /// Store the latest TPS (external callers; the per-tick path feeds the ring
@@ -604,6 +736,186 @@ mod bench_hotpath {
             best_after * 1e9
         );
     }
+
+    /// TASK-198 A/B: the tps resolve + format on the snapshot READ path.
+    ///
+    /// CONTEXT (the round's finding): the landed snapshot_json lines
+    /// (92 ns e2e / 124 ns direct) are an EMPTY-RING shape — the bench
+    /// never pushes ticks, so `ring_tps()` returns None after one load.
+    /// In production the per-tick path feeds the ring; `ring_tps()` then
+    /// scans RING_CAP (4096) slots per read with Acquire loads — the
+    /// TASK-194 cache win is silently masked behind a ~µs-scale scan.
+    ///
+    /// Arms (min of rounds x iters, solo):
+    /// - empty_e2e:      snapshot_json_write with an empty ring (the
+    ///                   landed-line shape, continuity).
+    /// - scan_warm:      VERBATIM pre-198 per-read resolve+format
+    ///                   (`ring_tps().unwrap_or_else(current_tps)` + serde
+    ///                   f64 format into a reused buffer) on a warm ring
+    ///                   (1400 fabricated monotone samples, 50 ms apart —
+    ///                   steady 20 tps, ~1200 in the 60 s window). This is
+    ///                   what every production panel read pays today.
+    /// - warm_e2e:       snapshot_json_write per read on the warm ring.
+    /// - tick_then_read: one push + one snapshot_json_write per iter — the
+    ///                   amortized production shape (a tick lands between
+    ///                   panel reads).
+    ///
+    /// The AFTER implementation (TASK-198 tps memo) must keep the resolved
+    /// value bit-identical to `ring_tps().unwrap_or_else(current_tps)` —
+    /// asserted in-suite by tps_memo parity tests, and the bench itself
+    /// re-asserts it against the scan arm before timing (phase 2).
+    #[test]
+    #[ignore]
+    fn bench_tps_memo_ab() {
+        test_reset_snapshot();
+        test_reset_ring();
+
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut buf = Vec::with_capacity(4096);
+
+        // ---- empty-ring e2e (landed-line shape, continuity) ----
+        for _ in 0..10_000u32 {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_empty = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf.clear();
+                snapshot_json_write(&mut buf);
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_empty = best_empty.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- warm ring: 1400 monotone fabricated samples, 50 ms apart ----
+        // ts in process-relative ns (the TSC epoch form); 0 = empty sentinel
+        // handled by push_tick_time_ts's +1 offset. 1400 x 50 ms = 70 s of
+        // history; the 60 s window keeps the newest ~1200.
+        for i in 0..1400u64 {
+            push_tick_time_ts(1_000_000_000 + i * 50_000_000, 50_000_000);
+        }
+
+        // ---- scan_warm: verbatim pre-198 resolve+format ----
+        let mut tps_buf = Vec::with_capacity(32);
+        let mut scan_value = 0.0f64;
+        for _ in 0..1_000u32 {
+            tps_buf.clear();
+            let tps = ring_tps().unwrap_or_else(current_tps);
+            scan_value = tps;
+            if serde_json::to_writer(&mut tps_buf, &tps).is_err() {
+                tps_buf.clear();
+                tps_buf.extend_from_slice(b"0");
+            }
+            std::hint::black_box(tps_buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_scan = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                tps_buf.clear();
+                let tps = ring_tps().unwrap_or_else(current_tps);
+                scan_value = tps;
+                if serde_json::to_writer(&mut tps_buf, &tps).is_err() {
+                    tps_buf.clear();
+                    tps_buf.extend_from_slice(b"0");
+                }
+                std::hint::black_box(tps_buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_scan = best_scan.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- memo arm (TASK-198): cache lock + tps memo resolve ----
+        // Parity canary first: the memo value must equal the scan arm's
+        // value bit-for-bit on this fabricated monotone feed.
+        {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                tps_memo_resolve(&mut cache.tps_memo),
+                "f64 format failed (unreachable)"
+            );
+            assert_eq!(
+                cache.tps_memo.tps.to_bits(),
+                scan_value.to_bits(),
+                "memo value diverged from the verbatim scan"
+            );
+        }
+        let mut memo_value = 0.0f64;
+        for _ in 0..1_000u32 {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            if tps_memo_resolve(&mut cache.tps_memo) {
+                memo_value = cache.tps_memo.tps;
+            }
+            std::hint::black_box(memo_value.to_bits());
+        }
+        let mut best_memo = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                if tps_memo_resolve(&mut cache.tps_memo) {
+                    memo_value = cache.tps_memo.tps;
+                }
+                std::hint::black_box(memo_value.to_bits());
+            }
+            best_memo = best_memo.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- warm_e2e: snapshot_json_write on the warm ring ----
+        for _ in 0..10_000u32 {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_warm = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf.clear();
+                snapshot_json_write(&mut buf);
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_warm = best_warm.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- tick_then_read: push 1 + read 1 per iter ----
+        let mut tick_ts = 1_000_000_000 + 1400 * 50_000_000;
+        for _ in 0..10_000u32 {
+            tick_ts += 50_000_000;
+            push_tick_time_ts(tick_ts, 50_000_000);
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_ttr = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                tick_ts += 50_000_000;
+                push_tick_time_ts(tick_ts, 50_000_000);
+                buf.clear();
+                snapshot_json_write(&mut buf);
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_ttr = best_ttr.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // teardown: leave a clean state for whatever runs next (solo)
+        test_reset_ring();
+
+        println!(
+            "BENCH tps_memo A/B: empty_e2e {:.0} ns/op, scan_warm {:.0} ns/op (tps {:.2}), memo_warm {:.0} ns/op, warm_e2e {:.0} ns/op, tick_then_read {:.0} ns/op (min of {rounds}x{iters})",
+            best_empty * 1e9,
+            best_scan * 1e9,
+            scan_value,
+            best_memo * 1e9,
+            best_warm * 1e9,
+            best_ttr * 1e9
+        );
+    }
 }
 
 pub fn set_mem(used_mb: u64, max_mb: u64) {
@@ -717,6 +1029,242 @@ fn ring_tps() -> Option<f64> {
     }
     let avg_ms = sum as f64 / n as f64 / 1_000_000.0;
     Some(if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 })
+}
+
+// ---------------------------------------------------------------------------
+// TASK-198: tps memo — incremental 60s-window accumulator + cached serde
+// bytes for the snapshot read path. Value contract on [`TpsMemo`].
+// ---------------------------------------------------------------------------
+
+/// Resolve the live tps into `m` (value + serde-formatted bytes). Returns
+/// false only on the unreachable f64-format failure (the caller serves the
+/// legacy `{}` fallback and invalidates both cache layers).
+///
+/// Steady state: two relaxed/acquire loads + compares, zero ring scan,
+/// zero formatting. Slow states: bounded incremental advance + evict, or
+/// the verbatim rebuild (a clone of [`ring_tps`]'s scan — exact for
+/// arbitrary ring content).
+///
+/// Call discipline: caller holds the SNAP_JSON_CACHE lock (the memo is a
+/// field of the cache struct); the ring itself is lock-free.
+fn tps_memo_resolve(m: &mut TpsMemo) -> bool {
+    let head_now = RING_HEAD.load(Ordering::Relaxed);
+    let newest_stored = if head_now > 0 {
+        RING_TS[((head_now - 1) & (RING_CAP as u64 - 1)) as usize].load(Ordering::Acquire)
+    } else {
+        0
+    };
+    let ring_now = head_now > 0 && newest_stored != 0;
+    let bits_now = TPS_LAST_BITS.load(Ordering::Relaxed);
+
+    // Fast path 1: ring steady — no push since the last resolve, mode
+    // match. (a_head == head_now implies the newest slot was consumed;
+    // its stored value cannot change without a new push.)
+    if m.valid && ring_now && m.ring_keyed && m.a_head == head_now {
+        return true;
+    }
+    // Fast path 2: fallback steady (ring empty or newest in flight) —
+    // keyed on the fallback bits.
+    if m.valid && !ring_now && !m.ring_keyed && m.k_bits == bits_now {
+        return true;
+    }
+
+    if !ring_now {
+        // Fallback value, verbatim `unwrap_or_else(current_tps)` shape.
+        // The accumulator state is untouched: nothing changed the ring
+        // (a reset zeroes head/slots — caught below on the next ring
+        // read), so a later resume stays sound.
+        m.ring_keyed = false;
+        m.k_bits = bits_now;
+        m.tps = f64::from_bits(bits_now);
+        m.valid = true;
+        return tps_memo_format(m);
+    }
+
+    // Ring-derived value. Decide between the incremental resume and the
+    // verbatim rebuild.
+    let resume_ok = m.valid
+        && m.a_evict <= m.a_head
+        && m.a_head <= head_now
+        && head_now - m.a_head <= RING_CAP as u64
+        && head_now - m.a_evict <= RING_CAP as u64
+        && newest_stored >= m.last_ts;
+
+    if resume_ok {
+        let cutoff = (newest_stored - 1).saturating_sub(TPS_WINDOW_SECS * 1_000_000_000);
+        if tps_memo_advance(m, head_now, cutoff) && tps_memo_evict(m, cutoff) {
+            if m.a_head == head_now {
+                // Fully caught up: the monotonicity sentinel advances to
+                // the newest consumed sample. On an in-flight stop the
+                // sentinel stays at the last CONSUMED slot so the hole
+                // slots cannot trip the dip check on the retry.
+                m.last_ts = newest_stored;
+            }
+            m.ring_keyed = true;
+            m.tps = tps_formula(m.a_sum, m.a_n);
+            m.valid = true;
+            return tps_memo_format(m);
+        }
+        // anomaly (torn / dip): fall through to the verbatim rebuild
+    }
+
+    tps_memo_rebuild(m, head_now, newest_stored)
+}
+
+/// Consume new pushes [m.a_head, head_now) into the accumulator: add every
+/// written sample (window membership is enforced by the evict cursor —
+/// under monotone ingest membership is a contiguous suffix of push order,
+/// so a forward cursor reproduces the backward scan exactly). Stops at the
+/// first in-flight slot (ts store not landed) — the effective head stays
+/// there and a later resolve picks the sample up. Returns false on a torn
+/// read or a ts dip (caller rebuilds).
+fn tps_memo_advance(m: &mut TpsMemo, head_now: u64, cutoff: u64) -> bool {
+    let mask = RING_CAP as u64 - 1;
+    while m.a_head < head_now {
+        let idx = (m.a_head & mask) as usize;
+        let ts = RING_TS[idx].load(Ordering::Acquire);
+        if ts == 0 {
+            // In-flight push: consume up to here. The slot's ts is the
+            // only in-flight marker (ring_store writes NS before TS).
+            break;
+        }
+        let ns = RING_NS[idx].load(Ordering::Relaxed);
+        if RING_TS[idx].load(Ordering::Acquire) != ts || ts < m.last_ts {
+            // Torn (slot rewritten mid-read) or ts regression/dip
+            // (clock-form switch / non-monotone producer).
+            return false;
+        }
+        m.a_sum = m.a_sum.wrapping_add(ns);
+        m.a_n += 1;
+        m.a_head += 1;
+        m.last_ts = ts;
+        // Evict eagerly when the just-consumed sample is already outside
+        // the window (batch spanning > 60s between two reads): the cursor
+        // only moves forward, so membership stays a contiguous suffix.
+        while m.a_evict < m.a_head {
+            let e_idx = (m.a_evict & mask) as usize;
+            let e_ts = RING_TS[e_idx].load(Ordering::Acquire);
+            if e_ts == 0 || e_ts - 1 >= cutoff {
+                break;
+            }
+            let e_ns = RING_NS[e_idx].load(Ordering::Relaxed);
+            if RING_TS[e_idx].load(Ordering::Acquire) != e_ts {
+                return false;
+            }
+            m.a_sum = m.a_sum.wrapping_sub(e_ns);
+            m.a_n -= 1;
+            m.a_evict += 1;
+        }
+    }
+    true
+}
+
+/// Evict from the cursor while the oldest counted sample fell out of the
+/// window (cutoff advanced via the newest sample). Returns false on a torn
+/// read (caller rebuilds).
+fn tps_memo_evict(m: &mut TpsMemo, cutoff: u64) -> bool {
+    let mask = RING_CAP as u64 - 1;
+    while m.a_evict < m.a_head {
+        let idx = (m.a_evict & mask) as usize;
+        let ts = RING_TS[idx].load(Ordering::Acquire);
+        if ts == 0 || ts - 1 >= cutoff {
+            break;
+        }
+        let ns = RING_NS[idx].load(Ordering::Relaxed);
+        if RING_TS[idx].load(Ordering::Acquire) != ts {
+            return false;
+        }
+        m.a_sum = m.a_sum.wrapping_sub(ns);
+        m.a_n -= 1;
+        m.a_evict += 1;
+    }
+    true
+}
+
+/// Verbatim rebuild: a byte-for-byte clone of [`ring_tps`]'s backward scan
+/// (same guards, same window test) that additionally records the
+/// accumulator state. Exact for arbitrary ring content. All issued pushes
+/// are marked consumed (a_head = head_now): under the single-producer
+/// epoch contract every issued push's stores are visible to the backward
+/// Acquire walk (Release/Acquire propagation — a visible newer slot
+/// implies all older stores of the same producer), so the scan's break
+/// only fires on the never-issued tail or the documented multi-producer
+/// in-flight race class.
+fn tps_memo_rebuild(m: &mut TpsMemo, head_now: u64, newest_stored: u64) -> bool {
+    let mask = RING_CAP as u64 - 1;
+    let cutoff = (newest_stored - 1).saturating_sub(TPS_WINDOW_SECS * 1_000_000_000);
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    let mut oldest_kept = head_now;
+    for k in 0..RING_CAP {
+        let p = head_now.wrapping_sub(k as u64 + 1);
+        let i = (p & mask) as usize;
+        let ts = RING_TS[i].load(Ordering::Acquire);
+        if ts == 0 {
+            break; // never-written tail (partial ring) — nothing below is issued
+        }
+        if ts - 1 < cutoff {
+            continue;
+        }
+        let ns = RING_NS[i].load(Ordering::Relaxed);
+        if RING_TS[i].load(Ordering::Acquire) != ts {
+            continue;
+        }
+        sum += ns;
+        n += 1;
+        oldest_kept = p;
+    }
+    if n == 0 {
+        // The scan returns None here (defensive: the newest visible sample
+        // always passes the window test unless torn-skipped):
+        // fallback value, empty counted range.
+        m.a_head = head_now;
+        m.a_evict = head_now;
+        m.a_sum = 0;
+        m.a_n = 0;
+        m.last_ts = newest_stored;
+        m.ring_keyed = false;
+        m.k_bits = TPS_LAST_BITS.load(Ordering::Relaxed);
+        m.tps = f64::from_bits(m.k_bits);
+    } else {
+        m.a_head = head_now;
+        m.a_evict = oldest_kept;
+        m.a_sum = sum;
+        m.a_n = n;
+        m.last_ts = newest_stored;
+        m.ring_keyed = true;
+        m.tps = tps_formula(sum, n);
+    }
+    m.valid = true;
+    tps_memo_format(m)
+}
+
+/// The ring_tps tail, shared verbatim: tps = 1000 / avg_ms over the
+/// counted samples (0.0 for a non-positive average — unreachable for real
+/// tick durations).
+fn tps_formula(sum: u64, n: u64) -> f64 {
+    let avg_ms = sum as f64 / n as f64 / 1_000_000.0;
+    if avg_ms > 0.0 {
+        1000.0 / avg_ms
+    } else {
+        0.0
+    }
+}
+
+/// serde-format `m.tps` into the memo's fixed buffer (serde itself produces
+/// the bytes — never hand-rolled). Returns false on the unreachable format
+/// failure.
+fn tps_memo_format(m: &mut TpsMemo) -> bool {
+    let total = m.bytes.len();
+    let mut rest: &mut [u8] = &mut m.bytes[..];
+    let ok = serde_json::to_writer(&mut rest, &m.tps).is_ok();
+    if ok {
+        m.bytes_len = total - rest.len();
+    } else {
+        m.bytes_len = 0;
+        m.valid = false;
+    }
+    ok
 }
 
 /// Bind the telemetry socket and start the accept + refresh threads.
@@ -1079,6 +1627,139 @@ mod tests {
         }
         capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "cap overflow (drop, no bump)");
         assert_eq!(snapshot().metrics.len(), MAX_METRICS);
+    }
+
+    /// TASK-198 in-suite: the tps memo serves the verbatim
+    /// `ring_tps().unwrap_or_else(current_tps)` value through every state
+    /// transition — bits-keyed fallback, incremental advance (single +
+    /// batch), 61s eviction, ts dip (clock-form-switch guard -> verbatim
+    /// rebuild), ring reset, burst beyond RING_CAP (lap guard -> rebuild),
+    /// and the emptied-ring fallback. Full-JSON byte-identity against the
+    /// legacy expression (capture with stability probes, bounded retry —
+    /// the snapshot_json_cache_parity discipline) plus a bits assert
+    /// against a fresh scan.
+    #[test]
+    fn tps_memo_parity_and_states() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+
+        let legacy = |buf: &mut Vec<u8>| {
+            buf.clear();
+            let tps = ring_tps().unwrap_or_else(current_tps);
+            let snap = snapshot_arc();
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = s.tps;
+            s.tps = tps;
+            let res = serde_json::to_writer(&mut *buf, &*s);
+            s.tps = saved;
+            if res.is_err() {
+                buf.clear();
+                buf.extend_from_slice(b"{}");
+            }
+        };
+        fn probe() -> (u64, u64, u64) {
+            (
+                SNAP_GEN.load(Ordering::Relaxed),
+                RING_HEAD.load(Ordering::Relaxed),
+                TPS_LAST_BITS.load(Ordering::Relaxed),
+            )
+        }
+        fn capture(
+            legacy: &dyn Fn(&mut Vec<u8>),
+            legacy_buf: &mut Vec<u8>,
+            cached_buf: &mut Vec<u8>,
+            what: &str,
+        ) {
+            for _ in 0..1000 {
+                legacy_buf.clear();
+                cached_buf.clear();
+                let p0 = probe();
+                legacy(legacy_buf);
+                let p1 = probe();
+                snapshot_json_write(cached_buf);
+                let p2 = probe();
+                if p0 == p1 && p1 == p2 {
+                    assert_eq!(legacy_buf, cached_buf, "{what}");
+                    // the memo's resolved value must equal a fresh scan;
+                    // re-probe so the compare itself is inside a stable
+                    // window
+                    let p3 = probe();
+                    if p2 != p3 {
+                        continue;
+                    }
+                    let fresh = ring_tps().unwrap_or_else(current_tps);
+                    let cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                    assert_eq!(
+                        cache.tps_memo.tps.to_bits(),
+                        fresh.to_bits(),
+                        "memo bits diverged: {what}"
+                    );
+                    return;
+                }
+                // concurrent mutation voided the round — retry
+            }
+            panic!("snapshot state never settled for {what}");
+        }
+
+        let mut legacy_buf = Vec::new();
+        let mut cached_buf = Vec::new();
+
+        // 1) empty ring, set_tps fallback: two captures (fill + steady)
+        set_tps(7.25);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "fallback fill");
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "fallback steady");
+
+        // 2) monotone feed — the first ring capture resumes the
+        //    accumulator from zero (add-on-consume, no eviction yet)
+        for i in 1..=10u64 {
+            push_tick_time_ts(1_000_000_000 + i * 50_000_000, 50_000_000);
+        }
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "ring resume-from-zero");
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "ring steady fast path");
+
+        // 3) incremental advance: one push, then a four-sample batch
+        push_tick_time_ts(1_000_000_000 + 11 * 50_000_000, 50_000_000);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "advance x1");
+        for i in 12..=15u64 {
+            push_tick_time_ts(1_000_000_000 + i * 50_000_000, 50_000_000);
+        }
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "advance batch");
+
+        // 4) 61s silence then a tick: every older sample leaves the 60s
+        //    window, only the new one stays (n=1)
+        push_tick_time_ts(1_000_000_000 + 15 * 50_000_000 + 61_000_000_000, 50_000_000);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "61s eviction -> n=1");
+
+        // 5) ts dip (the clock-form-switch guard): the new sample sits
+        //    10s BELOW the previous newest — resume must refuse and the
+        //    verbatim rebuild must reproduce the scan exactly
+        push_tick_time_ts(1_000_000_000 + 15 * 50_000_000 + 51_000_000_000, 50_000_000);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "ts dip -> rebuild");
+
+        // 6) ring reset mid-life (head regression): rebuild via resume
+        //    refusal
+        reset_state();
+        push_tick_time_ts(5_000_000_000, 50_000_000);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "reset -> rebuild");
+
+        // 7) burst beyond RING_CAP: 5000 x 1ms samples wrap the ring with
+        //    the whole window still inside — the lap guard forces the
+        //    rebuild regime; parity must hold per read
+        reset_state();
+        for i in 1..=5000u64 {
+            push_tick_time_ts(2_000_000_000 + i * 1_000_000, 1_000_000);
+        }
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "burst > RING_CAP rebuild");
+        push_tick_time_ts(2_000_000_000 + 5001 * 1_000_000, 1_000_000);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "lap guard rebuild");
+
+        // 8) emptied ring: fallback bits again, then set_tps interplay
+        test_reset_ring();
+        set_tps(19.5);
+        capture(&legacy, &mut legacy_buf, &mut cached_buf, "emptied ring fallback");
+
+        // teardown for the parallel suite
+        test_reset_ring();
     }
 
     #[test]
