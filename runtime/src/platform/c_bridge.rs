@@ -20,7 +20,7 @@ use cplug_abi::{
     CPacket, CPlatformApi, EventCb, FaultCb, PacketHookCb, SaveCb, SchedulerTaskCb, StorageBeginSaveCb,
     StorageEndSaveCb, StorageNameCb, StorageReadCb, StorageWriteCb,
 };
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::AtomicUsize;
@@ -58,6 +58,19 @@ pub const TELEM_PREGATE: bool = true;
 /// serde JSON bytes never contain a raw 0x00, so the manual terminator is
 /// the only NUL — CString semantics preserved).
 pub const TELEM_SNAP_INPLACE: bool = true;
+
+/// TASK-193 A/B toggle: hand-rolled fast-path parse for the flat payload
+/// shapes C producers actually emit (null/true/false, integers, escape-free
+/// strings, flat objects/arrays of exactly those leaves). ANYTHING the
+/// scanner is not 100% sure about falls back to serde_json::from_str, so
+/// the result is semantically identical to the pre-TASK-193 shape in every
+/// case: input inside the proven subset -> the same Value serde builds;
+/// everything else -> serde decides exactly as before (invalid input still
+/// lands on Value::Null through unwrap_or). Excluded from the subset on
+/// purpose: floats (serde's float resolution is not re-implemented),
+/// leading zeros, "-0", escapes, raw control bytes, nested containers,
+/// any whitespace inside containers — every one of those routes to serde.
+pub const C_PUBLISH_FASTPARSE: bool = true;
 
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
@@ -133,6 +146,209 @@ unsafe extern "C" fn n_events_subscribe(event: *const c_char, cb: EventCb, ctx: 
     sub.id
 }
 
+/// TASK-193: C-entry payload parse = fast path first, serde fallback.
+#[inline]
+fn c_publish_parse(s: &str) -> Value {
+    if C_PUBLISH_FASTPARSE {
+        if let Some(v) = parse_payload_fast(s) {
+            return v;
+        }
+    }
+    serde_json::from_str(s).unwrap_or(Value::Null)
+}
+
+/// Fast-path scanner: Some = confidently parsed inside the proven subset;
+/// None = the caller must fall back to serde (same result as pre-TASK-193).
+fn parse_payload_fast(s: &str) -> Option<Value> {
+    match s.as_bytes() {
+        b"null" => return Some(Value::Null),
+        b"true" => return Some(Value::Bool(true)),
+        b"false" => return Some(Value::Bool(false)),
+        _ => {}
+    }
+    if s.is_empty() {
+        return None;
+    }
+    match s.as_bytes()[0] {
+        b'"' => scan_simple_string(s).map(Value::String),
+        b'{' => scan_flat_object(s),
+        b'[' => scan_flat_array(s),
+        b'-' | b'0'..=b'9' => scan_integer(s),
+        _ => None,
+    }
+}
+
+/// Whole-input string: quotes at both ends, no escapes, no control bytes,
+/// no raw '"' inside (a raw inner quote means invalid JSON — serde rejects
+/// it, so the fallback must decide it, not us).
+fn scan_simple_string(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+        return None;
+    }
+    let inner = &b[1..b.len() - 1];
+    for &c in inner {
+        if c == b'\\' || c == b'"' || c < 0x20 {
+            return None;
+        }
+    }
+    Some(s[1..s.len() - 1].to_string())
+}
+
+/// String token at cursor *i (which must point at an opening quote):
+/// scans to the FIRST closing quote, rejecting escapes and control bytes.
+/// A raw inner quote ends the token early and the caller's structural
+/// check then rejects the input — parity is preserved through the fallback.
+fn scan_string_at(s: &str, i: &mut usize) -> Option<String> {
+    let b = s.as_bytes();
+    let start = *i + 1;
+    let mut j = start;
+    loop {
+        let c = *b.get(j)?;
+        if c == b'"' {
+            let t = s[start..j].to_string();
+            *i = j + 1;
+            return Some(t);
+        }
+        if c == b'\\' || c < 0x20 {
+            return None;
+        }
+        j += 1;
+    }
+}
+
+/// Integer token only: [-]digits with no leading zero ("0" alone is fine).
+/// Floats (any '.'/'e'/'E'), overflow and "-0" are excluded — serde decides.
+fn scan_integer(s: &str) -> Option<Value> {
+    let b = s.as_bytes();
+    let (neg, digits) = match b[0] {
+        b'-' => (true, &b[1..]),
+        _ => (false, b),
+    };
+    if digits.is_empty() || (digits[0] == b'0' && digits.len() > 1) {
+        return None;
+    }
+    if !digits.iter().all(|d| d.is_ascii_digit()) {
+        return None;
+    }
+    if neg {
+        if digits == b"0" {
+            return None;
+        }
+        s.parse::<i64>().ok().map(|v| Value::Number(v.into()))
+    } else {
+        s.parse::<u64>().ok().map(|v| Value::Number(v.into()))
+    }
+}
+
+/// Leaf value at cursor *i: null/true/false, integer, or simple string.
+/// Nested containers and whitespace return None (serde decides).
+fn scan_leaf(s: &str, i: &mut usize) -> Option<Value> {
+    let b = s.as_bytes();
+    match b[*i] {
+        b'n' if b.len() - *i >= 4 && &b[*i..*i + 4] == b"null" => {
+            *i += 4;
+            Some(Value::Null)
+        }
+        b't' if b.len() - *i >= 4 && &b[*i..*i + 4] == b"true" => {
+            *i += 4;
+            Some(Value::Bool(true))
+        }
+        b'f' if b.len() - *i >= 5 && &b[*i..*i + 5] == b"false" => {
+            *i += 5;
+            Some(Value::Bool(false))
+        }
+        b'"' => scan_string_at(s, i).map(Value::String),
+        b'-' | b'0'..=b'9' => {
+            let start = *i;
+            let mut j = start;
+            if b[j] == b'-' {
+                j += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j == start + usize::from(b[start] == b'-') {
+                return None; // sign with no digits
+            }
+            // Only a structural terminator may follow: a '.'/'e'/'E' or any
+            // other byte means serde must decide (floats, garbage).
+            match b.get(j) {
+                None | Some(b',') | Some(b'}') | Some(b']') => {}
+                _ => return None,
+            }
+            let tok = &s[start..j];
+            let v = if tok.starts_with('-') {
+                if tok == "-0" || (tok.len() > 2 && tok.starts_with("-0")) {
+                    return None;
+                }
+                Value::Number(tok.parse::<i64>().ok()?.into())
+            } else {
+                if tok.len() > 1 && tok.starts_with('0') {
+                    return None;
+                }
+                Value::Number(tok.parse::<u64>().ok()?.into())
+            };
+            *i = j;
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
+/// Flat object: keys are simple strings, leaves from scan_leaf, no
+/// whitespace inside (serde accepts whitespace; we just fall back to it).
+fn scan_flat_object(s: &str) -> Option<Value> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[b.len() - 1] != b'}' {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    let mut i = 1usize;
+    if b[i] == b'}' {
+        return Some(Value::Object(map));
+    }
+    loop {
+        if b[i] != b'"' {
+            return None;
+        }
+        let key = scan_string_at(s, &mut i)?;
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        let v = scan_leaf(s, &mut i)?;
+        map.insert(key, v);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => return Some(Value::Object(map)),
+            _ => return None,
+        }
+    }
+}
+
+/// Flat array of scan_leaf values (no nesting, no whitespace).
+fn scan_flat_array(s: &str) -> Option<Value> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[b.len() - 1] != b']' {
+        return None;
+    }
+    let mut vec = Vec::new();
+    let mut i = 1usize;
+    if b[i] == b']' {
+        return Some(Value::Array(vec));
+    }
+    loop {
+        let v = scan_leaf(s, &mut i)?;
+        vec.push(v);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return Some(Value::Array(vec)),
+            _ => return None,
+        }
+    }
+}
+
 unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const c_char) -> usize {
     let event = cstr(event);
     if event.is_empty() {
@@ -153,7 +369,10 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
     let payload: Value = if payload_json.is_null() {
         Value::Null
     } else {
-        serde_json::from_str(cstr(payload_json)).unwrap_or(Value::Null)
+        // TASK-193: fast path for the flat producer shapes, serde fallback
+        // for everything else — same Value in every case (see
+        // C_PUBLISH_FASTPARSE for the parity argument).
+        c_publish_parse(cstr(payload_json))
     };
     bus.publish(event, &payload)
 }
@@ -806,6 +1025,128 @@ mod tests {
             "BENCH c_publish: c_publish(no subs) {:.0} ns/op, c_publish(1 sync sub) {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_sync * 1e9
+        );
+    }
+
+    /// TASK-193 parity corpus: for every input, the C-entry parse must
+    /// produce EXACTLY the Value the pre-TASK-193 shape produced
+    /// (serde_json::from_str(..).unwrap_or(Value::Null)). Fast-path
+    /// acceptances are checked for equality with serde; everything the
+    /// scanner declines routes to serde itself, so equality is structural.
+    #[test]
+    fn c_publish_parse_parity_corpus() {
+        // fast-path subset: must equal serde AND exercise the scanner
+        let fast_subset = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "42",
+            "-7",
+            "18446744073709551615",  // u64::MAX
+            "9223372036854775808",   // i64::MAX+1 -> u64 range
+            "-9223372036854775808",  // i64::MIN
+            "\"hello\"",
+            "\"\"",
+            "{}",
+            "[]",
+            "{\"tick\":1,\"drained\":0}",
+            "{\"a\":\"x\",\"b\":2,\"c\":null,\"d\":true}",
+            "[1,2,3]",
+            "[true,false,null]",
+            "[\"a\",\"b\"]",
+        ];
+        for s in fast_subset {
+            assert!(
+                parse_payload_fast(s).is_some(),
+                "scanner declined a subset shape: {s}"
+            );
+            assert_eq!(
+                c_publish_parse(s),
+                serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                "fast-path result diverged from serde for: {s}"
+            );
+        }
+        // fallback shapes: scanner declines, serde decides — equality is
+        // the contract (invalid inputs land on Null exactly as before)
+        let fallback = [
+            "",
+            "1.5",
+            "1e3",
+            "-0",
+            "01",
+            "-01",
+            "18446744073709551616",  // u64 overflow -> serde error -> Null
+            "-9223372036854775809",  // i64 underflow -> serde error -> Null
+            "\"a\\\"b\"",
+            "\"a\\u0041b\"",
+            "\"a\"b\"",
+            "{\"a\":{\"b\":1}}",
+            "[{\"a\":1}]",
+            "[1,]",
+            "{\"a\":1,}",
+            "{a:1}",
+            "  {\"a\":1}",
+            "{\"a\":1} ",
+            " {\"a\": 1}",
+            "{\"a\": 1}",
+            "{\"a\":1.5}",
+            "nul",
+            "nullx",
+            "tru",
+            "[1,2",
+            "{\"a\"",
+            "12x",
+            "12 ",
+            " 12",
+        ];
+        for s in fallback {
+            let via_entry = c_publish_parse(s);
+            let via_serde = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+            assert_eq!(
+                via_entry, via_serde,
+                "C-entry parse diverged from serde for: {s}"
+            );
+        }
+    }
+
+    /// TASK-193 A/B subject: payload parse cost, pre-shape (serde direct)
+    /// vs fast-path+fallback. Line 1 is the BEFORE arm (the exact
+    /// pre-TASK-193 expression), line 2 the AFTER arm; the end-to-end
+    /// effect shows up in bench_c_events_publish line 2.
+    #[test]
+    #[ignore]
+    fn bench_c_publish_parse_ab() {
+        let payload = "{\"tick\":1,\"drained\":0}";
+        assert!(
+            parse_payload_fast(payload).is_some(),
+            "fast path misses the bench shape — round would be refuted"
+        );
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let mut best_serde = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(serde_json::from_str::<Value>(payload).unwrap_or(Value::Null));
+            }
+            best_serde = best_serde.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        let mut best_fast = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(c_publish_parse(payload));
+            }
+            best_fast = best_fast.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH c_publish_parse: serde-direct {:.0} ns/op, fast-path+fallback {:.0} ns/op (min of {rounds}x{iters})",
+            best_serde * 1e9,
+            best_fast * 1e9
         );
     }
 
