@@ -1309,6 +1309,127 @@ mod tests {
         );
     }
 
+    /// TASK-204 decomposition: where do the ~147 ns of
+    /// c_publish(1 sync sub) go? The parse layer is TASK-193's floor
+    /// (bench_c_publish_parse_ab: ~140, representation-locked — the
+    /// output Value MUST be serde_json's Map, so the key Strings and the
+    /// BTree build/drop are semantic parity costs); the dispatch layer
+    /// rides the Rust publish line (~9: gens load + fnv + memo probes +
+    /// guard-check + catch_unwind + handler call). The C framing between
+    /// them (the gate load + TWO cstr walks — event and payload) has
+    /// never been isolated. Iso lines, all in ONE run for comparability:
+    ///   framing      — the post-203 fall-through shape up to but
+    ///                  excluding the parse (gate + cstr(event) +
+    ///                  empty-check), one sync subscriber present (the
+    ///                  gate must pass);
+    ///   payload_cstr — the second cstr walk (the payload string) that
+    ///                  bench_c_publish_parse_ab excludes (it receives a
+    ///                  ready &str);
+    ///   parse        — c_publish_parse on the payload &str (the
+    ///                  TASK-193 shape, Value drop inside the loop);
+    ///   dispatch     — bus.publish(event, &payload) on the memo-hit
+    ///                  path, payload PRE-BUILT outside the loop (pure
+    ///                  delivery cost, no per-iter Value build/drop);
+    ///   e2e          — the real entry (the sum check).
+    /// If framing + payload_cstr + parse + dispatch closes on e2e within
+    /// measurement overlap, the line's true zero-semantic-change floor is
+    /// BANKED with numbers: every remaining component is either
+    /// representation-locked (the Map), contract-locked (the cstr walks
+    /// feeding utf8-checked &str slicing + the empty-check), or
+    /// floor-class (the memo-hit dispatch). Context-independent: every
+    /// line is with-subscriber or bus-free (no line needs a
+    /// never-subscribed bus; the bench's own subscribe cycle bumps gens
+    /// exactly like every other global-bus bench).
+    #[test]
+    #[ignore]
+    fn bench_c_publish_delivery_iso() {
+        // The post-203 fall-through shape up to (excluding) the parse.
+        #[inline(never)]
+        unsafe fn iso_framing(event: *const c_char) -> usize {
+            let bus = events::global_ref();
+            if !bus.may_have_subscribers() {
+                return 0;
+            }
+            let event = cstr(event);
+            if event.is_empty() {
+                return 0;
+            }
+            black_box(event);
+            0
+        }
+        // The payload cstr walk (strlen + UTF-8) the parse bench excludes.
+        #[inline(never)]
+        unsafe fn iso_payload_cstr(payload_json: *const c_char) -> usize {
+            let p = cstr(payload_json);
+            black_box(p);
+            p.len()
+        }
+
+        let ev = CString::new("c.bench.delivery").unwrap();
+        let pj = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+        let ev_str = ev.to_str().unwrap();
+        let pj_str = pj.to_str().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let sub = events::global().subscribe("c.bench.delivery", Arc::new(|_, _| {}));
+        let bus = events::global_ref();
+        let payload = c_publish_parse(pj_str); // pre-built for the dispatch iso
+
+        // warm-up: memo fill + code paths (10k each)
+        for _ in 0..10_000u32 {
+            black_box(unsafe { iso_framing(ev.as_ptr()) });
+            black_box(unsafe { iso_payload_cstr(pj.as_ptr()) });
+            black_box(c_publish_parse(pj_str));
+            black_box(bus.publish(ev_str, &payload));
+            black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+        }
+
+        let mut best = [f64::MAX; 5]; // framing, payload_cstr, parse, dispatch, e2e
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { iso_framing(ev.as_ptr()) });
+            }
+            best[0] = best[0].min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { iso_payload_cstr(pj.as_ptr()) });
+            }
+            best[1] = best[1].min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(c_publish_parse(pj_str));
+            }
+            best[2] = best[2].min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(bus.publish(ev_str, &payload));
+            }
+            best[3] = best[3].min(start.elapsed().as_secs_f64() / f64::from(iters));
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) });
+            }
+            best[4] = best[4].min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.delivery", &sub);
+
+        println!(
+            "BENCH c_publish_delivery_iso: framing {:.0} + payload_cstr {:.0} + parse {:.0} + dispatch {:.0} = {:.0} vs e2e {:.0} ns/op (min of {rounds}x{iters})",
+            best[0] * 1e9,
+            best[1] * 1e9,
+            best[2] * 1e9,
+            best[3] * 1e9,
+            (best[0] + best[1] + best[2] + best[3]) * 1e9,
+            best[4] * 1e9,
+        );
+    }
+
     /// TASK-203 in-suite contract: the gate-first ordering preserves the
     /// C publish entry's observable contract in every state reachable
     /// from a parallel suite run. State-INDEPENDENT lines (no assumption
