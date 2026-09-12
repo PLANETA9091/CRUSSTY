@@ -195,6 +195,49 @@ pub fn metrics_full() -> bool {
     s.metrics.len() >= MAX_METRICS
 }
 
+/// TASK-181: serialize the current snapshot JSON straight into `out`
+/// WITHOUT the deep clone the `snapshot()` + `serde_json::to_string` pair
+/// pays (that clone allocates every String / labels map in the snapshot —
+/// up to [`MAX_METRICS`] metrics — and is then dropped untouched by the
+/// serializer). The output is byte-identical to
+/// `serde_json::to_string(&snapshot())` (same derived Serialize, same
+/// field order, `to_string` is `to_writer` into a String).
+///
+/// TPS contract identical to [`snapshot`]: the serialized value carries
+/// `ring_tps().unwrap_or(current_tps)`. The value is read BEFORE the data
+/// lock is taken (both sources are lock-free atomics — TASK-162/164), then
+/// applied as a transient in-place override of the stored field under the
+/// lock and restored right after serialization: no lock holder can observe
+/// the override mid-call, and the stored field itself has no reader that
+/// does not override it (every reader goes through [`snapshot`]-shaped
+/// clones). On a panic the runtime aborts (the only caller is an
+/// extern "C" entry), so the override cannot outlive the call.
+///
+/// Lock ordering: takes the snapshot data lock only (a leaf — nothing it
+/// calls takes another lock); the caller may hold its own buffer mutex
+/// around this with no inverse order anywhere. The ring scan that may run
+/// under the lock is the bounded lock-free RING_CAP loop, not a mutex.
+/// Single call site (the C entry); #[inline(never)] keeps the serializer
+/// out of the caller's code region — its cost is serde-dominated and it
+/// must not perturb unrelated hot-loop placement (TASK-181 iteration 1).
+#[inline(never)]
+#[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
+pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
+    let tps = ring_tps().unwrap_or_else(current_tps);
+    let snap = snapshot_arc();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+    let saved = s.tps;
+    s.tps = tps;
+    let res = serde_json::to_writer(&mut *out, &*s);
+    s.tps = saved;
+    if res.is_err() {
+        // Unreachable for this Serialize impl (no fallible parts), kept for
+        // parity with the legacy `{}` fallback.
+        out.clear();
+        out.extend_from_slice(b"{}");
+    }
+}
+
 /// Test-only: drop the shared snapshot so the next publish starts a fresh
 /// list. The list itself has no removal API by design (append-only up to
 /// the cap); full-state tests need a way back out of it. Never call from

@@ -46,6 +46,19 @@ pub const C_ENTRY_PREGATE: bool = true;
 /// could actually be accepted.
 pub const TELEM_PREGATE: bool = true;
 
+/// TASK-181 A/B toggle: serialize the C snapshot entry's JSON in place.
+/// `false` = pre-TASK-181 shape (every call deep-clones the whole Snapshot
+/// under the data lock, serializes the clone into a fresh String, then
+/// swaps a fresh CString into the static, freeing the old one). `true` =
+/// the locked snapshot is serialized directly into a REUSED NUL-terminated
+/// buffer (zero allocs in the steady state; the deep clone and the two
+/// per-call allocations are gone). Semantics are identical in both states:
+/// byte-identical JSON (asserted in-tree), the same pointer-valid-until-
+/// next-call contract (both shapes overwrite the shared buffer every call;
+/// serde JSON bytes never contain a raw 0x00, so the manual terminator is
+/// the only NUL — CString semantics preserved).
+pub const TELEM_SNAP_INPLACE: bool = true;
+
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
         return "";
@@ -224,13 +237,32 @@ unsafe extern "C" fn n_telemetry_publish_metric(
 
 static SNAP: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
 
+/// TASK-181: reusable serialize target for the in-place path. The returned
+/// pointer stays valid until the NEXT call to the entry (the same contract
+/// the legacy CString swap had) — the Vec lives in this static, the NUL
+/// terminator is appended after every write, and serde JSON output cannot
+/// contain a raw 0x00 byte (control characters are escaped), so the
+/// terminator is the only NUL in the buffer.
+static SNAP_BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
 unsafe extern "C" fn n_telemetry_snapshot_json() -> *const c_char {
-    let s = telemetry::snapshot();
-    let json = serde_json::to_string(&s).unwrap_or_else(|_| "{}".into());
-    let ptr = SNAP.get_or_init(|| Mutex::new(None));
-    let mut guard = ptr.lock().unwrap();
-    *guard = Some(CString::new(json).unwrap());
-    guard.as_ref().unwrap().as_ptr()
+    if TELEM_SNAP_INPLACE {
+        let buf = SNAP_BUF.get_or_init(|| Mutex::new(Vec::with_capacity(4096)));
+        let mut guard = buf.lock().unwrap();
+        guard.clear();
+        telemetry::snapshot_json_write(guard.as_mut());
+        guard.push(0);
+        guard.as_ptr() as *const c_char
+    } else {
+        // Pre-TASK-181 shape, kept verbatim for the A/B toggle (the
+        // byte-identity test re-derives this shape independently).
+        let s = telemetry::snapshot();
+        let json = serde_json::to_string(&s).unwrap_or_else(|_| "{}".into());
+        let ptr = SNAP.get_or_init(|| Mutex::new(None));
+        let mut guard = ptr.lock().unwrap();
+        *guard = Some(CString::new(json).unwrap());
+        guard.as_ref().unwrap().as_ptr()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +930,160 @@ mod tests {
             "BENCH c_telemetry: c_metric(full, labels4) {:.0} ns/op, c_metric(full, no labels) {:.0} ns/op (min of {rounds}x{iters})",
             best_labeled * 1e9,
             best_null * 1e9
+        );
+    }
+
+    /// TASK-181: C snapshot-entry state-independent contract (parallel
+    /// test): the entry returns a non-NULL, NUL-terminated JSON object
+    /// carrying the base snapshot fields in ANY shared state (empty /
+    /// partial / full metric list; parallel tests may publish metrics
+    /// concurrently). Two successive calls must both yield a valid,
+    /// parseable object — each call refreshes the buffer, and the returned
+    /// pointer is valid until the NEXT call (the pre-TASK-181 contract,
+    /// unchanged by the round).
+#[test]
+    fn telemetry_snapshot_inplace_contract() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let p1 = unsafe { n_telemetry_snapshot_json() };
+        assert!(!p1.is_null(), "snapshot entry returns a pointer in any state");
+        let b1 = unsafe { CStr::from_ptr(p1) }.to_bytes();
+        let v1: serde_json::Value = serde_json::from_slice(b1).expect("call 1: valid JSON");
+        assert_eq!(
+            v1["runtime_version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "runtime_version is the crate version in any state"
+        );
+        assert!(v1["server_name"].is_string(), "server_name always present");
+        assert!(v1["started_at"].is_u64(), "started_at always present");
+        assert!(v1["tps"].is_number(), "tps always present");
+        assert!(v1["metrics"].is_array(), "metrics always serialized");
+
+        let p2 = unsafe { n_telemetry_snapshot_json() };
+        assert!(!p2.is_null());
+        let b2 = unsafe { CStr::from_ptr(p2) }.to_bytes();
+        let v2: serde_json::Value = serde_json::from_slice(b2).expect("call 2: valid JSON");
+        assert_eq!(v2["server_name"], v1["server_name"], "stable across calls");
+        assert_eq!(v2["started_at"], v1["started_at"], "stable across calls");
+    }
+
+    /// TASK-181: byte-identity between the two toggle paths in ONE build
+    /// (SOLO, filtered run — resets the shared snapshot and publishes a
+    /// controlled fixture; the parallel suite may publish concurrently,
+    /// which would change the JSON between the two calls): the legacy
+    /// shape (deep clone -> to_string -> CString swap) and the in-place
+    /// shape (serialize under the lock into the reused buffer) must emit
+    /// byte-identical JSON in the empty state and in the labeled state.
+    /// The ring is empty in tests, so tps is deterministic (0.0) and both
+    /// read points agree.
+#[test]
+    #[ignore]
+    fn telemetry_snapshot_inplace_byte_identical() {
+        telemetry::test_reset_snapshot();
+
+        // legacy shape re-derived here independently (the dispatch fn is a
+        // single unit — no extracted legacy fn; TASK-181 iteration 2 showed
+        // that extracting one shifts unrelated CPU-bound loop placement)
+        let legacy_shape = || {
+            let s = telemetry::snapshot();
+            serde_json::to_string(&s).unwrap_or_else(|_| "{}".into())
+        };
+        let legacy1 = legacy_shape().into_bytes();
+        let inplace1 =
+            unsafe { CStr::from_ptr(n_telemetry_snapshot_json()) }.to_bytes().to_vec();
+        assert_eq!(legacy1, inplace1, "empty state: byte-identical JSON");
+        let v1: serde_json::Value = serde_json::from_slice(&inplace1).unwrap();
+        assert_eq!(v1["metrics"].as_array().unwrap().len(), 0, "empty state");
+
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("idx".to_string(), i.to_string());
+            telemetry::publish_metric(
+                &format!("c.bench.ident.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+
+        let legacy2 = legacy_shape().into_bytes();
+        let inplace2 =
+            unsafe { CStr::from_ptr(n_telemetry_snapshot_json()) }.to_bytes().to_vec();
+        assert_eq!(legacy2, inplace2, "32-metric state: byte-identical JSON");
+        let v2: serde_json::Value = serde_json::from_slice(&inplace2).unwrap();
+        assert_eq!(v2["metrics"].as_array().unwrap().len(), 32);
+        assert_eq!(v2["metrics"][0]["name"], "c.bench.ident.0");
+        assert_eq!(v2["metrics"][0]["labels"]["region"], "eu");
+    }
+
+    /// TASK-181 A/B subject: the C telemetry snapshot entry. OFF (legacy
+    /// shape): every call deep-clones the whole Snapshot under the data
+    /// lock (every String / labels map — up to MAX_METRICS metrics),
+    /// serializes the clone into a fresh String, then swaps a fresh CString
+    /// into the static (freeing the old one) — the clone is dropped
+    /// untouched by the serializer. ON: serializes the locked snapshot in
+    /// place into a REUSED buffer (transient tps override, zero allocs in
+    /// the steady state). Line 1: empty metric list (control — base fields
+    /// only). Line 2: 32 labeled metrics (the clone tax scales with the
+    /// list; a realistic active-module fleet). Runs SOLO (filtered run
+    /// only): resets the shared snapshot and leaves 32 metrics published
+    /// at the end (harmless — every solo bench resets its own starting
+    /// state; the parallel suite never depends on the list being empty).
+    /// Byte-identity between the toggle paths is asserted by the separate
+    /// solo test telemetry_snapshot_inplace_byte_identical.
+#[test]
+    #[ignore]
+    fn bench_telemetry_snapshot_json() {
+        telemetry::test_reset_snapshot();
+
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // line 1: empty metric list (control)
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_telemetry_snapshot_json() });
+        }
+        let mut best_empty = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_telemetry_snapshot_json() });
+            }
+            best_empty = best_empty.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // 32 labeled metrics (4 label pairs each)
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            telemetry::publish_metric(
+                &format!("c.bench.snap.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_telemetry_snapshot_json() });
+        }
+        let mut best_32 = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_telemetry_snapshot_json() });
+            }
+            best_32 = best_32.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH snapshot_json: snapshot_json(0 metrics) {:.0} ns/op, snapshot_json(32 labeled) {:.0} ns/op (min of {rounds}x{iters})",
+            best_empty * 1e9,
+            best_32 * 1e9
         );
     }
 }
