@@ -18,3 +18,10 @@ libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+# TASK-213 codegen audit: default release profile splits the crate into 16
+# CGUs, blocking cross-module inlining on the hot chains (c_bridge -> events,
+# telemetry -> events, scheduler). One unit lets LLVM see every call site.
+[profile.release]
+codegen-units = 1
+lto = "fat"
