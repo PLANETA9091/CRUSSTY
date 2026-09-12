@@ -65,11 +65,15 @@
 //! ever dlopening a real library.
 
 use libloading::{Library, Symbol};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use super::rcu::ArcCell;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 
@@ -116,10 +120,193 @@ struct LoadedModule {
     /// Return code of the active library's `cplugin_init` (0 = healthy).
     init_rc: i32,
     /// In-flight calls into module code; reload refuses while > 0.
+    /// TASK-177: on the lock-free guard path this field is legacy — the
+    /// authoritative count lives in `gate` (see below); the field is kept
+    /// for the legacy path and for test fabrication.
     active: usize,
     /// A reload is in progress: `enter_module` refuses new entries so the
     /// old library cannot gain callers between the busy check and dlclose.
+    /// TASK-177: legacy mirror — see `active` above.
     swapping: bool,
+    /// TASK-177: the module's packed call gate (swap bit + in-flight
+    /// count), shared with the lock-free lookup map so the dispatcher's
+    /// enter/leave/guard path never takes the registry Mutex.
+    gate: Arc<ModuleGate>,
+}
+
+/// TASK-177: const toggle for the A/B rig. `true` = packed-gate lock-free
+/// enter/leave/guard (RCU slot map, zero String allocs); `false` = the
+/// pre-177 path (registry Mutex + HashMap lookup + String-keyed guard).
+pub(crate) const MODULE_GUARD_LOCKFREE: bool = true;
+
+const GATE_SWAP_BIT: usize = 1;
+const GATE_STEP: usize = 2;
+
+/// Packed per-module call gate (TASK-177): bit 0 = "a reload is in
+/// progress" (new enters refused); bits 1.. = the in-flight call count
+/// (`reload_module` refuses while > 0). One CAS loop on this single word
+/// replaces the registry Mutex on the dispatcher's hot path and keeps the
+/// busy/swapping arbitration atomic against enter/leave without any lock.
+struct ModuleGate {
+    state: AtomicUsize,
+}
+
+impl ModuleGate {
+    fn with(active: usize, swapping: bool) -> Self {
+        Self {
+            state: AtomicUsize::new((active << 1) | usize::from(swapping)),
+        }
+    }
+
+    #[inline]
+    fn enter(&self) -> bool {
+        let mut v = self.state.load(Ordering::Acquire);
+        loop {
+            if v & GATE_SWAP_BIT != 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                v,
+                v + GATE_STEP,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(cur) => v = cur,
+            }
+        }
+    }
+
+    /// Pairs a prior successful enter; saturates at zero so an unpaired
+    /// leave can never wrap into the packed swap bit.
+    #[inline]
+    fn leave(&self) {
+        let mut v = self.state.load(Ordering::Acquire);
+        loop {
+            if v < GATE_STEP {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                v,
+                v - GATE_STEP,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(cur) => v = cur,
+            }
+        }
+    }
+
+    /// Reload reservation: capture the swap bit only from a fully idle
+    /// state. `Err(usize::MAX)` = already swapping; `Err(n)` = n calls in
+    /// flight (exact busy semantics of the legacy registry check).
+    fn reserve(&self) -> Result<(), usize> {
+        let mut v = self.state.load(Ordering::Acquire);
+        loop {
+            if v & GATE_SWAP_BIT != 0 {
+                return Err(usize::MAX);
+            }
+            let active = v >> 1;
+            if active != 0 {
+                return Err(active);
+            }
+            match self.state.compare_exchange_weak(
+                v,
+                v | GATE_SWAP_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(cur) => v = cur,
+            }
+        }
+    }
+
+    /// Release a successful (or abort a failed) reload reservation.
+    fn unreserve(&self) {
+        self.state.fetch_and(!GATE_SWAP_BIT, Ordering::AcqRel);
+    }
+
+    fn active(&self) -> usize {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+}
+
+/// TASK-177: id -> gate slot map, published through the same RCU ArcCell
+/// primitive as the events/router/packet views. Mutations are rare
+/// (register/admit) and rebuild the map; readers are hot and lock-free.
+static MODULE_GATES: OnceLock<ArcCell<HashMap<Box<str>, Arc<ModuleGate>>>> = OnceLock::new();
+
+fn gates_cell() -> &'static ArcCell<HashMap<Box<str>, Arc<ModuleGate>>> {
+    MODULE_GATES.get_or_init(ArcCell::new)
+}
+
+fn gate_view() -> Option<Arc<HashMap<Box<str>, Arc<ModuleGate>>>> {
+    gates_cell().load_arc()
+}
+
+thread_local! {
+    /// TASK-177: per-thread gate cache, invalidated by the RCU generation
+    /// (the ArcCell gen counter exists exactly for this — see rcu.rs).
+    /// `map` is the fallback lookup (paid once per id per thread); `last_id`/
+    /// `last_gate` is a single-entry front cache: dispatch almost always
+    /// resolves the same module back-to-back, so the hot path is a
+    /// gen-check + one memcmp — zero refcount traffic, zero hashing.
+    static GATE_CACHE: RefCell<GateCache> = RefCell::new(GateCache {
+        gen: 0,
+        map: None,
+        last_id: None,
+        last_gate: None,
+    });
+}
+
+struct GateCache {
+    gen: u64,
+    map: Option<Arc<HashMap<Box<str>, Arc<ModuleGate>>>>,
+    last_id: Option<Box<str>>,
+    last_gate: Option<Arc<ModuleGate>>,
+}
+
+/// Resolve `id` to its gate slot inside the thread cache (mutates the
+/// cache, never the shared map). The returned reference borrows the cache
+/// guard, so it stays valid for the rest of the closure.
+fn gate_lookup_in<'a>(c: &'a mut GateCache, id: &str) -> Option<&'a Arc<ModuleGate>> {
+    let gen = gates_cell().gen();
+    if c.gen != gen {
+        c.gen = gen;
+        c.map = if gen == 0 { None } else { gates_cell().load_arc() };
+        c.last_id = None;
+        c.last_gate = None;
+    }
+    let hit = matches!(&c.last_id, Some(lid) if lid.as_ref() == id);
+    if !hit {
+        let g = Arc::clone(c.map.as_ref()?.get(id)?);
+        c.last_id = Some(id.into());
+        c.last_gate = Some(g);
+    }
+    c.last_gate.as_ref()
+}
+
+/// Run `f` with the module's gate slot (or None when the module is not
+/// registered). The closure must not recurse into `with_gate` and must not
+/// rebuild the map, so the RefCell cannot be re-entered from inside `f`.
+fn with_gate<R>(id: &str, f: impl FnOnce(Option<&Arc<ModuleGate>>) -> R) -> R {
+    GATE_CACHE.with(|cell| {
+        let mut c = cell.borrow_mut();
+        f(gate_lookup_in(&mut c, id))
+    })
+}
+
+/// Rebuild the slot map under the swap lock (mutations are rare; readers
+/// keep working on the previous snapshot the whole time).
+fn gates_mutate(f: impl FnOnce(&mut HashMap<Box<str>, Arc<ModuleGate>>)) {
+    let _swap = swap_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut next: HashMap<Box<str>, Arc<ModuleGate>> = gate_view()
+        .map(|m| (*m).clone())
+        .unwrap_or_default();
+    f(&mut next);
+    gates_cell().store(Arc::new(next));
 }
 
 /// Panel-facing snapshot of one registered module.
@@ -136,14 +323,26 @@ pub struct ModuleInfo {
 /// drop even if the hook panics, so a panic cannot leave the busy counter
 /// stuck and block future reloads.
 pub struct ModuleGuard {
-    id: String,
+    inner: GuardInner,
     armed: bool,
+}
+
+/// TASK-177: the guard either holds the module's gate slot directly
+/// (lock-free path — release is one CAS, no lookup) or the legacy String
+/// id re-resolved through the registry on drop.
+enum GuardInner {
+    Gate(Arc<ModuleGate>),
+    Registry(String),
 }
 
 impl Drop for ModuleGuard {
     fn drop(&mut self) {
-        if self.armed {
-            leave_module(&self.id);
+        if !self.armed {
+            return;
+        }
+        match &self.inner {
+            GuardInner::Gate(g) => g.leave(),
+            GuardInner::Registry(id) => leave_module(id),
         }
     }
 }
@@ -282,6 +481,7 @@ fn insert_entry(
     if reg.contains_key(id) {
         return Err((format!("module '{id}' is already registered"), lib));
     }
+    let gate = Arc::new(ModuleGate::with(0, false));
     reg.insert(
         id.to_string(),
         LoadedModule {
@@ -295,8 +495,13 @@ fn insert_entry(
             init_rc: 0,
             active: 0,
             swapping: false,
+            gate: Arc::clone(&gate),
         },
     );
+    drop(reg);
+    gates_mutate(|m| {
+        m.insert(id.into(), gate);
+    });
     Ok(())
 }
 
@@ -315,27 +520,47 @@ pub fn reload_module(id: &str) -> Result<(), String> {
     // Reserve the slot: fail fast if busy, then block new entries for the
     // rest of the swap so the old library cannot gain callers between the
     // busy check and its dlclose.
-    let (path, api, vm, options, old_gen) = {
+    let (path, api, vm, options, old_gen, gate) = {
         let mut reg = registry().lock().unwrap();
         let entry = reg
             .get_mut(id)
             .ok_or_else(|| format!("module '{id}' is not registered"))?;
-        if entry.active > 0 {
-            return Err(format!(
-                "module '{id}' is busy: {} in-flight call(s)",
-                entry.active
-            ));
+        if MODULE_GUARD_LOCKFREE {
+            // TASK-177: the busy/swapping arbitration lives on the packed
+            // gate the dispatcher's enter/leave also uses, so a hot call
+            // racing the reload is decided atomically — no Mutex order
+            // between the two views can exist. Error texts are byte-equal
+            // to the legacy path.
+            match entry.gate.reserve() {
+                Ok(()) => {}
+                Err(n) if n == usize::MAX => {
+                    return Err(format!("module '{id}' is already being reloaded"))
+                }
+                Err(n) => {
+                    return Err(format!(
+                        "module '{id}' is busy: {n} in-flight call(s)"
+                    ))
+                }
+            }
+        } else {
+            if entry.active > 0 {
+                return Err(format!(
+                    "module '{id}' is busy: {} in-flight call(s)",
+                    entry.active
+                ));
+            }
+            if entry.swapping {
+                return Err(format!("module '{id}' is already being reloaded"));
+            }
+            entry.swapping = true;
         }
-        if entry.swapping {
-            return Err(format!("module '{id}' is already being reloaded"));
-        }
-        entry.swapping = true;
         (
             entry.path.clone(),
             entry.api,
             entry.vm,
             entry.options.clone(),
             entry.gen,
+            entry.gate.clone(),
         )
     };
 
@@ -363,7 +588,9 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             // under its window.
             crate::purge_module_hooks(id, old_gen + 1);
             crate::platform::events::global().purge_owner(&(id.to_string(), old_gen + 1));
-            if let Some(entry) = reg.get_mut(id) {
+            if MODULE_GUARD_LOCKFREE {
+                gate.unreserve();
+            } else if let Some(entry) = reg.get_mut(id) {
                 entry.swapping = false;
             }
             Err(e)
@@ -376,7 +603,11 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             entry.gen = old_gen + 1;
             entry.loaded_at_unix = unix_now();
             entry.init_rc = 0;
-            entry.swapping = false;
+            if MODULE_GUARD_LOCKFREE {
+                gate.unreserve();
+            } else {
+                entry.swapping = false;
+            }
             drop(reg);
             // The old generation's registrations are stale: purge them by
             // owner BEFORE the dlclose so a class load cannot dispatch into
@@ -400,8 +631,16 @@ pub fn reload_module(id: &str) -> Result<(), String> {
 /// The platform hook dispatcher MUST pair every call into module code with
 /// [`leave_module`] (or use [`guard_module`] for panic safety).
 pub fn enter_module(id: &str) -> bool {
-    // TASK-46-class hardening (S7-8): reachable from the JVMTI dispatch loop
-    // (guard_module per event); poison must not panic the callback thread.
+    if MODULE_GUARD_LOCKFREE {
+        // TASK-177: gen-check + cached-map borrow + CAS on the packed
+        // gate. The TASK-46-class hardening (S7-8) is preserved by
+        // construction — atomics cannot panic the callback thread, and
+        // unknown ids / mid-reload modules are refused exactly as before.
+        return with_gate(id, |g| match g {
+            Some(g) => g.enter(),
+            None => false,
+        });
+    }
     let mut reg = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -417,6 +656,16 @@ pub fn enter_module(id: &str) -> bool {
 /// Mark exit from a module's code; releases one [`enter_module`] slot.
 /// Unknown ids are a no-op.
 pub fn leave_module(id: &str) {
+    if MODULE_GUARD_LOCKFREE {
+        // TASK-177: the gate's leave saturates at zero, so unknown ids are
+        // a no-op (nothing to find) exactly like the legacy path.
+        with_gate(id, |g| {
+            if let Some(g) = g {
+                g.leave();
+            }
+        });
+        return;
+    }
     if let Some(e) = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -430,10 +679,23 @@ pub fn leave_module(id: &str) {
 /// that leaves it on drop (panic-safe for the hook dispatcher). `None` when
 /// the module is unknown or mid-reload.
 pub fn guard_module(id: &str) -> Option<ModuleGuard> {
-    enter_module(id).then(|| ModuleGuard {
-        id: id.to_string(),
-        armed: true,
-    })
+    if MODULE_GUARD_LOCKFREE {
+        // TASK-177: one gen-checked cached borrow for the whole call, and
+        // the guard holds the gate slot itself — zero String allocs, zero
+        // refcount traffic on the hot path.
+        with_gate(id, |g| {
+            let gate = g?;
+            gate.enter().then(|| ModuleGuard {
+                inner: GuardInner::Gate(Arc::clone(gate)),
+                armed: true,
+            })
+        })
+    } else {
+        enter_module(id).then(|| ModuleGuard {
+            inner: GuardInner::Registry(id.to_string()),
+            armed: true,
+        })
+    }
 }
 
 /// Snapshot of the registry, sorted by id, for a panel/console.
@@ -445,7 +707,11 @@ pub fn list_modules() -> Vec<ModuleInfo> {
             id: id.clone(),
             path: e.path.clone(),
             loaded_at_unix: e.loaded_at_unix,
-            in_use: e.active > 0,
+            in_use: if MODULE_GUARD_LOCKFREE {
+                e.gate.active() > 0
+            } else {
+                e.active > 0
+            },
             init_rc: e.init_rc,
         })
         .collect();
@@ -576,6 +842,81 @@ fn reload_loop() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TASK-177 bench rig (test-only; no production code is touched by this block)
+
+/// Test seam shared with sibling-module benches (events dispatch-owned line):
+/// fabricate a registry entry without any real .so.
+#[cfg(test)]
+pub(crate) fn test_seed_module(id: &str, active: usize, swapping: bool) {
+    let gate = Arc::new(ModuleGate::with(active, swapping));
+    registry().lock().unwrap().insert(
+        id.to_string(),
+        LoadedModule {
+            lib: None,
+            path: PathBuf::from(format!("/m/{id}.so")),
+            gen: 1,
+            api: 0,
+            vm: 0,
+            options: CString::new("").expect("empty CString"),
+            loaded_at_unix: 1,
+            init_rc: 0,
+            active,
+            swapping,
+            gate: Arc::clone(&gate),
+        },
+    );
+    gates_mutate(|m| {
+        m.insert(id.into(), gate);
+    });
+}
+
+/// TASK-177 isolate: the module guard the dispatcher pays per owned handler —
+/// `guard_module` + drop (the full enter/leave round trip incl. the guard
+/// object itself), plus the bare `enter_module`/`leave_module` pair.
+#[test]
+#[ignore]
+fn bench_module_guard() {
+    test_seed_module("bench-guard-mod", 0, false);
+    let iters = 200_000u32;
+    let rounds = 5;
+
+    let guard_pair = || {
+        let g = guard_module("bench-guard-mod").expect("bench module present");
+        drop(g);
+    };
+    for _ in 0..10_000u32 {
+        guard_pair();
+    }
+    let mut best_guard = f64::MAX;
+    for _ in 0..rounds {
+        let start = Instant::now();
+        for _ in 0..iters {
+            guard_pair();
+        }
+        best_guard = best_guard.min(start.elapsed().as_secs_f64() / f64::from(iters));
+    }
+
+    for _ in 0..10_000u32 {
+        assert!(enter_module("bench-guard-mod"));
+        leave_module("bench-guard-mod");
+    }
+    let mut best_enter = f64::MAX;
+    for _ in 0..rounds {
+        let start = Instant::now();
+        for _ in 0..iters {
+            assert!(enter_module("bench-guard-mod"));
+            leave_module("bench-guard-mod");
+        }
+        best_enter = best_enter.min(start.elapsed().as_secs_f64() / f64::from(iters));
+    }
+    println!(
+        "BENCH module_guard: guard_module+drop {:.0} ns/op, enter+leave {:.0} ns/op (min of {rounds}x{iters})",
+        best_guard * 1e9,
+        best_enter * 1e9
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +929,7 @@ mod tests {
         active: usize,
         swapping: bool,
     ) {
+        let gate = Arc::new(ModuleGate::with(active, swapping));
         registry().lock().unwrap().insert(
             id.to_string(),
             LoadedModule {
@@ -601,8 +943,12 @@ mod tests {
                 init_rc,
                 active,
                 swapping,
+                gate: Arc::clone(&gate),
             },
         );
+        gates_mutate(|m| {
+            m.insert(id.into(), gate);
+        });
     }
 
     /// Stub: replacement "loads" but its init fails with rc 7.
@@ -758,6 +1104,31 @@ mod tests {
         let err = reload_module("nostub-1").unwrap_err();
         assert!(err.contains("cannot dlopen"), "got: {err}");
         assert_eq!(find("nostub-1").loaded_at_unix, 1);
+    }
+
+    /// TASK-177: the packed gate's semantics as observed through the public
+    /// API — busy count, swapping refusal, saturating leave, and the exact
+    /// error texts. Toggle-independent: both paths must behave identically.
+    #[test]
+    fn gate_packed_semantics() {
+        test_seed_module("gate-1", 0, false);
+        assert!(enter_module("gate-1"));
+        assert!(enter_module("gate-1"), "second enter allowed");
+        let err = reload_module("gate-1").unwrap_err();
+        assert!(err.contains("busy"), "got: {err}");
+        assert!(err.contains("2 in-flight"), "count from the gate: {err}");
+        leave_module("gate-1");
+        leave_module("gate-1");
+
+        // swapping refusal through a seeded swap flag
+        test_seed_module("gate-2", 0, true);
+        let err2 = reload_module("gate-2").unwrap_err();
+        assert!(err2.contains("already being reloaded"), "got: {err2}");
+
+        // an unpaired leave saturates — must never wrap into the swap bit
+        leave_module("gate-1");
+        assert!(enter_module("gate-1"), "gate usable after a stray leave");
+        leave_module("gate-1");
     }
 
     #[test]

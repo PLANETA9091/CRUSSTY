@@ -1997,6 +1997,43 @@ mod bench_hotpath {
             best_build * 1e9
         );
     }
+
+    /// TASK-177 integral: the dispatcher pays one module guard per owned
+    /// handler. Seed a registry entry, subscribe one sync handler inside a
+    /// registration window (owner = ("bench-own-mod", 1)), then publish —
+    /// each publish walks the memo/dispatch path and calls guard_module
+    /// exactly once. The handler is a no-op, so the ON/OFF delta isolates
+    /// the guard cost (registry Mutex + String alloc + HashMap lookups vs
+    /// the lock-free gate).
+    #[test]
+    #[ignore]
+    fn bench_event_dispatch_owned() {
+        crate::platform::hot_reload::test_seed_module("bench-own-mod", 0, false);
+        let bus = with_cap(64);
+        {
+            let _owner = crate::begin_registration("bench-own-mod", 1);
+            let _tok = bus.subscribe("bench.own.tick", Arc::new(|_, _| {}));
+        }
+        let payload = serde_json::json!({ "n": 1u64 });
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        for _ in 0..10_000u32 {
+            let _ = bus.publish("bench.own.tick", &payload);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = bus.publish("bench.own.tick", &payload);
+            }
+            best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        println!(
+            "BENCH dispatch_owned: publish(1 owned sync sub) {:.0} ns/op (min of {rounds}x{iters})",
+            best * 1e9
+        );
+    }
 }
 
 
