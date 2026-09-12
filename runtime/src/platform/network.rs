@@ -363,26 +363,24 @@ pub fn attach_conn(conn_id: u64, player_uuid: Option<u128>) -> bool {
     // TASK-164 mirror: the per-packet state_of probe reads this table.
     conn_mirror_put(conn_id, ProtocolState::Handshake.code());
     // TASK-163 gate mirror: keep the live-conn count honest (the per-packet
-    // state_of gate trusts 0 = empty table).
-    let live = reg.map.len();
+    // state_of gate trusts 0 = empty table). TASK-182: the store moved under
+    // the write lock — the count is serialized with the map mutation, so
+    // lock-free `conn_count` readers can only lag an ACTIVE writer.
+    CONNS_LIVE.store(reg.map.len(), Ordering::Release);
     drop(reg);
-    CONNS_LIVE.store(live, Ordering::Release);
     true
 }
 
 /// Forget a connection (called by the `onClose` hook on channel inactive).
 /// Returns `true` if the conn was tracked. O(1) (was O(n) `retain`).
 pub fn detach_conn(conn_id: u64) -> bool {
-    let removed = CONNS
-        .write()
-        .unwrap_or_else(|p| p.into_inner())
-        .map
-        .remove(&conn_id)
-        .is_some();
+    // TASK-182: one write round-trip (was write + read); the count store
+    // happens under the same lock that removed the row.
+    let mut reg = CONNS.write().unwrap_or_else(|p| p.into_inner());
+    let removed = reg.map.remove(&conn_id).is_some();
     if removed {
         conn_mirror_del(conn_id);
-        let live = CONNS.read().unwrap_or_else(|p| p.into_inner()).map.len();
-        CONNS_LIVE.store(live, Ordering::Release);
+        CONNS_LIVE.store(reg.map.len(), Ordering::Release);
     }
     removed
 }
@@ -511,13 +509,27 @@ pub fn conn_info(conn_id: u64) -> Option<ConnInfo> {
         })
 }
 
-/// Number of currently tracked connections.
+/// TASK-182 A/B toggle: when true, `conn_count` is served lock-free from the
+/// TASK-163 atomic mirror; when false, the legacy RwLock shape below runs
+/// verbatim (the OFF arm exists only as the A/B bench reference).
+const CONN_COUNT_ATOMIC: bool = true;
+
+/// Number of currently tracked connections. TASK-182: served lock-free from
+/// the TASK-163 atomic mirror (`CONNS_LIVE`) instead of a RwLock read
+/// round-trip. The registry writers publish the count while still holding
+/// the write lock, so the atomic can only lag an ACTIVE writer — a finished
+/// attach/detach is always visible. The legacy shape is kept verbatim behind
+/// [`CONN_COUNT_ATOMIC`] for the A/B bench.
 pub fn conn_count() -> usize {
-    CONNS
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .map
-        .len()
+    if CONN_COUNT_ATOMIC {
+        CONNS_LIVE.load(Ordering::Acquire)
+    } else {
+        CONNS
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .map
+            .len()
+    }
 }
 
 /// Tracked connection ids in LRU order (least recently used first).
@@ -1046,6 +1058,44 @@ mod tests {
             best_rand_touch * 1e9,
             best_detach * 1e9,
             best_rand_detach * 1e9
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_conn_count() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+        // empty-table line: the steady state before the first player joins
+        bench_drain(MAX_CONNS as u64 + 16);
+        let _ = std::hint::black_box(conn_count());
+        let mut best_empty = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = std::hint::black_box(conn_count());
+            }
+            best_empty = best_empty.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        // full-table line: the periodic-publisher steady state
+        let table = MAX_CONNS as u64;
+        bench_fill(table);
+        let _ = std::hint::black_box(conn_count());
+        let mut best_full = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = std::hint::black_box(conn_count());
+            }
+            best_full = best_full.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        bench_drain(table);
+        assert_eq!(conn_count(), 0);
+        println!(
+            "BENCH conn_count: empty {:.1} ns/op, full({MAX_CONNS}) {:.1} ns/op (min of {rounds}x{iters})",
+            best_empty * 1e9,
+            best_full * 1e9
         );
     }
 
