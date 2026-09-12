@@ -250,16 +250,20 @@ impl Default for SnapshotJsonCache {
     }
 }
 
-/// Cache lock discipline (TASK-198 revision): the cache lock is now taken
-/// FIRST (before the snapshot data lock) because the tps memo inside it
-/// must resolve without holding the data lock. Safety invariant: NOTHING
-/// that holds the data lock may acquire the cache lock — every mutator
+/// Cache lock discipline (TASK-199 revision): the cache lock is the ONLY
+/// lock on the HIT path — a hit assembles the output purely from the
+/// cached ranges + memo bytes and never touches the live snapshot, so the
+/// SNAP_GEN load on the hit path is lock-free and linearized (stale gen =
+/// coherent pre-mutation snapshot; bumped gen = the miss path below). The
+/// data lock is taken ONLY on the miss/rebuild path, in cache -> data
+/// order, with the generation RE-VERIFIED under the data lock (another
+/// reader may have refilled while we waited). Safety invariants: nothing
+/// that holds the data lock may acquire the cache lock (every mutator
 /// bumps SNAP_GEN with one atomic fetch_add while holding the data lock
-/// and never touches the cache, and no other site locks this static
-/// (grep-verified single acquisition point). So cache→data is the only
-/// nesting that exists and no inverse order can form. The cache lock
-/// itself remains a leaf (nothing it guards takes another lock besides
-/// the data lock edge above). No other code touches this static.
+/// and never touches the cache; no other site locks this static —
+/// grep-verified single acquisition point), so no inverse order can form.
+/// The cache lock itself remains a leaf. No other code touches this
+/// static.
 static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache {
     gen: 0,
     prefix: Vec::new(),
@@ -409,15 +413,27 @@ pub fn metrics_full() -> bool {
 /// serializes with tps overridden to 0.0/1.0 (restored immediately), so
 /// the stored value is never baked into the cache either.
 ///
-/// Lock ordering (TASK-198 revision): cache lock FIRST (it holds the tps
-/// memo that must resolve lock-free of the data lock), then the snapshot
-/// data lock. Safety: nothing that holds the data lock ever acquires the
-/// cache lock (mutators only bump SNAP_GEN; single acquisition point —
-/// see the note on [`SNAP_JSON_CACHE`]). The ring reads inside the memo
-/// are the bounded lock-free RING_CAP loop, never a mutex. The caller may
-/// hold its own buffer mutex around this with no inverse order anywhere.
-/// Single call site (the C entry); #[inline(never)] keeps the serializer
-/// out of the caller's code region (TASK-181).
+/// Lock ordering (TASK-199 revision): the cache lock is the ONLY lock on
+/// the hit path. The hit assembles the output exclusively from the cached
+/// ranges (built atomically under the data lock at fill time) plus the
+/// memo bytes — the live snapshot content is NEVER read on a hit, so the
+/// data lock there served only to make the SNAP_GEN load race-free. That
+/// load is now lock-free and LINEARIZED: a reader that loads the
+/// pre-bump generation serves the coherent pre-mutation ranges (its read
+/// happened before the mutation — linearized at the load); a reader that
+/// sees the bumped generation takes the miss path, acquires the data
+/// lock, re-verifies the generation under it (another reader may have
+/// refilled while waiting) and rebuilds fresh from the locked content.
+/// No torn output is possible by construction: the ranges swap atomically
+/// under the cache lock, and a mixed old-prefix/new-suffix can only be
+/// assembled from ranges that were never stored together. The data lock
+/// is therefore taken ONLY on the miss/rebuild path (cache -> data
+/// nesting unchanged and still the only nesting; mutators only bump
+/// SNAP_GEN under the data lock and never touch the cache — no inverse
+/// order can form). The caller may hold its own buffer mutex around this
+/// with no inverse order anywhere. Single call site (the C entry);
+/// #[inline(never)] keeps the serializer out of the caller's code region
+/// (TASK-181).
 #[inline(never)]
 #[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
 pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
@@ -438,11 +454,11 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
         }
         return;
     }
-    // TASK-194: generation-gated cache; TASK-198: cache lock first, then
-    // the tps memo resolve, then the data lock (ordering rationale on
-    // SNAP_JSON_CACHE). The struct destructure splits the field borrows
-    // (the borrow checker cannot prove disjointness through
-    // `cache.field` alone inside one fn).
+    // TASK-194: generation-gated cache; TASK-198: tps memo under the same
+    // leaf lock; TASK-199: the hit path runs under the CACHE LOCK ONLY.
+    // The struct destructure splits the field borrows (the borrow checker
+    // cannot prove disjointness through `cache.field` alone inside one
+    // fn).
     let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     let SnapshotJsonCache {
         gen: cached_gen,
@@ -467,11 +483,10 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
     }
     let tps_bytes_len = tps_memo.bytes_len;
     let tps_bytes = &tps_memo.bytes[..tps_bytes_len];
-    let snap = snapshot_arc();
-    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
-    // The gen load happens under the data lock, and every mutator bumps
-    // the gen while holding the same lock, so the comparison cannot race
-    // a mutation.
+    // TASK-199 lock-free linearized generation load (see the locking
+    // note above): a clean generation = serve the coherent cached
+    // ranges WITHOUT touching the live snapshot; a bumped generation =
+    // the miss path below.
     let gen = SNAP_GEN.load(Ordering::Relaxed);
     if *cached_valid && *cached_gen == gen {
         out.extend_from_slice(prefix);
@@ -479,8 +494,20 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
         out.extend_from_slice(suffix);
         return;
     }
-    // Dirty (first call or generation bump): rebuild the prefix/suffix
-    // pair from the locked snapshot.
+    // Miss (first call, generation bump, or a stale-cache race): take
+    // the data lock, RE-VERIFY the generation under it (another reader
+    // may have refilled the cache while we waited — avoid a needless
+    // reserialize), then rebuild the prefix/suffix pair from the locked
+    // snapshot.
+    let snap = snapshot_arc();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+    let gen = SNAP_GEN.load(Ordering::Relaxed);
+    if *cached_valid && *cached_gen == gen {
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(tps_bytes);
+        out.extend_from_slice(suffix);
+        return;
+    }
     let saved = s.tps;
     s.tps = 0.0;
     scratch_a.clear();
@@ -914,6 +941,133 @@ mod bench_hotpath {
             best_memo * 1e9,
             best_warm * 1e9,
             best_ttr * 1e9
+        );
+    }
+
+    /// TASK-199 A/B: the snapshot cache-hit path with and without the
+    /// snapshot data lock. Arm A = the verbatim pre-199 shape (cache lock
+    /// + tps memo + DATA LOCK + generation load + assemble); arm B = the
+    /// TASK-199 lock-free gen-gated hit (cache lock + memo + one linearized
+    /// SNAP_GEN load + assemble — the data lock is gone from the hit
+    /// path). Steady generation (hit regime), 32-labeled fixture, same
+    /// symmetric fold observability as the cache A/B. Runs SOLO.
+    #[test]
+    #[ignore]
+    fn bench_snapshot_hit_ab() {
+        test_reset_snapshot();
+
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("c.bench.hit.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut buf = Vec::with_capacity(4096);
+
+        // warm the cache + memo so both arms run in the hit regime
+        for _ in 0..10_000u32 {
+            buf.clear();
+            snapshot_json_write(&mut buf);
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+
+        // ---- arm A: pre-199 verbatim (data lock on the hit path) ----
+        for _ in 0..1_000u32 {
+            buf.clear();
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let SnapshotJsonCache {
+                gen: cached_gen,
+                valid: cached_valid,
+                prefix,
+                suffix,
+                tps_memo,
+                scratch_a: _scratch_a,
+                scratch_b: _scratch_b,
+            } = &mut *cache;
+            if !tps_memo_resolve(tps_memo) {
+                *cached_valid = false;
+            } else {
+                let tps_bytes_len = tps_memo.bytes_len;
+                let tps_bytes = &tps_memo.bytes[..tps_bytes_len];
+                let snap = snapshot_arc();
+                let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                let gen = SNAP_GEN.load(Ordering::Relaxed);
+                if *cached_valid && *cached_gen == gen {
+                    buf.extend_from_slice(prefix);
+                    buf.extend_from_slice(tps_bytes);
+                    buf.extend_from_slice(suffix);
+                } else {
+                    drop(s);
+                    drop(cache);
+                    snapshot_json_write(&mut buf);
+                }
+            }
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_locked = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf.clear();
+                let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                let SnapshotJsonCache {
+                    gen: cached_gen,
+                    valid: cached_valid,
+                    prefix,
+                    suffix,
+                    tps_memo,
+                    scratch_a: _scratch_a2,
+                    scratch_b: _scratch_b2,
+                } = &mut *cache;
+                if !tps_memo_resolve(tps_memo) {
+                    *cached_valid = false;
+                } else {
+                    let tps_bytes_len = tps_memo.bytes_len;
+                    let tps_bytes = &tps_memo.bytes[..tps_bytes_len];
+                    let snap = snapshot_arc();
+                    let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                    let gen = SNAP_GEN.load(Ordering::Relaxed);
+                    if *cached_valid && *cached_gen == gen {
+                        buf.extend_from_slice(prefix);
+                        buf.extend_from_slice(tps_bytes);
+                        buf.extend_from_slice(suffix);
+                    } else {
+                        drop(s);
+                        drop(cache);
+                        snapshot_json_write(&mut buf);
+                    }
+                }
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_locked = best_locked.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- arm B: TASK-199 lock-free gen-gated hit ----
+        let mut best_lockfree = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf.clear();
+                snapshot_json_write(&mut buf);
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_lockfree = best_lockfree.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH snapshot_hit A/B (32 labeled, steady gen): locked {:.0} ns/op, lockfree {:.0} ns/op (min of {rounds}x{iters})",
+            best_locked * 1e9,
+            best_lockfree * 1e9
         );
     }
 }
@@ -1760,6 +1914,81 @@ mod tests {
 
         // teardown for the parallel suite
         test_reset_ring();
+    }
+
+    /// TASK-199 in-suite: the lock-free gen-gated hit must serve ONLY
+    /// coherent output under concurrent mutation. A mutator thread bumps
+    /// the content generation (set_mem — unbounded bumps, unlike the
+    /// append-capped publish_metric) while the reader loops
+    /// snapshot_json_write: every output must parse as JSON, carry a
+    /// numeric tps and stay within the metrics cap. A torn
+    /// old-prefix/new-suffix mix would break the parse — impossible by
+    /// construction (ranges swap under the cache lock the reader holds);
+    /// a stale-but-coherent pre-mutation snapshot is ALLOWED (the
+    /// linearization point argument). Phase 1 = rebuild-heavy (hot
+    /// mutator), phase 2 = hit-heavy raced (rare mutator), phase 3 =
+    /// quiet steady hits.
+    #[test]
+    fn snapshot_json_lockfree_hit_coherence() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+        for i in 0..4u32 {
+            publish_metric(&format!("race.{i}"), i as f64, None, None);
+        }
+
+        fn check(buf: &mut Vec<u8>, reads: usize, what: &str) {
+            for _ in 0..reads {
+                buf.clear();
+                snapshot_json_write(buf);
+                let v: serde_json::Value = serde_json::from_slice(buf)
+                    .unwrap_or_else(|e| panic!("{what}: output is not valid JSON: {e}"));
+                assert!(v["tps"].is_number(), "{what}: tps must stay a number");
+                let arr = v["metrics"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{what}: metrics array missing"));
+                assert!(arr.len() <= MAX_METRICS, "{what}: metrics cap exceeded");
+            }
+        }
+
+        // phase 1: rebuild-heavy — a hot mutator forces the miss path
+        // under the data lock while the reader reads
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let hot = thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                set_mem(i & 0xFFF, 8192);
+                i += 1;
+            }
+        });
+        let mut buf = Vec::with_capacity(8192);
+        check(&mut buf, 10_000, "rebuild-heavy");
+        stop.store(true, Ordering::Relaxed);
+        hot.join().unwrap();
+
+        // phase 2: hit-heavy raced — the mutator bumps rarely, the reader
+        // mostly takes the lock-free hit and occasionally rebuilds
+        let stop3 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop4 = stop3.clone();
+        let rare = thread::spawn(move || {
+            while !stop4.load(Ordering::Relaxed) {
+                for _ in 0..256 {
+                    if stop4.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::hint::black_box(1);
+                }
+                set_mem(4095, 8192);
+            }
+        });
+        check(&mut buf, 10_000, "hit-heavy raced");
+        stop3.store(true, Ordering::Relaxed);
+        rare.join().unwrap();
+
+        // phase 3: quiet steady hits (no mutator at all)
+        check(&mut buf, 10_000, "quiet steady");
+
+        reset_state();
     }
 
     #[test]
