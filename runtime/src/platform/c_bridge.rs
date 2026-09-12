@@ -36,6 +36,16 @@ pub const CPB_VERSION: u32 = 1;
 /// unobservable without subscribers (publish drops it untouched).
 pub const C_ENTRY_PREGATE: bool = true;
 
+/// TASK-180 A/B toggle: gate the C telemetry entry's labels parse behind the
+/// metrics-full check. `false` = pre-TASK-180 shape (labels always parsed;
+/// publish_metric then drops the metric when the list is at MAX_METRICS).
+/// When the list is full neither state publishes anything; the ONE
+/// documented observable difference is the error code for a MALFORMED
+/// labels string in the full state (0 instead of -2, the parse never ran);
+/// the 0 / -1 / -2 contract is unchanged in every state where a metric
+/// could actually be accepted.
+pub const TELEM_PREGATE: bool = true;
+
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
         return "";
@@ -191,6 +201,13 @@ unsafe extern "C" fn n_telemetry_publish_metric(
     let name = cstr(name);
     if name.is_empty() {
         return -1;
+    }
+    // TASK-180 pre-parse gate: once the metric list is full,
+    // publish_metric drops every further metric — the parsed labels would
+    // be unobservable. Skip the parse entirely (see the TELEM_PREGATE doc
+    // for the one documented observable difference in the full state).
+    if TELEM_PREGATE && telemetry::metrics_full() {
+        return 0;
     }
     let unit = if unit.is_null() { None } else { Some(cstr(unit)) };
     let labels = if labels_json.is_null() {
@@ -757,6 +774,130 @@ mod tests {
             "BENCH c_publish: c_publish(no subs) {:.0} ns/op, c_publish(1 sync sub) {:.0} ns/op (min of {rounds}x{iters})",
             best_none * 1e9,
             best_sync * 1e9
+        );
+    }
+
+    /// TASK-180: C telemetry entry state-independent contract. These two
+    /// asserts hold regardless of the metric list state (parallel test
+    /// processes may have it empty, partially filled or full): an empty
+    /// name is rejected with -1, a NULL labels pointer is accepted with 0.
+    /// State-DEPENDENT semantics (malformed labels -> -2 with room, -> 0
+    /// once the list is full) live in bench_telemetry_c_publish — they
+    /// require the controlled solo state a parallel full-suite run cannot
+    /// provide (the metric list has no removal API and other tests read
+    /// it concurrently).
+    #[test]
+    fn telemetry_c_entry_pregate_semantics() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let name_ok = CString::new("c.gate.metric").unwrap();
+        let labels_ok = CString::new("{\"region\":\"eu\"}").unwrap();
+
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(std::ptr::null(), 1.0, std::ptr::null(), labels_ok.as_ptr()) },
+            -1,
+            "empty name is rejected in any state"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(name_ok.as_ptr(), 1.0, std::ptr::null(), std::ptr::null()) },
+            0,
+            "NULL labels are accepted in any state (room: published, full: capped)"
+        );
+    }
+
+    /// TASK-180 A/B subject: the full C telemetry entry in the steady state
+    /// (list at MAX_METRICS — periodic metric publishers live here forever,
+    /// nothing is ever removed). OFF: the labels JSON is parsed into a
+    /// HashMap and then dropped by the cap on every call; ON: the entry
+    /// returns after the cheap full-check. Control line: NULL labels (no
+    /// parse in either state — the gate must not cost anything there).
+    /// Runs SOLO (filtered run only): it resets the shared snapshot,
+    /// asserts the room-state contract (malformed labels -> -2), fills the
+    /// list to the cap and asserts the full-state contract (nothing
+    /// publishes; malformed labels report 0 — the documented decision),
+    /// then benches the full state. The parallel full-suite run must never
+    /// see the list filled by this bench — hence #[ignore].
+    #[test]
+    #[ignore]
+    fn bench_telemetry_c_publish() {
+        telemetry::test_reset_snapshot();
+
+        // room state: the pre-TASK-180 0 / -2 contract is intact
+        let nm = CString::new("c.bench.metric").unwrap();
+        let lb1 = CString::new("{\"region\":\"eu\"}").unwrap();
+        let bad = CString::new("{not json").unwrap();
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb1.as_ptr()) },
+            0,
+            "with room: valid labels accepted"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), bad.as_ptr()) },
+            -2,
+            "with room: malformed labels rejected before any cap logic"
+        );
+
+        // fill to the cap (unique names, no labels)
+        let mut i = 0u64;
+        while !telemetry::metrics_full() {
+            let n = CString::new(format!("c.bench.fill.{i}")).unwrap();
+            telemetry::publish_metric(n.to_str().unwrap(), i as f64, None, None);
+            i += 1;
+            assert!(i < 10_000, "metric list never filled");
+        }
+        assert!(telemetry::metrics_full(), "bench requires the full state");
+
+        // full state: nothing publishes in either toggle state; the
+        // malformed-labels CODE follows the gate decision (documented):
+        // ON skips the parse -> 0, OFF parses and rejects -> -2
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 2.0, std::ptr::null(), lb1.as_ptr()) },
+            0,
+            "full: the metric is capped in both states"
+        );
+        assert_eq!(
+            unsafe { n_telemetry_publish_metric(nm.as_ptr(), 2.0, std::ptr::null(), bad.as_ptr()) },
+            if TELEM_PREGATE { 0 } else { -2 },
+            "full: malformed-labels code follows the gate decision (documented)"
+        );
+
+        let lb4 = CString::new(
+            "{\"region\":\"eu-central-1\",\"world\":\"overworld\",\"dim\":\"nether\",\"tier\":2}",
+        )
+        .unwrap();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // line 1: full + labeled (4 pairs) — the parse-then-drop shape
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb4.as_ptr()) });
+        }
+        let mut best_labeled = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), lb4.as_ptr()) });
+            }
+            best_labeled = best_labeled.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // control line: full + NULL labels (no parse in either state)
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), std::ptr::null()) });
+        }
+        let mut best_null = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_telemetry_publish_metric(nm.as_ptr(), 1.0, std::ptr::null(), std::ptr::null()) });
+            }
+            best_null = best_null.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH c_telemetry: c_metric(full, labels4) {:.0} ns/op, c_metric(full, no labels) {:.0} ns/op (min of {rounds}x{iters})",
+            best_labeled * 1e9,
+            best_null * 1e9
         );
     }
 }

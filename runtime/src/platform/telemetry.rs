@@ -181,6 +181,30 @@ pub fn publish_metric(
     });
 }
 
+/// Exact pre-parse gate for the C entry (TASK-180): `true` once the metric
+/// list is at [`MAX_METRICS`] — from then on [`publish_metric`] drops every
+/// further metric, so a caller that still has to PARSE its labels payload
+/// may skip that work (the parsed map would be unobservable). The check
+/// takes the same two uncontended locks the publish itself would take
+/// (~30-40 ns) — an order of magnitude below the serde parse it saves.
+/// Recomputed under the lock every call, so snapshot swaps in tests cannot
+/// desynchronize it.
+pub fn metrics_full() -> bool {
+    let snap = snapshot_arc();
+    let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+    s.metrics.len() >= MAX_METRICS
+}
+
+/// Test-only: drop the shared snapshot so the next publish starts a fresh
+/// list. The list itself has no removal API by design (append-only up to
+/// the cap); full-state tests need a way back out of it. Never call from
+/// a test that runs in parallel with metric-reading tests — filtered
+/// single-test runs only.
+#[cfg(test)]
+pub(crate) fn test_reset_snapshot() {
+    *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// Store the latest TPS (external callers; the per-tick path feeds the ring
 /// instead — see [`push_tick_time_at`]).
 pub fn set_tps(v: f64) {
