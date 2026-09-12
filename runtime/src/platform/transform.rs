@@ -877,7 +877,7 @@ fn s32_at(d: &[u8], off: usize, ctx: &str) -> Result<i32, String> {
 // Instrumentation planning and surgical edits.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Edit {
     SetU1(usize, u8),
     SetU2(usize, u16),
@@ -1566,6 +1566,103 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
         pos += entry_len;
     }
     Ok(())
+}
+
+/// TASK-217: the REFUTED alternative fixup shape (test-only record, the
+/// conv/convconst pattern from the boundary stages). The pre-registered
+/// gate was fixup_new <= fixup_old - 2 ns on the fixture; the instrument
+/// measured the OPPOSITE (52 vs 23-24 ns, x2.2 slower): at the production
+/// fixture's scale (A=2 payloads, E~10 edits, R=0 restores) the sorted-offset
+/// precompute pays two allocations + a sort + prefix build to replace ~20
+/// L1-resident, branch-predictable compares. The asymptotic region where the
+/// shape wins is banked in the SAME bench (the x200p crossover arms: 200
+/// payloads x 41 inserts), so any future revival (owner profiling showing
+/// workload-scale A x E) starts from proven-correct code: the suite value
+/// gate `attr_len_fixup_matches_naive_shape` holds it elementwise-identical
+/// to the naive shape across every boundary class of the range filter.
+/// Identity argument (unchanged): qualifying Insert edits are collected once
+/// (non-Insert edits contribute zero to every delta; Insert edits whose
+/// offset is in `restores` are the net-zero re-emissions the Plan contract
+/// excludes), sorted by offset and prefix-summed; each payload's delta is
+/// two `partition_point` searches over the SAME inclusive range the naive
+/// shape filters (`o >= payload_off && o <= payload_end`), so `pre[hi] -
+/// pre[lo]` is exactly the sum of Insert lengths with offset in range and
+/// offset not in restores; payload order is the caller's, the delta!=0 gate
+/// and the SetU4 shape are identical -> element-for-element identical fixup
+/// list, byte-identical apply_edits output by construction.
+#[cfg(test)]
+fn attr_len_fixup_edits(
+    payloads: impl Iterator<Item = (usize, usize)>,
+    restores: &[usize],
+    edits: &[Edit],
+) -> Vec<Edit> {
+    let mut ins: Vec<(usize, i64)> = edits
+        .iter()
+        .filter_map(|e| match e {
+            Edit::Insert(o, b) if !restores.contains(o) => Some((*o, b.len() as i64)),
+            _ => None,
+        })
+        .collect();
+    ins.sort_unstable_by_key(|&(o, _)| o);
+    let mut pre = Vec::with_capacity(ins.len() + 1);
+    pre.push(0i64);
+    let mut acc = 0i64;
+    for &(_, len) in &ins {
+        acc += len;
+        pre.push(acc);
+    }
+    let mut out: Vec<Edit> = Vec::new();
+    for (payload_off, payload_len) in payloads {
+        let payload_end = payload_off + payload_len;
+        let lo = ins.partition_point(|&(o, _)| o < payload_off);
+        let hi = ins.partition_point(|&(o, _)| o <= payload_end);
+        let delta = pre[hi] - pre[lo];
+        if delta != 0 {
+            out.push(Edit::SetU4(
+                payload_off - 4,
+                (payload_len as i64 + delta) as u32,
+            ));
+        }
+    }
+    out
+}
+
+/// Verbatim image of the production attr_len fixup pass (apply_slow's
+/// inline block, restored by the TASK-217 refutation): a full edit scan per
+/// payload with the linear `restores` check inside the filter. Test-only;
+/// consumed by `bench_transform_attrfixup_iso` (fixup old arm — the numbers
+/// are therefore about the production shape) and kept elementwise-identical
+/// to the refuted alternative by the bench gates + the suite value gate.
+#[cfg(test)]
+fn attr_len_fixup_edits_naive(
+    payloads: impl Iterator<Item = (usize, usize)>,
+    restores: &[usize],
+    edits: &[Edit],
+) -> Vec<Edit> {
+    let mut out: Vec<Edit> = Vec::new();
+    for (payload_off, payload_len) in payloads {
+        let payload_end = payload_off + payload_len;
+        let delta: i64 = edits
+            .iter()
+            .filter(|e| {
+                let o = e.offset();
+                o >= payload_off
+                    && o <= payload_end
+                    && !matches!(e, Edit::Insert(_, _) if restores.contains(&o))
+            })
+            .map(|e| match e {
+                Edit::Insert(_, b) => b.len() as i64,
+                _ => 0,
+            })
+            .sum();
+        if delta != 0 {
+            out.push(Edit::SetU4(
+                payload_off - 4,
+                (payload_len as i64 + delta) as u32,
+            ));
+        }
+    }
+    out
 }
 
 /// Rebuild the class bytes from the original buffer plus edits. Edits are
@@ -2338,6 +2435,63 @@ mod conflict_guard_tests {
 }
 
 #[cfg(test)]
+mod attr_fixup_tests {
+    //! TASK-217 value gate for the restructured attr_len fixup.
+
+    use super::*;
+
+    /// The restructured fixup must be elementwise identical to the banked
+    /// naive shape AND carry hand-computed SetU4 values, across every
+    /// boundary class of the range filter: inserts at payload_off, at the
+    /// INCLUSIVE payload_end, one past it, an offset in restores (excluded),
+    /// duplicate offsets (summed), a Set-only range (zero contribution), and
+    /// the delta==0 skip. Payloads mirror production order: per method, the
+    /// Code payload then its sub-attributes.
+    #[test]
+    fn attr_len_fixup_matches_naive_shape() {
+        // method 1: Code [100,140) (filter range [100,140] inclusive),
+        // SMT sub [120,130); method 2: Code [200,210); method 3: Code
+        // [300,305) with no qualifying inserts (the delta==0 skip).
+        let payloads = [(100usize, 40usize), (120, 10), (200, 10), (300, 5)];
+        let restores = [126usize];
+        let edits = vec![
+            Edit::Insert(95, vec![0; 2].into_boxed_slice()),  // below every range
+            Edit::Insert(100, vec![0; 3].into_boxed_slice()), // at payload_off of [100,140]
+            Edit::Insert(125, vec![0; 5].into_boxed_slice()), // inside [120,130] and [100,140]
+            Edit::Insert(126, vec![0; 8].into_boxed_slice()), // in restores -> excluded from both
+            Edit::Insert(130, vec![0; 4].into_boxed_slice()), // at INCLUSIVE payload_end of [120,130]
+            Edit::Insert(140, vec![0; 7].into_boxed_slice()), // at INCLUSIVE payload_end of [100,140]
+            Edit::Insert(141, vec![0; 6].into_boxed_slice()), // one past [100,140]
+            Edit::SetU2(122, 5),                              // in range, contributes zero
+            Edit::Insert(200, vec![0; 2].into_boxed_slice()), // at payload_off of [200,210]
+            Edit::Insert(205, vec![0; 3].into_boxed_slice()), // duplicate offset (a)
+            Edit::Insert(205, vec![0; 4].into_boxed_slice()), // duplicate offset (b)
+            Edit::Insert(210, vec![0; 1].into_boxed_slice()), // at INCLUSIVE payload_end of [200,210]
+            Edit::SetU4(302, 9),                              // Set-only range: zero contribution
+        ];
+
+        let new = attr_len_fixup_edits(payloads.iter().copied(), &restores, &edits);
+        let old = attr_len_fixup_edits_naive(payloads.iter().copied(), &restores, &edits);
+        assert_eq!(new, old, "shapes must be elementwise identical");
+
+        // Hand-computed: [100,140] takes 100(+3) + 125(+5) + 130(+4) +
+        // 140(+7) = +19 (126 excluded, 141 out, the Set contributes zero)
+        // -> SetU4(96, 59); [120,130] takes 125(+5) + 130(+4) = +9 (126
+        // excluded) -> SetU4(116, 19); [200,210] takes 200(+2) + 205(+3+4)
+        // + 210(+1) = +10 -> SetU4(196, 20); [300,305] takes nothing ->
+        // skipped entirely.
+        assert_eq!(
+            new,
+            vec![
+                Edit::SetU4(96, 59),
+                Edit::SetU4(116, 19),
+                Edit::SetU4(196, 20),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod bench_hotpath {
     //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_transform`.
     //! The no-match path is THE per-class-load hot path (lib.rs CFLH fires for every
@@ -2611,6 +2765,145 @@ mod bench_hotpath {
         });
         time("plan+edits", rounds, iters, || {
             let out = transform_tail_replica(NAME, &bytes, &matched).expect("replica ok");
+            black_box(out);
+        });
+    }
+
+    /// TASK-217: iso decomposition of the attr_len fixup pass (never measured
+    /// before this bench). The fixture (parse + plan + cp pushes + collected
+    /// payload ranges) is built once; the production shape (naive, verbatim
+    /// image) and the refuted sorted-offset shape are asserted elementwise
+    /// identical BEFORE timing, then timed min-of-5x200k:
+    ///   - `fixup old` / `fixup new` at fixture scale (A=2, E~10, R=0):
+    ///     the REFUTATION numbers (52 vs 23-24 ns — the lever loses, the
+    ///     precompute's two allocs + sort dominate the ~20 compares).
+    ///   - `fixup old/new x200p` over a workload-scale fixture (200 payloads
+    ///     x 41 inserts, one restored offset): the crossover record — where
+    ///     the refuted shape starts winning, banked for any future revival.
+    #[test]
+    #[ignore]
+    fn bench_transform_attrfixup_iso() {
+        use std::hint::black_box;
+        const NAME: &str = "net/minecraft/server/MinecraftServer";
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let hash = super::super::rcu::fnv1a(NAME.as_bytes());
+        let view = e.view_snapshot();
+        let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
+        if let Some(slot) = view.exact_find(hash, NAME) {
+            matched.extend(slot.idxs.iter().map(|&i| (i, &view.rules[i])));
+        }
+        for w in &view.wildcards {
+            let hit = match &w.kind {
+                WildKind::Any => true,
+                WildKind::Suffix(s) => NAME.ends_with(&**s),
+                WildKind::Prefix(p) => NAME.starts_with(&**p),
+            };
+            if hit {
+                matched.push((w.idx, &view.rules[w.idx]));
+            }
+        }
+        matched.sort_unstable_by_key(|(i, _)| *i);
+        assert!(!matched.is_empty(), "engine must match the bench name");
+
+        let class = parse_class(&bytes).expect("parse ok");
+        let mut plan = Plan::default();
+        for (_, rule) in matched.iter().copied() {
+            for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
+                match &rule.injection {
+                    Injection::MethodEntry => {
+                        plan_method_entry(&class, m, &rule.helper, &mut plan).expect("plan ok");
+                    }
+                    Injection::BeforeCall(target) => {
+                        plan_before_call(&class, m, target, &rule.helper, &mut plan).expect("plan ok");
+                    }
+                }
+            }
+        }
+        assert!(!plan.is_empty(), "fixture must produce edits");
+        let mut edits = plan.edits;
+        if plan.cp_added > 0 {
+            edits.push(Edit::Insert(class.cp_end, plan.cp_bytes.into_boxed_slice()));
+            edits.push(Edit::SetU2(8, class.cp.len() as u16 + plan.cp_added));
+        }
+        let payloads: Vec<(usize, usize)> = class
+            .methods
+            .iter()
+            .filter_map(|m| m.code.as_ref())
+            .flat_map(|code| {
+                std::iter::once((code.attr_len_off + 4, code.attr_len))
+                    .chain(code.sub.iter().map(|s| (s.off, s.len)))
+            })
+            .collect();
+        let restores = plan.restores.clone();
+        assert!(!payloads.is_empty(), "fixture must have coded methods");
+
+        // Elementwise gate before timing: the two shapes must agree exactly.
+        let old = attr_len_fixup_edits_naive(payloads.iter().copied(), &restores, &edits);
+        let new = attr_len_fixup_edits(payloads.iter().copied(), &restores, &edits);
+        assert_eq!(old, new, "fixup shapes must be elementwise identical");
+
+        fn time(label: &str, rounds: u32, iters: u32, mut f: impl FnMut()) {
+            for _ in 0..10_000u32 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            println!(
+                "BENCH transform attrfixup {label}: {:.0} ns/op (min of {rounds}x{iters})",
+                best * 1e9
+            );
+        }
+
+        time("fixup old", rounds, iters, || {
+            let out = attr_len_fixup_edits_naive(payloads.iter().copied(), &restores, &edits);
+            black_box(out);
+        });
+        time("fixup new", rounds, iters, || {
+            let out = attr_len_fixup_edits(payloads.iter().copied(), &restores, &edits);
+            black_box(out);
+        });
+
+        // Crossover record at workload scale: 200 payloads x 41 inserts.
+        // Payload i covers [1000+16i, 1012+16i] (disjoint, 4-byte gaps);
+        // every 5th payload hosts a 6-byte insert at off+4, payload 0's
+        // insert offset (1004) is ALSO the restored offset (the filter
+        // excludes both co-located inserts -> payload 0's delta is 0 and
+        // skipped: 39 SetU4s expected).
+        let big_payloads: Vec<(usize, usize)> =
+            (0..200usize).map(|i| (1000 + i * 16, 12)).collect();
+        let mut big_edits: Vec<Edit> = (0..40usize)
+            .map(|j| Edit::Insert(1000 + (j * 5) * 16 + 4, vec![0u8; 6].into_boxed_slice()))
+            .collect();
+        big_edits.push(Edit::Insert(1004, vec![0u8; 2].into_boxed_slice()));
+        let big_restores = [1004usize];
+        let big_old =
+            attr_len_fixup_edits_naive(big_payloads.iter().copied(), &big_restores, &big_edits);
+        let big_new =
+            attr_len_fixup_edits(big_payloads.iter().copied(), &big_restores, &big_edits);
+        assert_eq!(
+            big_old, big_new,
+            "shapes must agree at workload scale too"
+        );
+        assert_eq!(big_new.len(), 39, "39 payloads carry a nonzero delta");
+
+        time("fixup old x200p", rounds, iters, || {
+            let out =
+                attr_len_fixup_edits_naive(big_payloads.iter().copied(), &big_restores, &big_edits);
+            black_box(out);
+        });
+        time("fixup new x200p", rounds, iters, || {
+            let out =
+                attr_len_fixup_edits(big_payloads.iter().copied(), &big_restores, &big_edits);
             black_box(out);
         });
     }
