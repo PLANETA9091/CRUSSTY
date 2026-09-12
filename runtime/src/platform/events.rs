@@ -2221,6 +2221,26 @@ mod bench_hotpath {
     ///                   numbers; the no-waiter line includes two
     ///                   Instant reads ~40ns and is overhead-bound if the
     ///                   glibc fast path skips the syscall)
+    /// TASK-208 reproducibility pass: a 5-fresh-process study on
+    /// unmodified HEAD banked the run-to-run truth — deterministic arms
+    /// are stable to <5% (framing 0%, payload 1.7%, serial 4.7%, notify
+    /// no-waiter 0.8%) while the distributional arms are a CHAOTIC
+    /// regime, not a noisy scalar (e2e min 565-754 ns = 33% spread,
+    /// prebuilt 525-764 = 45% with the shed count itself random-walking
+    /// 108k-337k, cadence min 650-971 / med 3935-5676, parked-notify min
+    /// 143-358 = 150%): the shed rate is an emergent oscillator state,
+    /// so scalar reproducibility is structurally impossible. The
+    /// hardening is INLINE REGIME INSTRUMENTATION — worst-of-rounds
+    /// spread for the enqueue arms, p10/p90 for cadence, worst-of-3 for
+    /// drain, med for parked — ADDED ALONGSIDE unchanged headline
+    /// statistics (same warmups, same sample counts, same min-of
+    /// methodology: historical bands stay comparable; the ledger quotes
+    /// the regime, not a fake scalar). A pre-registered WARMUP BURN-IN
+    /// lever (10k -> 60k pre-timing pushes) was probed and REFUTED with
+    /// numbers: e2e spread 29% vs 33% baseline (noise), prebuilt 73%,
+    /// worker_drain 76% (worse), band centers drifted +30-50 ns — the
+    /// regime is a sustained oscillator, not a startup-phase artifact;
+    /// the warmup stays 10k.
     #[test]
     #[ignore]
     fn bench_publish_shared_enqueue_iso() {
@@ -2231,25 +2251,32 @@ mod bench_hotpath {
         let rounds = 5;
         let mut fold = 0u64; // observability guard against elision
 
+        // TASK-208: returns (name, best, worst) — worst is the max
+        // per-round average, reported for the DISTRIBUTIONAL arms so the
+        // regime spread travels inline with the headline (which stays
+        // methodology-identical: min of {rounds}x{iters}).
         fn time_arm(
             name: &'static str,
             mut op: impl FnMut() -> u64,
             fold: &mut u64,
             iters: u32,
             rounds: u32,
-        ) -> (&'static str, f64) {
+        ) -> (&'static str, f64, f64) {
             for _ in 0..10_000u32 {
                 *fold = fold.wrapping_add(op());
             }
             let mut best = f64::MAX;
+            let mut worst = f64::MIN;
             for _ in 0..rounds {
                 let start = Instant::now();
                 for _ in 0..iters {
                     *fold = fold.wrapping_add(op());
                 }
-                best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+                let per = start.elapsed().as_secs_f64() / f64::from(iters);
+                best = best.min(per);
+                worst = worst.max(per);
             }
-            (name, best * 1e9)
+            (name, best * 1e9, worst * 1e9)
         }
 
         // framing_sync — the non-queue part through the memo machinery.
@@ -2402,6 +2429,7 @@ mod bench_hotpath {
             std::hint::spin_loop();
         }
         let mut best_drain = f64::MAX;
+        let mut worst_drain = f64::MIN;
         let mut drain_len = DRAIN_TASKS;
         for _ in 0..3 {
             while drain_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
@@ -2452,6 +2480,7 @@ mod bench_hotpath {
                 best_drain = per;
                 drain_len = start_len;
             }
+            worst_drain = worst_drain.max(per);
         }
 
         // enq_cadence — the production-cadence arm: exactly one task in
@@ -2500,6 +2529,12 @@ mod bench_hotpath {
         cad_samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in elapsed"));
         let cad_min = cad_samples[0];
         let cad_med = cad_samples[cad_iters / 2];
+        // TASK-208: the 5-fresh-process study showed the min/med pair
+        // alone reads as a stable scalar while the whole distribution
+        // shifts per process (med 3935-5676 ns across 5 runs) — p10/p90
+        // are printed so the regime SHAPE travels with the line.
+        let cad_p10 = cad_samples[cad_iters / 10];
+        let cad_p90 = cad_samples[cad_iters * 9 / 10];
 
         // notify lines — the wake term, min of samples. no_waiter: a
         // condvar nobody ever waited on (glibc __wrefs fast path?).
@@ -2525,7 +2560,7 @@ mod bench_hotpath {
             );
             std::hint::spin_loop();
         }
-        let mut best_parked = f64::MAX;
+        let mut park_samples = Vec::with_capacity(256);
         for _ in 0..256usize {
             let deadline = Instant::now() + Duration::from_secs(5);
             while np_pool.idle.load(Ordering::SeqCst) != ASYNC_WORKERS {
@@ -2544,13 +2579,14 @@ mod bench_hotpath {
                 np_pool.condvar.notify_one();
             }
             let ns = t0.elapsed().as_secs_f64() * 1e9;
-            if ns < best_parked {
-                best_parked = ns;
-            }
+            park_samples.push(ns);
         }
+        park_samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in elapsed"));
+        let best_parked = park_samples[0];
+        let med_parked = park_samples[128];
 
         println!(
-            "BENCH publish_shared_enqueue_iso: [{}] {:.0} ns/op, [{}] {:.0} ns/op, [{}] {:.0} ns/op (sheds {}), [{}] {:.0} ns/op (sheds {}), [{}] {:.0} ns/op; worker_drain {:.0} ns/task ({} tasks, single worker, min of 3); cadence push->drained min {:.0} / med {:.0} ns ({} iters); notify no-waiter {:.0} ns / parked {:.0} ns (min of samples); fold {} (loops min of {rounds}x{iters})",
+            "BENCH publish_shared_enqueue_iso: [{}] {:.0} ns/op, [{}] {:.0} ns/op, [{}] {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}), [{}] {:.0} ns/op (sheds {}, rounds spread {:.2}x worst {:.0}), [{}] {:.0} ns/op; worker_drain {:.0} ns/task min (worst-of-3 {:.0}; {} tasks, single worker); cadence push->drained min {:.0} / med {:.0} / p10 {:.0} / p90 {:.0} ns ({} iters); notify no-waiter {:.0} ns / parked min {:.0} / med {:.0} ns (min/med of samples); fold {} (loops min of {rounds}x{iters})",
             framing.0,
             framing.1,
             payload_build.0,
@@ -2558,18 +2594,26 @@ mod bench_hotpath {
             enq_e2e.0,
             enq_e2e.1,
             sheds_e2e,
+            enq_e2e.2 / enq_e2e.1,
+            enq_e2e.2,
             enq_prebuilt.0,
             enq_prebuilt.1,
             sheds_prebuilt,
+            enq_prebuilt.2 / enq_prebuilt.1,
+            enq_prebuilt.2,
             enq_serial.0,
             enq_serial.1,
             best_drain,
+            worst_drain,
             drain_len,
             cad_min,
             cad_med,
+            cad_p10,
+            cad_p90,
             cad_iters,
             best_no_waiter,
             best_parked,
+            med_parked,
             fold,
         );
         assert!(fold != u64::MAX);
