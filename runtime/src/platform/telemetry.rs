@@ -165,7 +165,35 @@ struct SnapshotJsonCache {
     /// JSON output cannot contain a raw 0x00 — control characters are
     /// escaped), so the terminator is the only NUL in the buffer.
     c_buf: Vec<u8>,
+    /// TASK-201: identity of the last zero-copy-servable fill of `c_buf`
+    /// (see [`CFill`]). Guard state only — never read by C.
+    c_fill: CFill,
     valid: bool,
+}
+
+/// TASK-201: the zero-copy steady-state guard for the C snapshot entry.
+/// After every [`snapshot_c_entry`] fill, `c_buf` holds EXACTLY
+/// `prefix + tps_memo bytes + suffix + NUL` at cache generation `gen`
+/// (or one of the guarded `{}` fallback shapes — every fallback arm
+/// invalidates `valid`, and the fast-path consumer re-checks the cache's
+/// own `valid` flag, so a fallback-written buffer can never be served as
+/// a cached assemble). While the cache generation AND the resolved tps
+/// memo bytes are unchanged, the next entry call would assemble
+/// byte-identical output — so the whole clear + 3x extend + NUL cycle is
+/// skippable and the existing pointer can be returned directly (the
+/// valid-until-next-call contract permits it; a repeated identical
+/// pointer with identical bytes is observationally the same fill). The
+/// bytes compare catches tps changes that do NOT bump the generation
+/// (ticks are gen-stable — TASK-199); the gen compare catches publishes.
+struct CFill {
+    /// false = c_buf content is not known to be a cache assemble + NUL.
+    valid: bool,
+    /// The cache generation the last fill assembled at.
+    gen: u64,
+    /// Length of the tps memo bytes embedded in the last fill.
+    bytes_len: usize,
+    /// Copy of the tps memo bytes embedded in the last fill.
+    bytes: [u8; 40],
 }
 
 /// TASK-198: incremental state for the live tps on the snapshot READ path.
@@ -257,6 +285,7 @@ impl Default for SnapshotJsonCache {
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
             c_buf: Vec::new(),
+            c_fill: CFill { valid: false, gen: 0, bytes_len: 0, bytes: [0; 40] },
             valid: false,
         }
     }
@@ -301,6 +330,7 @@ static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache 
     scratch_a: Vec::new(),
     scratch_b: Vec::new(),
     c_buf: Vec::new(),
+    c_fill: CFill { valid: false, gen: 0, bytes_len: 0, bytes: [0; 40] },
     valid: false,
 });
 
@@ -520,6 +550,7 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
         scratch_a,
         scratch_b,
         c_buf,
+        c_fill,
     } = &mut *cache;
     let out: &mut Vec<u8> = match out {
         SnapshotOut::Ext(v) => v,
@@ -533,6 +564,7 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
         // `{}` fallback and invalidate both layers so the next call retries.
         tps_memo.valid = false;
         *cached_valid = false;
+        c_fill.valid = false; // TASK-201: c_buf is about to hold `{}`, not an assemble
         out.clear();
         out.extend_from_slice(b"{}");
         return;
@@ -576,6 +608,7 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
         // Unreachable for this Serialize impl, kept for parity with the
         // legacy `{}` fallback.
         *cached_valid = false;
+        c_fill.valid = false; // TASK-201: c_buf is about to hold `{}`, not an assemble
         out.clear();
         out.extend_from_slice(b"{}");
         return;
@@ -599,6 +632,7 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
             // byte of the tps value span. Serve the legacy fallback and
             // leave the cache invalid so the next call retries the fill.
             *cached_valid = false;
+            c_fill.valid = false; // TASK-201: c_buf is about to hold `{}`, not an assemble
             out.clear();
             out.extend_from_slice(b"{}");
         }
@@ -635,14 +669,92 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
 /// level; cache -> data (miss path) is unchanged and remains the only
 /// nesting. #[inline(never)] keeps the serializer out of the caller's
 /// code region (TASK-181 discipline).
+///
+/// TASK-201 zero-copy steady state: after every fill, the fill identity
+/// (cache gen + resolved tps memo bytes) is recorded into `c_fill` —
+/// while BOTH stay unchanged, the next call would assemble
+/// byte-identical output, so the whole clear + 3x extend + NUL cycle is
+/// skipped and the existing pointer is returned (the
+/// valid-until-next-call contract permits a repeated identical pointer
+/// with identical bytes — observationally the same fill). The guard is
+/// [`centry_zerocopy_hit`], checked BEFORE the entry's clear — the
+/// first cut placed it inside the write body AFTER the clear and served
+/// an emptied buffer (the parity test caught it immediately); the
+/// number of published metrics vanishes from the steady-state read
+/// (nothing scales with the output length anymore). Bytes remain
+/// bit-identical or the guard would not fire (gen compare catches
+/// publishes, memo-bytes compare catches gen-stable tick drift, the
+/// `{}` fallbacks invalidate the guard).
 #[inline(never)]
 pub(crate) fn snapshot_c_entry() -> *const std::os::raw::c_char {
     let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    // TASK-201 zero-copy steady state: the check MUST run before the
+    // clear — once c_buf is cleared the recorded identity would still
+    // match while the content is gone.
+    if centry_zerocopy_hit(&mut cache) {
+        return cache.c_buf.as_ptr() as *const std::os::raw::c_char;
+    }
     cache.c_buf.clear();
     snapshot_json_write_inner(&mut cache, SnapshotOut::Own);
-    let buf = &mut cache.c_buf;
-    buf.push(0);
-    buf.as_ptr() as *const std::os::raw::c_char
+    cache.c_buf.push(0);
+    // TASK-201: record the fill identity for the zero-copy steady state
+    // (see [`CFill`]). Unconditional: a `{}` fallback already invalidated
+    // c_fill inside the write body and the fast-path consumer re-checks
+    // the cache's own `valid` flag, so recording gen/bytes after a
+    // fallback fill is inert. Runs under the cache lock the entry
+    // already holds — the memo cannot move underneath (all memo mutation
+    // is cache-lock-guarded) and `gen` is the exact generation the
+    // prefix/suffix were assembled at (set by the write body itself).
+    {
+        let SnapshotJsonCache { gen, tps_memo, c_fill, .. } = &mut *cache;
+        c_fill.valid = true;
+        c_fill.gen = *gen;
+        c_fill.bytes_len = tps_memo.bytes_len;
+        c_fill.bytes[..tps_memo.bytes_len]
+            .copy_from_slice(&tps_memo.bytes[..tps_memo.bytes_len]);
+    }
+    cache.c_buf.as_ptr() as *const std::os::raw::c_char
+}
+
+/// TASK-201: the zero-copy steady-state check for [`snapshot_c_entry`].
+/// Returns true when `c_buf` ALREADY holds the exact output the entry
+/// would assemble — `prefix + resolved tps memo bytes + suffix + NUL` at
+/// the live generation — so the caller can return the existing pointer
+/// WITHOUT the clear + assemble + NUL cycle. The guard is the recorded
+/// fill identity ([`CFill`]): the cache is valid, the recorded
+/// generation matches the live `SNAP_GEN` AND the cache's own
+/// generation (prefix/suffix unchanged), and the resolved tps memo
+/// bytes match the recorded ones (gen-stable tick drift caught here —
+/// ticks never bump the content generation, TASK-199). The memo is
+/// resolved FIRST (its steady-state advance is idempotent: a following
+/// [`snapshot_json_write_inner`] call re-resolves to the same state);
+/// the `{}` fallback arms invalidate `c_fill` inside the write body, so
+/// a fallback-written buffer can never be served as a cached assemble.
+/// With [`TELEM_SNAP_CACHE`] off the guard never fires (the write body
+/// reserializes in place; the cache never serves). Runs under the cache
+/// lock the entry already holds.
+fn centry_zerocopy_hit(cache: &mut SnapshotJsonCache) -> bool {
+    if !TELEM_SNAP_CACHE {
+        return false;
+    }
+    let SnapshotJsonCache {
+        gen: cached_gen,
+        valid: cached_valid,
+        tps_memo,
+        c_fill,
+        ..
+    } = cache;
+    if !(*cached_valid && c_fill.valid && c_fill.gen == *cached_gen && tps_memo.valid) {
+        return false;
+    }
+    if !tps_memo_resolve(tps_memo) {
+        return false;
+    }
+    let gen = SNAP_GEN.load(Ordering::Relaxed);
+    *cached_gen == gen
+        && c_fill.gen == gen
+        && tps_memo.bytes_len == c_fill.bytes_len
+        && tps_memo.bytes[..tps_memo.bytes_len] == c_fill.bytes[..c_fill.bytes_len]
 }
 
 /// Split point between two serializations of the SAME snapshot whose only
@@ -1090,6 +1202,7 @@ mod bench_hotpath {
                 scratch_a: _scratch_a,
                 scratch_b: _scratch_b,
                 c_buf: _c_buf,
+                ..
             } = &mut *cache;
             if !tps_memo_resolve(tps_memo) {
                 *cached_valid = false;
@@ -1126,6 +1239,7 @@ mod bench_hotpath {
                     scratch_a: _scratch_a2,
                     scratch_b: _scratch_b2,
                     c_buf: _c_buf2,
+                    ..
                 } = &mut *cache;
                 if !tps_memo_resolve(tps_memo) {
                     *cached_valid = false;
@@ -1166,6 +1280,103 @@ mod bench_hotpath {
             "BENCH snapshot_hit A/B (32 labeled, steady gen): locked {:.0} ns/op, lockfree {:.0} ns/op (min of {rounds}x{iters})",
             best_locked * 1e9,
             best_lockfree * 1e9
+        );
+    }
+
+    /// TASK-201 A/B subject: the C snapshot entry's steady-state read.
+    /// Arm A = the verbatim pre-201 fill cycle (cache lock + clear +
+    /// snapshot_json_write_inner(Own) + NUL push — no fast check, no
+    /// record); arm B = snapshot_c_entry (the c_fill record on fills +
+    /// the zero-copy guard on steady-state reads — in this bench every
+    /// call after the first IS a steady read, so arm B measures the
+    /// fast path). Lines: empty metric list (control) and 32 labeled
+    /// metrics — the label count must VANISH from arm B (nothing scales
+    /// with the output length anymore). Byte-identity through the fast
+    /// path is asserted by snapshot_c_entry_zerocopy_parity (tests
+    /// module). Runs SOLO (filtered run only): resets the shared
+    /// snapshot and leaves 32 metrics published at the end (harmless —
+    /// every solo bench resets its own starting state).
+    #[test]
+    #[ignore]
+    fn bench_snapshot_centry_zerocopy_ab() {
+        test_reset_snapshot();
+
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // Arm A: the pre-201 entry body, verbatim.
+        let entry_fill = || -> *const std::os::raw::c_char {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            cache.c_buf.clear();
+            snapshot_json_write_inner(&mut cache, SnapshotOut::Own);
+            cache.c_buf.push(0);
+            cache.c_buf.as_ptr() as *const std::os::raw::c_char
+        };
+
+        // ---- line 1: empty metric list (control) ----
+        for _ in 0..10_000u32 {
+            std::hint::black_box(entry_fill());
+            std::hint::black_box(snapshot_c_entry());
+        }
+        let mut best_empty_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(entry_fill());
+            }
+            best_empty_a = best_empty_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_empty_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(snapshot_c_entry());
+            }
+            best_empty_b = best_empty_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ---- 32 labeled metrics (4 label pairs each) ----
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("t.bench.zc.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+
+        for _ in 0..10_000u32 {
+            std::hint::black_box(entry_fill());
+            std::hint::black_box(snapshot_c_entry());
+        }
+        let mut best_32_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(entry_fill());
+            }
+            best_32_a = best_32_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_32_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(snapshot_c_entry());
+            }
+            best_32_b = best_32_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH centry zerocopy A/B: fill empty {:.0} -> zero-copy empty {:.0} ns/op, fill 32-labeled {:.0} -> zero-copy 32-labeled {:.0} ns/op (min of {rounds}x{iters})",
+            best_empty_a * 1e9,
+            best_empty_b * 1e9,
+            best_32_a * 1e9,
+            best_32_b * 1e9
         );
     }
 }
@@ -2416,6 +2627,230 @@ mod tests {
         let _ = done_rx.recv_timeout(Duration::from_secs(1));
 
         // post-join: no concurrent writers left — race-free read.
+        let p = snapshot_c_entry();
+        let b = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(b).expect("valid JSON after the race");
+        assert!(v["tps"].is_number(), "numeric tps after the race");
+        assert!(v["metrics"].is_array(), "metrics array present after the race");
+    }
+
+    /// TASK-201: the zero-copy steady state — byte parity through the
+    /// fast path, pointer stability, and the two bypass hazards
+    /// (publish = generation bump; tick-class tps change WITHOUT a
+    /// generation bump = the memo-bytes compare). Holds the module
+    /// TEST_LOCK (probe-guarded captures, the same discipline as
+    /// `snapshot_c_entry_single_lock_parity`; probe = content gen / ring
+    /// head / fallback bits — any input the JSON depends on).
+    /// (a) Fill-path parity: c-entry output == Ext assemble + NUL, empty
+    ///     and labeled states (the first call after a state change
+    ///     fills).
+    /// (b) Steady state: 100 back-to-back calls — every call byte-equal
+    ///     to the reference assemble and ALL pointers identical (the
+    ///     fast path performs zero writes).
+    /// (c) Publish bypass: set_mem bumps SNAP_GEN — the next call must
+    ///     refill and reflect the new metric.
+    /// (d) Tick-class tps bypass: test_reset_ring + set_tps change the
+    ///     memo key with the generation UNCHANGED (asserted) — the
+    ///     memo-bytes compare must reject the stale buffer and the next
+    ///     call must reflect the new tps. This is the exact hazard the
+    ///     bytes compare exists for: ticks are gen-stable (TASK-199).
+    /// (e) The steady state (b) holds again after both bypasses.
+    #[test]
+    fn snapshot_c_entry_zerocopy_parity() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Deterministic starting state: the metric list is append-only and
+        // shared for the whole process — test order decides what is already
+        // in it, so the labeled-state count assertion resets it first (the
+        // swap bumps the content generation; parallel publishers hold this
+        // same TEST_LOCK and cannot interleave).
+        test_reset_snapshot();
+        // Deterministic tps state: zero the ring + fallback bits so the
+        // memo lives on the wall-time-independent fallback arm (keyed on
+        // TPS_LAST_BITS) — no ring sample aging can move the bytes
+        // mid-test. The memo key cannot survive a zeroed ring (documented
+        // on test_reset_ring), so the next resolve rebuilds from this
+        // state.
+        test_reset_ring();
+
+        let probe = || {
+            (
+                SNAP_GEN.load(Ordering::Relaxed),
+                RING_HEAD.load(Ordering::Relaxed),
+                TPS_LAST_BITS.load(Ordering::Relaxed),
+            )
+        };
+        // Probe-guarded capture: c-entry bytes + the Ext-assemble
+        // reference + the pointer, retried until the state settles.
+        let capture = |tag: &str| -> (Vec<u8>, usize) {
+            let mut attempts = 0u32;
+            loop {
+                let mut local = Vec::new();
+                let p0 = probe();
+                let ptr = snapshot_c_entry();
+                let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                    .to_bytes_with_nul()
+                    .to_vec();
+                let p1 = probe();
+                snapshot_json_write(&mut local);
+                local.push(0);
+                let p2 = probe();
+                if p0 == p1 && p1 == p2 {
+                    assert_eq!(
+                        bytes, local,
+                        "{tag}: output must be bit-identical to the Ext assemble + NUL"
+                    );
+                    assert_eq!(*bytes.last().unwrap(), 0, "{tag}: NUL-terminated");
+                    return (bytes, ptr as usize);
+                }
+                attempts += 1;
+                assert!(attempts < 1000, "{tag}: snapshot state never settled");
+            }
+        };
+
+        // (a) empty state: the first capture fills, the next steady
+        // calls take the fast path — parity must hold through both.
+        let (ref_bytes, ref_ptr) = capture("empty fill");
+        for i in 0..100u32 {
+            let ptr = snapshot_c_entry();
+            let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_bytes_with_nul()
+                .to_vec();
+            assert_eq!(
+                &bytes, &ref_bytes,
+                "steady call {i} drifted from the reference assemble"
+            );
+            assert_eq!(
+                ptr as usize, ref_ptr,
+                "steady call {i} must keep the pointer (zero-copy, zero writes)"
+            );
+        }
+
+        // labeled state: 4 metrics, same parity through fill + fast path.
+        for i in 0..4u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("t.zc.parity.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+        let (ref_bytes, ref_ptr) = capture("labeled fill");
+        let v: serde_json::Value =
+            serde_json::from_slice(&ref_bytes[..ref_bytes.len() - 1]).expect("valid JSON");
+        assert_eq!(v["metrics"].as_array().unwrap().len(), 4, "labeled state");
+        for i in 0..100u32 {
+            let ptr = snapshot_c_entry();
+            let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_bytes_with_nul()
+                .to_vec();
+            assert_eq!(&bytes, &ref_bytes, "labeled steady call {i} drifted");
+            assert_eq!(ptr as usize, ref_ptr, "labeled steady call {i} moved the pointer");
+        }
+
+        // (c) publish bypass: a gen bump must refill (the guard fires
+        // only while the generation is unchanged).
+        set_mem(77, 128);
+        let (pub_bytes, _) = capture("publish refill");
+        let v: serde_json::Value =
+            serde_json::from_slice(&pub_bytes[..pub_bytes.len() - 1]).expect("valid JSON");
+        assert_eq!(v["mem_used_mb"].as_u64(), Some(77), "publish must be reflected");
+
+        // (d) tick-class tps bypass: the memo key changes with the
+        // generation UNCHANGED — only the memo-bytes compare can reject
+        // the stale buffer.
+        let gen_before = SNAP_GEN.load(Ordering::Relaxed);
+        test_reset_ring();
+        set_tps(7.25);
+        let (tps_bytes, _) = capture("tps refill");
+        let v: serde_json::Value =
+            serde_json::from_slice(&tps_bytes[..tps_bytes.len() - 1]).expect("valid JSON");
+        assert_eq!(v["tps"].as_f64(), Some(7.25), "tps change must be reflected");
+        assert_eq!(
+            SNAP_GEN.load(Ordering::Relaxed),
+            gen_before,
+            "tps bypass must be gen-stable (the bytes compare, not the gen compare, caught it)"
+        );
+
+        // (e) the steady state holds again after both bypasses.
+        let (ref_bytes, ref_ptr) = capture("post-bypass fill");
+        for i in 0..50u32 {
+            let ptr = snapshot_c_entry();
+            let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_bytes_with_nul()
+                .to_vec();
+            assert_eq!(&bytes, &ref_bytes, "post-bypass steady call {i} drifted");
+            assert_eq!(ptr as usize, ref_ptr, "post-bypass steady call {i} moved the pointer");
+        }
+    }
+
+    /// TASK-201: concurrent liveness through the zero-copy fast path.
+    /// Phase 1 (mixed): 3 writer threads x 2k calls + a set_mem mutator
+    /// forcing generation bumps under the writers — fills and fast calls
+    /// interleave; join is the liveness proof (a deadlock would hang the
+    /// harness). Phase 2 (quiet): the mutator stopped, the generation
+    /// and memo key are stable — every call is the zero-copy fast path,
+    /// which performs ZERO writes, so all pointer VALUES must be one
+    /// frozen address. Post-join output parses as valid JSON. Pointers
+    /// are never DEREFERENCED inside the racing phases (the
+    /// valid-until-next-call contract; the values are just addresses).
+    #[test]
+    fn snapshot_c_entry_zerocopy_liveness() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Same determinism as the parity test: fallback-arm tps keyed on
+        // frozen bits — phase 2's quiet state is then wall-time stable
+        // and the fast path holds for every call.
+        test_reset_ring();
+
+        // Phase 1: mixed fills + fast calls under a mutator.
+        let mut handles = Vec::new();
+        for _ in 0..3u32 {
+            handles.push(std::thread::spawn(|| {
+                for _ in 0..2000u32 {
+                    std::hint::black_box(snapshot_c_entry() as usize);
+                }
+            }));
+        }
+        for i in 0..6000u32 {
+            set_mem((i % 64 + 1).into(), 64);
+            std::thread::yield_now();
+        }
+        for h in handles {
+            h.join().expect("mixed-phase writer must not panic");
+        }
+
+        // Phase 2: quiet — pure fast path, one frozen pointer for all.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
+        let mut handles = Vec::new();
+        for _ in 0..2u32 {
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ptrs = Vec::with_capacity(1000);
+                for _ in 0..1000u32 {
+                    ptrs.push(snapshot_c_entry() as usize);
+                }
+                let _ = tx.send(ptrs);
+            }));
+        }
+        drop(tx);
+        for h in handles {
+            h.join().expect("quiet-phase writer must not panic");
+        }
+        let mut all = Vec::with_capacity(2000);
+        while let Ok(v) = rx.recv_timeout(Duration::from_secs(1)) {
+            all.extend(v);
+        }
+        assert_eq!(all.len(), 2000, "every quiet-phase call must report its pointer");
+        let distinct: std::collections::HashSet<usize> = all.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "quiet-state fast path must return ONE frozen pointer (zero writes), got {distinct:?} head"
+        );
+
+        // post-join: race-free read.
         let p = snapshot_c_entry();
         let b = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
         let v: serde_json::Value = serde_json::from_slice(b).expect("valid JSON after the race");
