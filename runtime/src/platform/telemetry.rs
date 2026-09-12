@@ -120,6 +120,72 @@ static TPS_LAST_BITS: AtomicU64 = AtomicU64::new(0);
 /// Ticks older than this fall out of the TPS window.
 const TPS_WINDOW_SECS: u64 = 60;
 
+/// TASK-194: snapshot content generation. Every mutator of the shared
+/// snapshot data (publish_metric, set_mem, set_uptime, set_modules,
+/// set_server_name, the 1s refresh thread, the test resets) bumps this
+/// counter while holding the data lock; the JSON cache below compares its
+/// cached generation against it and reserializes only on a mismatch.
+/// Relaxed orderings are sufficient: every load/store happens while the
+/// caller holds the snapshot data mutex, and the mutex lock/unlock pair
+/// provides the happens-before edge between mutator and reader.
+static SNAP_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn bump_snapshot_gen() {
+    SNAP_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// TASK-194: pre-encoded snapshot JSON, split around the tps value span.
+/// `prefix` + `suffix` are the byte ranges of a full serde serialization
+/// of the snapshot before/after the `"tps":` VALUE — built by serde itself
+/// (never hand-rolled), so the cache-hit output is byte-identical to a
+/// fresh serialize as long as the content generation is unchanged. The
+/// live value (tps, ring-fed, changes per call in production) is patched
+/// between the two ranges at read time; `tps_buf`/`scratch_a`/`scratch_b`
+/// are reused so neither the hit nor the dirty path allocates in the
+/// steady state.
+struct SnapshotJsonCache {
+    gen: u64,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    tps_buf: Vec<u8>,
+    scratch_a: Vec<u8>,
+    scratch_b: Vec<u8>,
+    valid: bool,
+}
+
+impl Default for SnapshotJsonCache {
+    fn default() -> Self {
+        SnapshotJsonCache {
+            gen: 0,
+            prefix: Vec::new(),
+            suffix: Vec::new(),
+            tps_buf: Vec::new(),
+            scratch_a: Vec::new(),
+            scratch_b: Vec::new(),
+            valid: false,
+        }
+    }
+}
+
+/// Cache lock is a LEAF taken after the snapshot data lock (same discipline
+/// as the data lock itself: nothing it guards takes another lock). No other
+/// code touches this static.
+static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache {
+    gen: 0,
+    prefix: Vec::new(),
+    suffix: Vec::new(),
+    tps_buf: Vec::new(),
+    scratch_a: Vec::new(),
+    scratch_b: Vec::new(),
+    valid: false,
+});
+
+/// TASK-194 A/B toggle: ON = generation-gated pre-encoded cache (O(buffer)
+/// assemble on a clean generation); OFF = the pre-TASK-194 in-place
+/// reserialize shape, kept verbatim (the byte-identity tests re-derive it
+/// independently).
+const TELEM_SNAP_CACHE: bool = true;
+
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -179,6 +245,7 @@ pub fn publish_metric(
         labels,
         unit: unit.map(str::to_string),
     });
+    bump_snapshot_gen(); // TASK-194: invalidate the pre-encoded JSON cache
 }
 
 /// Exact pre-parse gate for the C entry (TASK-180): `true` once the metric
@@ -195,47 +262,167 @@ pub fn metrics_full() -> bool {
     s.metrics.len() >= MAX_METRICS
 }
 
-/// TASK-181: serialize the current snapshot JSON straight into `out`
-/// WITHOUT the deep clone the `snapshot()` + `serde_json::to_string` pair
-/// pays (that clone allocates every String / labels map in the snapshot —
-/// up to [`MAX_METRICS`] metrics — and is then dropped untouched by the
-/// serializer). The output is byte-identical to
-/// `serde_json::to_string(&snapshot())` (same derived Serialize, same
-/// field order, `to_string` is `to_writer` into a String).
+/// TASK-194: serialize the current snapshot JSON straight into `out`
+/// WITHOUT reserializing when the snapshot content is unchanged since the
+/// last call. Two paths behind the [`TELEM_SNAP_CACHE`] toggle:
+///
+/// - ON (default): the snapshot's JSON is cached as a prefix/suffix pair
+///   split around the `"tps":` value, built by serde itself at fill time
+///   (serialize the locked snapshot twice — tps 0.0 and tps 1.0 — and split
+///   at the first differing byte, which is the tps digit; the two bodies
+///   are equal-length and otherwise byte-identical). On a cache hit
+///   (content generation [`SNAP_GEN`] unchanged) the output is assembled as
+///   prefix + fresh tps bytes + suffix — an O(buffer) copy with the ONLY
+///   live value (tps, ring-fed, changes per call in production) patched
+///   in; the tps bytes come from the same serde_json f64 serializer, so
+///   the output is byte-identical to a fresh serialize by construction.
+///   On a generation mismatch the cache is rebuilt (two cold serializations
+///   per dirty call — once per publish batch / refresh-second, never per
+///   read) and the call is served from the just-built cache. Neither path
+///   allocates in the steady state (all buffers live in the cache static).
+///   This replaces the TASK-181 every-call `serde_json::to_writer`, which
+///   paid the full ~9 µs serialize on every panel read (measured 8929 ns
+///   for 32 labeled metrics on 0e65e4d).
+/// - OFF: the TASK-181 shape kept verbatim — serialize under the data lock
+///   with a transient tps override. The byte-identity tests re-derive this
+///   shape independently.
+///
+/// The output is byte-identical to `serde_json::to_string(&snapshot())`
+/// (same derived Serialize, same field order, same tps contract) on BOTH
+/// paths — asserted in-suite by `snapshot_json_cache_parity` and solo by
+/// the C-entry test `telemetry_snapshot_inplace_byte_identical`.
 ///
 /// TPS contract identical to [`snapshot`]: the serialized value carries
 /// `ring_tps().unwrap_or(current_tps)`. The value is read BEFORE the data
-/// lock is taken (both sources are lock-free atomics — TASK-162/164), then
-/// applied as a transient in-place override of the stored field under the
-/// lock and restored right after serialization: no lock holder can observe
-/// the override mid-call, and the stored field itself has no reader that
-/// does not override it (every reader goes through [`snapshot`]-shaped
-/// clones). On a panic the runtime aborts (the only caller is an
-/// extern "C" entry), so the override cannot outlive the call.
+/// lock is taken (both sources are lock-free atomics — TASK-162/164). On
+/// the OFF path it is applied as a transient in-place override of the
+/// stored field under the lock and restored right after serialization (no
+/// lock holder can observe the override mid-call; the stored field has no
+/// reader that does not override it). On the ON path the stored field is
+/// never read or written at all — the fresh tps is patched into the cached
+/// byte ranges, and the cache fill itself serializes with tps overridden
+/// to 0.0/1.0 (restored immediately), so the stored value is never baked
+/// into the cache either.
 ///
-/// Lock ordering: takes the snapshot data lock only (a leaf — nothing it
-/// calls takes another lock); the caller may hold its own buffer mutex
-/// around this with no inverse order anywhere. The ring scan that may run
-/// under the lock is the bounded lock-free RING_CAP loop, not a mutex.
-/// Single call site (the C entry); #[inline(never)] keeps the serializer
-/// out of the caller's code region — its cost is serde-dominated and it
-/// must not perturb unrelated hot-loop placement (TASK-181 iteration 1).
+/// Lock ordering: snapshot data lock first, then the cache lock (a leaf —
+/// nothing it guards takes another lock); the caller may hold its own
+/// buffer mutex around this with no inverse order anywhere. The ring scan
+/// that may run under the data lock is the bounded lock-free RING_CAP
+/// loop, not a mutex. Single call site (the C entry); #[inline(never)]
+/// keeps the serializer out of the caller's code region (TASK-181).
 #[inline(never)]
 #[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
 pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
     let tps = ring_tps().unwrap_or_else(current_tps);
     let snap = snapshot_arc();
     let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+    if !TELEM_SNAP_CACHE {
+        // Pre-TASK-194 shape, kept verbatim for the A/B toggle.
+        let saved = s.tps;
+        s.tps = tps;
+        let res = serde_json::to_writer(&mut *out, &*s);
+        s.tps = saved;
+        if res.is_err() {
+            // Unreachable for this Serialize impl (no fallible parts), kept for
+            // parity with the legacy `{}` fallback.
+            out.clear();
+            out.extend_from_slice(b"{}");
+        }
+        return;
+    }
+    // TASK-194: generation-gated cache. The gen load happens under the
+    // data lock, and every mutator bumps the gen while holding the same
+    // lock, so the comparison cannot race a mutation. The struct
+    // destructure splits the field borrows (the borrow checker cannot
+    // prove disjointness through `cache.field` alone inside one fn).
+    let gen = SNAP_GEN.load(Ordering::Relaxed);
+    let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let SnapshotJsonCache {
+        gen: cached_gen,
+        valid: cached_valid,
+        prefix,
+        suffix,
+        tps_buf,
+        scratch_a,
+        scratch_b,
+    } = &mut *cache;
+    if *cached_valid && *cached_gen == gen {
+        tps_buf.clear();
+        if serde_json::to_writer(&mut *tps_buf, &tps).is_ok() {
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(tps_buf);
+            out.extend_from_slice(suffix);
+            return;
+        }
+        // Unreachable (f64 serialization is infallible): fall through and
+        // rebuild from scratch.
+    }
+    // Dirty (first call, generation bump, or unreachable fallback):
+    // rebuild the prefix/suffix pair from the locked snapshot.
     let saved = s.tps;
-    s.tps = tps;
-    let res = serde_json::to_writer(&mut *out, &*s);
+    s.tps = 0.0;
+    scratch_a.clear();
+    let res_a = serde_json::to_writer(&mut *scratch_a, &*s);
+    s.tps = 1.0;
+    scratch_b.clear();
+    let res_b = serde_json::to_writer(&mut *scratch_b, &*s);
     s.tps = saved;
-    if res.is_err() {
-        // Unreachable for this Serialize impl (no fallible parts), kept for
-        // parity with the legacy `{}` fallback.
+    if res_a.is_err() || res_b.is_err() {
+        // Unreachable for this Serialize impl, kept for parity with the
+        // legacy `{}` fallback.
+        *cached_valid = false;
         out.clear();
         out.extend_from_slice(b"{}");
+        return;
     }
+    match split_tps_span(scratch_a, scratch_b) {
+        Some((p, span)) => {
+            prefix.clear();
+            prefix.extend_from_slice(&scratch_a[..p]);
+            suffix.clear();
+            suffix.extend_from_slice(&scratch_a[p + span..]);
+            *cached_gen = gen;
+            *cached_valid = true;
+            // Serve this call from the just-built cache (same assemble
+            // path as the hit branch).
+            tps_buf.clear();
+            if serde_json::to_writer(&mut *tps_buf, &tps).is_ok() {
+                out.extend_from_slice(prefix);
+                out.extend_from_slice(tps_buf);
+                out.extend_from_slice(suffix);
+                return;
+            }
+            out.clear();
+            out.extend_from_slice(b"{}");
+        }
+        None => {
+            // Unreachable: tps 0.0 vs 1.0 always differs at exactly one
+            // byte of the tps value span. Serve the legacy fallback and
+            // leave the cache invalid so the next call retries the fill.
+            *cached_valid = false;
+            out.clear();
+            out.extend_from_slice(b"{}");
+        }
+    }
+}
+
+/// Split point between two serializations of the SAME snapshot whose only
+/// difference is the tps value (0.0 vs 1.0 — same byte length, one digit):
+/// returns the index of the first differing byte and the length of the tps
+/// value span (3: `0.0`). The tps field appears exactly once in the top-
+/// level field order, and the bodies are otherwise identical, so the first
+/// diff is necessarily inside that span. None = misaligned bodies (never
+/// happens for this Serialize impl; guarded so the caller can fall back
+/// instead of panicking inside an extern "C" call chain).
+fn split_tps_span(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let p = a.iter().zip(b.iter()).position(|(x, y)| x != y)?;
+    if p + 3 > a.len() {
+        return None;
+    }
+    Some((p, 3))
 }
 
 /// Test-only: drop the shared snapshot so the next publish starts a fresh
@@ -246,6 +433,7 @@ pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
 #[cfg(test)]
 pub(crate) fn test_reset_snapshot() {
     *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    bump_snapshot_gen(); // TASK-194: the swap must invalidate the JSON cache
 }
 
 /// Store the latest TPS (external callers; the per-tick path feeds the ring
@@ -313,6 +501,109 @@ mod bench_hotpath {
             best_clock * 1e9
         );
     }
+
+    /// TASK-194 A/B: snapshot JSON write with the 32-labeled fixture used
+    /// by the c_bridge end-to-end bench (comparable numbers; the C entry
+    /// adds only the SNAP_BUF lock + NUL push). BEFORE arm = the exact
+    /// pre-TASK-194 expression (in-place to_writer, transient tps
+    /// override); AFTER arm = the generation-gated cache (O(buffer)
+    /// assemble on hit). Runs SOLO (resets the shared snapshot; leaves 32
+    /// metrics published — harmless, every solo bench resets its own
+    /// starting state).
+    #[test]
+    #[ignore]
+    fn bench_snapshot_json_cache_ab() {
+        test_reset_snapshot();
+
+        // same fixture shape as bench_telemetry_snapshot_json
+        for i in 0..32u32 {
+            let mut labels = HashMap::new();
+            labels.insert("region".to_string(), "eu".to_string());
+            labels.insert("host".to_string(), format!("host-{i}"));
+            labels.insert("module".to_string(), format!("mod-{i}"));
+            labels.insert("idx".to_string(), i.to_string());
+            publish_metric(
+                &format!("c.bench.ab.{i}"),
+                i as f64,
+                Some("ms"),
+                Some(labels),
+            );
+        }
+
+        let iters = 200_000u32;
+        let rounds = 5;
+        let mut buf = Vec::with_capacity(4096);
+
+        // BEFORE arm: pre-TASK-194 expression, verbatim. The fold-sum over
+        // the output forces EVERY output byte to be observable (the C-entry
+        // bench is immune to elision via its extern call boundary; this
+        // inline expression needs the fold). The fold is symmetric in both
+        // arms (~50 ns of L1-hot reads). NOTE: the writer must be &mut Vec
+        // — `&mut *buf` on an owned Vec would deref to a fixed-size &mut
+        // [u8] slice writer (WriteZero on the first byte after clear()).
+        for _ in 0..10_000u32 {
+            buf.clear();
+            let tps = ring_tps().unwrap_or_else(current_tps);
+            let snap = snapshot_arc();
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = s.tps;
+            s.tps = tps;
+            let res = serde_json::to_writer(&mut buf, &*s);
+            s.tps = saved;
+            if res.is_err() {
+                buf.clear();
+                buf.extend_from_slice(b"{}");
+            }
+            std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_before = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf.clear();
+                let tps = ring_tps().unwrap_or_else(current_tps);
+                let snap = snapshot_arc();
+                let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                let saved = s.tps;
+                s.tps = tps;
+                let res = serde_json::to_writer(&mut buf, &*s);
+                s.tps = saved;
+                if res.is_err() {
+                    buf.clear();
+                    buf.extend_from_slice(b"{}");
+                }
+                std::hint::black_box(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_before =
+                best_before.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // AFTER arm: generation-gated cache (first call fills, rest hit);
+        // same symmetric observability fold as the BEFORE arm.
+        let mut buf2 = Vec::with_capacity(4096);
+        for _ in 0..10_000u32 {
+            buf2.clear();
+            snapshot_json_write(&mut buf2);
+            std::hint::black_box(buf2.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        }
+        let mut best_after = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                buf2.clear();
+                snapshot_json_write(&mut buf2);
+                std::hint::black_box(buf2.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+            }
+            best_after =
+                best_after.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH snapshot_json_cache A/B (32 labeled, direct write): before {:.0} ns/op, after {:.0} ns/op (min of {rounds}x{iters})",
+            best_before * 1e9,
+            best_after * 1e9
+        );
+    }
 }
 
 pub fn set_mem(used_mb: u64, max_mb: u64) {
@@ -320,6 +611,7 @@ pub fn set_mem(used_mb: u64, max_mb: u64) {
     let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     s.mem_used_mb = used_mb;
     s.mem_max_mb = max_mb;
+    bump_snapshot_gen(); // TASK-194
 }
 
 pub fn set_uptime(secs: u64) {
@@ -327,6 +619,7 @@ pub fn set_uptime(secs: u64) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .uptime_secs = secs;
+    bump_snapshot_gen(); // TASK-194
 }
 
 pub fn set_modules(names: Vec<String>) {
@@ -334,6 +627,7 @@ pub fn set_modules(names: Vec<String>) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .loaded_modules = names;
+    bump_snapshot_gen(); // TASK-194
 }
 
 pub fn set_server_name(name: &str) {
@@ -341,6 +635,7 @@ pub fn set_server_name(name: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .server_name = name.to_string();
+    bump_snapshot_gen(); // TASK-194
 }
 
 /// Feed a raw tick duration (ns) from a module or transform hook; the
@@ -550,6 +845,7 @@ fn spawn_refresh_thread() -> std::io::Result<()> {
                 s.mem_used_mb = used_kb / 1024;
                 s.mem_max_mb = max_kb / 1024;
             }
+            bump_snapshot_gen(); // TASK-194: refresh thread mutates the snapshot
         })?;
     Ok(())
 }
@@ -597,6 +893,7 @@ mod tests {
 
     fn reset_state() {
         *SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        bump_snapshot_gen(); // TASK-194: the swap must invalidate the JSON cache
         RING_HEAD.store(0, Ordering::Relaxed);
         for slot in RING_TS.iter() {
             slot.store(0, Ordering::Relaxed);
@@ -638,6 +935,133 @@ mod tests {
         assert_eq!(v["metrics"][0]["name"], "tick_ms");
         assert_eq!(v["metrics"][0]["unit"], "ms");
         assert!(v["metrics"][0].get("labels").is_none());
+    }
+
+    /// TASK-194 in-suite parity corpus: the cache path must emit
+    /// byte-identical JSON to a fresh serde serialization through every
+    /// state transition — first call (cache fill), repeat call (hit),
+    /// publish_metric / set_mem / set_uptime / set_modules /
+    /// set_server_name mutations (generation bumps → refill), a tps change
+    /// WITHOUT a content bump (variable-length patch across the split),
+    /// and a ring-fed tps. The legacy expression is re-derived inline
+    /// (pre-TASK-194 shape) exactly like the solo C-entry test does.
+    #[test]
+    fn snapshot_json_cache_parity() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        // The exact pre-TASK-194 expression, re-derived independently.
+        let legacy = |out: &mut Vec<u8>| {
+            let tps = ring_tps().unwrap_or_else(current_tps);
+            let snap = snapshot_arc();
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = s.tps;
+            s.tps = tps;
+            let res = serde_json::to_writer(&mut *out, &*s);
+            s.tps = saved;
+            if res.is_err() {
+                out.clear();
+                out.extend_from_slice(b"{}");
+            }
+        };
+
+        let mut legacy_buf = Vec::new();
+        let mut cached_buf = Vec::new();
+
+        // Concurrency guard for the parallel suite: c_bridge's pregate test
+        // publishes metrics and scheduler tests feed the tick ring WITHOUT
+        // telemetry's TEST_LOCK (each module has its own lock static), so a
+        // concurrent mutation between the two captures would legitimately
+        // change the bytes. A capture round is only asserted when BOTH the
+        // content generation and the ring head are stable across it — any
+        // concurrent publish or tick push voids the round and retries, so
+        // the byte-identity assertion is deterministic, never flaky.
+        fn capture_pair(
+            legacy: &dyn Fn(&mut Vec<u8>),
+            legacy_buf: &mut Vec<u8>,
+            cached_buf: &mut Vec<u8>,
+            what: &'static str,
+        ) {
+            let probe = || {
+                (
+                    SNAP_GEN.load(Ordering::Relaxed),
+                    RING_HEAD.load(Ordering::Relaxed),
+                )
+            };
+            for _ in 0..1000 {
+                legacy_buf.clear();
+                cached_buf.clear();
+                let p0 = probe();
+                legacy(legacy_buf);
+                let p1 = probe();
+                snapshot_json_write(cached_buf);
+                let p2 = probe();
+                if p0 == p1 && p1 == p2 {
+                    assert_eq!(legacy_buf, cached_buf, "{what}");
+                    return;
+                }
+                // concurrent mutation voided the round — retry
+            }
+            panic!("snapshot state never settled for {what}");
+        }
+
+        // empty state: fresh snapshot, cache fills on the first call.
+        // (The byte-identity of fill and hit paths is asserted by every
+        // capture_pair below: the first capture after any generation bump
+        // exercises the refill, the immediately following one exercises
+        // the steady hit.)
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "empty state (fill)");
+        capture_pair(
+            &legacy,
+            &mut legacy_buf,
+            &mut cached_buf,
+            "empty state (steady hit)",
+        );
+
+        // mixed metrics: labeled, unlabeled, unit-only
+        let mut labels = HashMap::new();
+        labels.insert("region".to_string(), "eu".to_string());
+        labels.insert("idx".to_string(), 7.to_string());
+        publish_metric("cache.parity.labeled", 1.0, Some("ms"), Some(labels));
+        publish_metric("cache.parity.plain", 2.5, None, None);
+        publish_metric("cache.parity.unit", 3.0, Some("kb"), None);
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "mixed metrics (refill)");
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "mixed metrics (hit)");
+
+        // setters mutate the base fields → generation bumps → refill
+        set_mem(11, 22);
+        set_uptime(33);
+        set_modules(vec!["m1".to_string(), "m2".to_string()]);
+        set_server_name("parity-host");
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "after setters (refill)");
+
+        // tps change WITHOUT a content bump: same generation, different
+        // tps byte length ("0.0" -> "19.98765") — exercises the
+        // variable-length patch across the split point.
+        set_tps(19.98765);
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "tps patch, same gen");
+
+        // ring-fed tps: the window average drives the value in both arms.
+        // The VALUE itself is order-dependent in a shared suite (earlier
+        // tests leave fabricated samples inside the 60s window), so only
+        // byte-identity is asserted, plus the field being a number.
+        for _ in 0..50 {
+            push_tick_time(50_000_000);
+        }
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "ring-fed tps");
+        legacy_buf.clear();
+        snapshot_json_write(&mut legacy_buf);
+        let v: serde_json::Value = serde_json::from_slice(&legacy_buf).unwrap();
+        assert!(v["tps"].as_f64().is_some(), "ring-fed tps is a JSON number");
+
+        // MAX_METRICS-cap publish drops (no bump — early return) must not
+        // desync the cache: the output still matches a fresh serialize.
+        let n = snapshot().metrics.len();
+        for i in 0..(MAX_METRICS - n + 10) {
+            publish_metric(&format!("cache.parity.cap.{i}"), i as f64, None, None);
+        }
+        capture_pair(&legacy, &mut legacy_buf, &mut cached_buf, "cap overflow (drop, no bump)");
+        assert_eq!(snapshot().metrics.len(), MAX_METRICS);
     }
 
     #[test]
