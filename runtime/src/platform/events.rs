@@ -460,6 +460,17 @@ struct MemoRecord {
     name: Box<str>,
     resolved: Resolved,
     has_async: bool,
+    /// TASK-197: the async resolved list at this record's generation, so a
+    /// memo hit enqueues without re-walking the async view (no per-publish
+    /// `load_arc` inc/dec pair, no exact-slot probe). Same guarantee class
+    /// as `resolved`: resolution is a pure function of the view at `gens`,
+    /// and any registry mutation (sync OR async — both bump the shared
+    /// combined counter) changes the tag, so a stale list can never verify.
+    /// `None` = no async match; `has_async` stays the verbatim any_match
+    /// verdict and a None-with-true combination (defensively impossible:
+    /// any_match implies a non-empty resolve) falls back to the legacy
+    /// re-resolve path, preserving the old behavior bit-for-bit.
+    async_list: Option<Resolved>,
 }
 
 const MEMO_SLOTS: usize = 4096;
@@ -514,24 +525,9 @@ fn memo_find(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<&'static
     None
 }
 
-/// Hot publish through the global memo (TASK-167): one acquire load per
-/// probe, no TLS, no refcounts. Re-entrant publishes from a handler simply
-/// take the same read path — there is no slot state to take out or restore
-/// (the TLS take/match/put-back protocol is gone with it).
-#[inline]
-fn memo_dispatch(
-    bus_key: u64,
-    gens: u64,
-    hash: u64,
-    event: &str,
-    payload: &Value,
-) -> Option<(usize, bool)> {
-    let rec = memo_find(bus_key, gens, hash, event)?;
-    Some((dispatch(&rec.resolved, event, payload), rec.has_async))
-}
-
 /// Hot has_subscribers through the global memo (TASK-167) — the same
-/// zero-RMW read shape as [`memo_dispatch`].
+/// zero-RMW read shape the publish path takes via [`memo_find`]: one
+/// acquire load per probe, no TLS, no refcounts.
 #[inline]
 fn memo_has(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<bool> {
     let rec = memo_find(bus_key, gens, hash, event)?;
@@ -540,10 +536,19 @@ fn memo_has(bus_key: u64, gens: u64, hash: u64, event: &str) -> Option<bool> {
 
 /// Fill the memo on a cold miss (registry-writer frequency). A record for
 /// the exact (bus, gens, event) key is content-identical to any existing
-/// one — resolution is a pure function of the view at `gens` — so a
-/// matching record is left in place and repeated cold fills are free.
+/// one — resolution (sync AND async, TASK-197) is a pure function of the
+/// view at `gens` — so a matching record is left in place and repeated
+/// cold fills are free.
 #[cold]
-fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved, has_async: bool) {
+fn memo_fill(
+    bus_key: u64,
+    gens: u64,
+    hash: u64,
+    event: &str,
+    resolved: Resolved,
+    has_async: bool,
+    async_list: &Option<Resolved>,
+) {
     let tag = memo_tag(bus_key, gens);
     let mut victim: Option<usize> = None;
     let mut i = memo_index(hash);
@@ -556,6 +561,7 @@ fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved
                 name: event.into(),
                 resolved: Arc::clone(&resolved),
                 has_async,
+                async_list: async_list.clone(),
             }));
             match slot.compare_exchange(
                 std::ptr::null_mut(),
@@ -572,7 +578,19 @@ fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved
             // SAFETY: published record — immutable, never freed.
             let rec = unsafe { &*cur };
             if rec.tag == tag && &*rec.name == event {
-                return; // already correct content
+                // TASK-197: a record without the carried list (has_subscribers
+                // fills incomplete — the resolve costs more than the whole
+                // probe) is not WRONG, only poorer. A fill that carries a
+                // list UPGRADES it (overwrite below); otherwise the record is
+                // content-identical — leave in place, repeated fills free.
+                if rec.async_list.is_some() || async_list.is_none() {
+                    return; // already correct content
+                }
+                // Prefer clobbering the incomplete record over retiring an
+                // unrelated one; nothing further down the chain can be a
+                // better target (inserts never chain past an empty slot).
+                victim = Some(i);
+                break;
             }
             if victim.is_none() {
                 victim = Some(i);
@@ -587,6 +605,7 @@ fn memo_fill(bus_key: u64, gens: u64, hash: u64, event: &str, resolved: Resolved
             name: event.into(),
             resolved: Arc::clone(&resolved),
             has_async,
+            async_list: async_list.clone(),
         }));
         let old = MEMO_TABLE[vi].swap(rec, Ordering::AcqRel);
         if !old.is_null() {
@@ -1021,7 +1040,12 @@ impl EventBus {
         }
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
         let any = !resolved.is_empty() || has_async;
-        memo_fill(self.sync.id, gens, hash, event, resolved, has_async);
+        // has_subscribers never resolves the async list (the resolve costs
+        // more than this whole probe) — the record is filled INCOMPLETE
+        // (async_list=None); a later publish-driven fill upgrades it (see
+        // memo_fill). Until then, publish hits on this record take the
+        // legacy re-resolve fallback — exactly the pre-197 behavior.
+        memo_fill(self.sync.id, gens, hash, event, resolved, has_async, &None);
         any
     }
 
@@ -1074,21 +1098,45 @@ impl EventBus {
         }
         // Global memo hit (TASK-167): no TLS, no refcounts — one acquire
         // load per probe. The hash is computed once and reused by the cold
-        // resolution path and the async queue below.
+        // resolution path and the async queue below. TASK-197: the hit path
+        // enqueues from the record's precomputed async list — the tag check
+        // already proves the list matches THIS generation, so no view walk.
         let hash = fnv1a(event.as_bytes());
-        if let Some((invoked, has_async)) =
-            memo_dispatch(self.sync.id, gens, hash, event, payload)
-        {
-            if has_async {
-                self.queue_async(event, payload, hash);
+        if let Some(rec) = memo_find(self.sync.id, gens, hash, event) {
+            let invoked = dispatch(&rec.resolved, event, payload);
+            if rec.has_async {
+                match &rec.async_list {
+                    Some(list) => self.queue_async_with(event, payload, Arc::clone(list)),
+                    // Defensive (any_match implies non-empty): legacy shape.
+                    None => self.queue_async(event, payload, hash),
+                }
             }
             return invoked;
         }
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
-        memo_fill(self.sync.id, gens, hash, event, Arc::clone(&resolved), has_async);
+        // Resolve the async list ONCE on the cold path: the memo record
+        // stores it (hits clone from there) and this publish's own task
+        // consumes the local handle — the queue no longer re-resolves.
+        let async_list = if has_async {
+            self.async_targets(event, hash)
+        } else {
+            None
+        };
+        memo_fill(
+            self.sync.id,
+            gens,
+            hash,
+            event,
+            Arc::clone(&resolved),
+            has_async,
+            &async_list,
+        );
         let invoked = dispatch(&resolved, event, payload);
         if has_async {
-            self.queue_async(event, payload, hash);
+            match async_list {
+                Some(list) => self.queue_async_with(event, payload, list),
+                None => self.queue_async(event, payload, hash),
+            }
         }
         invoked
     }
@@ -1115,21 +1163,46 @@ impl EventBus {
         }
         // Global memo hit (TASK-167) — same shape as publish; the hash is
         // computed once and reused by the cold resolution path and the
-        // async queue below.
+        // async queue below. TASK-197: the hit path enqueues from the
+        // record's precomputed async list (tag-checked against THIS gens).
         let hash = fnv1a(event.as_bytes());
-        if let Some((invoked, has_async)) =
-            memo_dispatch(self.sync.id, gens, hash, event, &payload)
-        {
-            if has_async {
-                self.queue_async_shared(event, payload, hash);
+        if let Some(rec) = memo_find(self.sync.id, gens, hash, event) {
+            let invoked = dispatch(&rec.resolved, event, &payload);
+            if rec.has_async {
+                match &rec.async_list {
+                    Some(list) => {
+                        self.queue_async_shared_with(event, payload, Arc::clone(list))
+                    }
+                    // Defensive (any_match implies non-empty): legacy shape.
+                    None => self.queue_async_shared(event, payload, hash),
+                }
             }
             return invoked;
         }
         let (resolved, has_async) = self.resolve_event(event, hash, gens >> 32, gens & 0xFFFF_FFFF);
-        memo_fill(self.sync.id, gens, hash, event, Arc::clone(&resolved), has_async);
+        // Cold path: one async resolve for both the memo record and this
+        // publish's own task (same generation snapshot — the sync dispatch
+        // and the async task now share one coherent view state).
+        let async_list = if has_async {
+            self.async_targets(event, hash)
+        } else {
+            None
+        };
+        memo_fill(
+            self.sync.id,
+            gens,
+            hash,
+            event,
+            Arc::clone(&resolved),
+            has_async,
+            &async_list,
+        );
         let invoked = dispatch(&resolved, event, &payload);
         if has_async {
-            self.queue_async_shared(event, payload, hash);
+            match async_list {
+                Some(list) => self.queue_async_shared_with(event, payload, list),
+                None => self.queue_async_shared(event, payload, hash),
+            }
         }
         invoked
     }
@@ -1160,8 +1233,15 @@ impl EventBus {
         let Some(list) = self.async_targets(event, hash) else {
             return;
         };
-        // The borrowed payload may die before the task runs: deep-clone it
-        // into the task (publish has no handle to share).
+        self.queue_async_with(event, payload, list);
+    }
+
+    /// Queue with the resolved list already in hand (TASK-197). The task
+    /// shape is byte-identical to the resolve-inside shape — the only
+    /// difference is WHERE the list came from (memo record vs view walk).
+    /// The borrowed payload may die before the task runs: deep-clone it
+    /// into the task (publish has no handle to share).
+    fn queue_async_with(&self, event: &str, payload: &Value, list: Resolved) {
         self.pool.push(AsyncTask {
             event: event.into(),
             payload: TaskPayload::Owned(payload.clone()),
@@ -1181,6 +1261,15 @@ impl EventBus {
         let Some(list) = self.async_targets(event, hash) else {
             return;
         };
+        self.queue_async_shared_with(event, payload, list);
+    }
+
+    /// Shared-arc enqueue with the resolved list already in hand
+    /// (TASK-197). Identical to queue_async_shared minus the re-resolve:
+    /// the caller's `Arc<Value>` handle moves into the task (zero deep
+    /// clone when ASYNC_PAYLOAD_SHARED is on), the list Arc is consumed
+    /// outright (the one inherent inc happened at the clone site).
+    fn queue_async_shared_with(&self, event: &str, payload: Arc<Value>, list: Resolved) {
         let payload = if ASYNC_PAYLOAD_SHARED {
             TaskPayload::Shared(payload)
         } else {
@@ -1341,6 +1430,72 @@ mod tests {
         let count = bus.publish("test.evt", &serde_json::json!({"a": 1}));
         assert_eq!(count, 1);
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    /// TASK-197 parity: the memo-carried async list must dispatch exactly
+    /// like the view-walk path — one task per publish across the cold-fill
+    /// boundary and every memo hit, for both publish shapes; unsubscribe
+    /// bumps the shared combined generation so the stale record (and its
+    /// carried list) can never verify, and the sync return count stays 0
+    /// (async handlers report through the pool, not the return value).
+    #[test]
+    fn async_memo_hit_dispatch_parity() {
+        let bus = with_cap(64);
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = Arc::clone(&n);
+        let tok = bus.subscribe_async("memo.parity", Arc::new(move |_, _| {
+            n2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let payload = serde_json::json!({ "k": 1u64 });
+        // 1 cold fill + 9 memo hits through the legacy publish shape.
+        for _ in 0..10 {
+            assert_eq!(bus.publish("memo.parity", &payload), 0);
+        }
+        assert!(
+            wait_until(|| n.load(Ordering::SeqCst) == 10),
+            "async handler must fire once per publish across the memo boundary"
+        );
+        // The record must actually CARRY the list (the hit path's subject).
+        let hash = fnv1a(b"memo.parity");
+        let gens = bus.gens.load(Ordering::Acquire);
+        let rec = memo_find(bus.sync.id, gens, hash, "memo.parity")
+            .expect("memo record after publish");
+        assert!(rec.has_async, "async sub must mark the record");
+        assert!(
+            rec.async_list.is_some(),
+            "TASK-197: record must carry the async resolved list"
+        );
+        // Same shape through publish_shared (the hot-path caller).
+        for _ in 0..10 {
+            assert_eq!(
+                bus.publish_shared("memo.parity", Arc::new(payload.clone())),
+                0
+            );
+        }
+        assert!(
+            wait_until(|| n.load(Ordering::SeqCst) == 20),
+            "publish_shared memo hits must queue from the carried list too"
+        );
+        // Unsubscribe bumps gens: the stale record can never verify; the
+        // next publish takes the cold path with has_async=false — no more
+        // tasks, and a fresh record (if slotted) carries no async list.
+        assert!(bus.unsubscribe("memo.parity", &tok));
+        let gens_before = gens;
+        assert_eq!(bus.publish("memo.parity", &payload), 0);
+        let gens_after = bus.gens.load(Ordering::Acquire);
+        assert_ne!(gens_after, gens_before, "unsubscribe must bump gens");
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            20,
+            "no async dispatch after unsubscribe"
+        );
+        if let Some(r) = memo_find(bus.sync.id, gens_after, hash, "memo.parity") {
+            assert!(
+                !r.has_async && r.async_list.is_none(),
+                "post-unsubscribe record must be async-free"
+            );
+        }
     }
 
     #[test]
@@ -2199,6 +2354,94 @@ mod bench_hotpath {
         println!("{line}");
         // Fold guard is never expected to trip (arms return 0 or tiny lens);
         // it exists so the compiler cannot prove the loops side-effect-free.
+        assert!(fold != u64::MAX);
+    }
+
+    /// TASK-197 A/B: the async-side enqueue resolution, per publish.
+    /// Arm A = the verbatim pre-197 work (`async_targets`: view load_arc
+    /// inc/dec pair + exact-slot probe walk + list clone). Arm B = the
+    /// memo-hit shape TASK-197 enables (one acquire-load probe via
+    /// memo_find + the record-carried list clone; the tag check proves the
+    /// list matches this generation). The iso delta is the banked number;
+    /// the end-to-end async lines ride their wake-dominated noisy class
+    /// (recorded by bench_event_bus_publish / bench_event_publish_shared).
+    /// Solo protocol: the memo table is process-global.
+    #[test]
+    #[ignore]
+    fn bench_async_targets_ab() {
+        let bus = with_cap(64);
+        let _atok = bus.subscribe_async("bench.async", Arc::new(|_, _| {}));
+        let payload = serde_json::json!({ "tick": 1u64, "drained": 0u64 });
+        // Fill the memo the way a real publisher would (cold fill + hits),
+        // so arm B reads the record TASK-197 stores.
+        for _ in 0..10_000u32 {
+            let _ = bus.publish_shared("bench.async", Arc::new(payload.clone()));
+        }
+        let iters = 200_000u32;
+        let rounds = 5;
+        const EVENT: &str = "bench.async";
+        let hash = fnv1a(EVENT.as_bytes());
+        let gens = bus.gens.load(Ordering::Acquire);
+        let mut fold = 0u64;
+
+        fn time_arm(
+            name: &'static str,
+            mut op: impl FnMut() -> u64,
+            fold: &mut u64,
+            iters: u32,
+            rounds: u32,
+        ) -> (&'static str, f64) {
+            for _ in 0..10_000u32 {
+                *fold = fold.wrapping_add(op());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    *fold = fold.wrapping_add(op());
+                }
+                best = best.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            (name, best * 1e9)
+        }
+
+        // A — pre-197 verbatim: resolve through the async view per publish.
+        let a = time_arm(
+            "async_targets view walk (pre-197)",
+            || {
+                let l = bus.async_targets(EVENT, hash);
+                std::hint::black_box(l.is_some());
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+        // B — TASK-197 memo-hit shape: one probe + carried list clone.
+        let b = time_arm(
+            "memo_find + carried list (TASK-197)",
+            || {
+                if let Some(rec) = memo_find(bus.sync.id, gens, hash, EVENT) {
+                    let l = rec.async_list.clone();
+                    std::hint::black_box(l.is_some());
+                }
+                0
+            },
+            &mut fold,
+            iters,
+            rounds,
+        );
+        // C — record-presence sanity inside the bench itself: a miss here
+        // would mean the warmup did not fill the memo (arms are invalid).
+        let rec_present = memo_find(bus.sync.id, gens, hash, EVENT)
+            .is_some_and(|r| r.async_list.is_some());
+        println!(
+            "BENCH async_targets_ab: [{a}] {:.0} ns/op vs [{b}] {:.0} ns/op (min of {rounds}x{iters}) record-carried {rec_present} fold {fold}",
+            a.1, b.1,
+            a = a.0,
+            b = b.0,
+        );
+        assert!(rec_present, "memo record must carry the async list for arm B to be the hit shape");
         assert!(fold != u64::MAX);
     }
 
