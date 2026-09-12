@@ -559,39 +559,46 @@ struct Rd<'a> {
 }
 
 impl<'a> Rd<'a> {
-    fn u1(&mut self, ctx: &str) -> Result<u8, String> {
+    // TASK-206: error contexts are `FnOnce` closures — the JVMS walk used to
+    // materialize a `format!`-ed context String for EVERY read on the success
+    // path (~1.5 allocs per constant-pool entry + ~4 per member/attribute,
+    // ~2492 ns of a 3521 ns parse arm), while the context is only ever
+    // rendered inside the `ok_or_else` error branch. Passing the pieces as
+    // closures moves every one of those allocs onto the error path; the
+    // rendered strings are byte-identical (same format strings, same args).
+    fn u1(&mut self, ctx: impl FnOnce() -> String) -> Result<u8, String> {
         let b = self
             .d
             .get(self.p)
             .copied()
-            .ok_or_else(|| format!("{ctx}: truncated class file at offset {}", self.p))?;
+            .ok_or_else(|| format!("{}: truncated class file at offset {}", ctx(), self.p))?;
         self.p += 1;
         Ok(b)
     }
 
-    fn u2(&mut self, ctx: &str) -> Result<u16, String> {
+    fn u2(&mut self, ctx: impl FnOnce() -> String) -> Result<u16, String> {
         let b = self
             .d
             .get(self.p..self.p + 2)
-            .ok_or_else(|| format!("{ctx}: truncated class file at offset {}", self.p))?;
+            .ok_or_else(|| format!("{}: truncated class file at offset {}", ctx(), self.p))?;
         self.p += 2;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn u4(&mut self, ctx: &str) -> Result<u32, String> {
+    fn u4(&mut self, ctx: impl FnOnce() -> String) -> Result<u32, String> {
         let b = self
             .d
             .get(self.p..self.p + 4)
-            .ok_or_else(|| format!("{ctx}: truncated class file at offset {}", self.p))?;
+            .ok_or_else(|| format!("{}: truncated class file at offset {}", ctx(), self.p))?;
         self.p += 4;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn take(&mut self, n: usize, ctx: &str) -> Result<&'a [u8], String> {
+    fn take(&mut self, n: usize, ctx: impl FnOnce() -> String) -> Result<&'a [u8], String> {
         let b = self
             .d
             .get(self.p..self.p + n)
-            .ok_or_else(|| format!("{ctx}: truncated class file at offset {}", self.p))?;
+            .ok_or_else(|| format!("{}: truncated class file at offset {}", ctx(), self.p))?;
         self.p += n;
         Ok(b)
     }
@@ -599,13 +606,13 @@ impl<'a> Rd<'a> {
 
 fn parse_class(data: &[u8]) -> Result<ClassFile<'_>, String> {
     let mut r = Rd { d: data, p: 0 };
-    let magic = r.u4("magic")?;
+    let magic = r.u4(|| "magic".to_string())?;
     if magic != MAGIC {
         return Err(format!("not a class file: bad magic {magic:#010x}"));
     }
-    r.u2("minor_version")?;
-    r.u2("major_version")?;
-    let cp_count = r.u2("constant_pool_count")? as usize;
+    r.u2(|| "minor_version".to_string())?;
+    r.u2(|| "major_version".to_string())?;
+    let cp_count = r.u2(|| "constant_pool_count".to_string())? as usize;
     if cp_count == 0 {
         return Err("constant_pool_count must be at least 1".to_string());
     }
@@ -613,24 +620,24 @@ fn parse_class(data: &[u8]) -> Result<ClassFile<'_>, String> {
     cp.push(CpEntry { tag: 0, payload: &[] });
     let mut i = 1usize;
     while i < cp_count {
-        let tag = r.u1(&format!("constant pool #{i} tag"))?;
+        let tag = r.u1(|| format!("constant pool #{i} tag"))?;
         let (payload, extra_slot) = match tag {
             TAG_UTF8 => {
-                let l = r.u2(&format!("constant pool #{i} utf8 length"))? as usize;
-                (r.take(l, &format!("constant pool #{i} utf8 bytes"))?, false)
+                let l = r.u2(|| format!("constant pool #{i} utf8 length"))? as usize;
+                (r.take(l, || format!("constant pool #{i} utf8 bytes"))?, false)
             }
-            TAG_INTEGER | TAG_FLOAT => (r.take(4, &format!("constant pool #{i}"))?, false),
-            TAG_LONG | TAG_DOUBLE => (r.take(8, &format!("constant pool #{i}"))?, true),
+            TAG_INTEGER | TAG_FLOAT => (r.take(4, || format!("constant pool #{i}"))?, false),
+            TAG_LONG | TAG_DOUBLE => (r.take(8, || format!("constant pool #{i}"))?, true),
             TAG_CLASS | TAG_STRING | TAG_METHOD_TYPE | TAG_MODULE | TAG_PACKAGE => {
-                (r.take(2, &format!("constant pool #{i}"))?, false)
+                (r.take(2, || format!("constant pool #{i}"))?, false)
             }
             TAG_FIELDREF
             | TAG_METHODREF
             | TAG_IFACE_METHODREF
             | TAG_NAME_AND_TYPE
             | TAG_DYNAMIC
-            | TAG_INVOKE_DYNAMIC => (r.take(4, &format!("constant pool #{i}"))?, false),
-            TAG_METHOD_HANDLE => (r.take(3, &format!("constant pool #{i}"))?, false),
+            | TAG_INVOKE_DYNAMIC => (r.take(4, || format!("constant pool #{i}"))?, false),
+            TAG_METHOD_HANDLE => (r.take(3, || format!("constant pool #{i}"))?, false),
             t => return Err(format!("constant pool #{i}: unknown tag {t}")),
         };
         if extra_slot {
@@ -642,25 +649,25 @@ fn parse_class(data: &[u8]) -> Result<ClassFile<'_>, String> {
         i += 1;
     }
     let cp_end = r.p;
-    let access_flags = r.u2("access_flags")?;
-    let this_class = r.u2("this_class")?;
-    let super_class = r.u2("super_class")?;
-    let interfaces_count = r.u2("interfaces_count")? as usize;
+    let access_flags = r.u2(|| "access_flags".to_string())?;
+    let this_class = r.u2(|| "this_class".to_string())?;
+    let super_class = r.u2(|| "super_class".to_string())?;
+    let interfaces_count = r.u2(|| "interfaces_count".to_string())? as usize;
     let mut interfaces = Vec::with_capacity(interfaces_count);
     for k in 0..interfaces_count {
-        interfaces.push(r.u2(&format!("interface #{k}"))?);
+        interfaces.push(r.u2(|| format!("interface #{k}"))?);
     }
-    let fields_count = r.u2("fields_count")? as usize;
+    let fields_count = r.u2(|| "fields_count".to_string())? as usize;
     let mut fields = Vec::with_capacity(fields_count);
     for k in 0..fields_count {
         fields.push(parse_member(data, &cp, &mut r, &format!("field #{k}"))?);
     }
-    let methods_count = r.u2("methods_count")? as usize;
+    let methods_count = r.u2(|| "methods_count".to_string())? as usize;
     let mut methods = Vec::with_capacity(methods_count);
     for k in 0..methods_count {
         methods.push(parse_member(data, &cp, &mut r, &format!("method #{k}"))?);
     }
-    let attrs_count = r.u2("class attributes_count")? as usize;
+    let attrs_count = r.u2(|| "class attributes_count".to_string())? as usize;
     for k in 0..attrs_count {
         parse_sub_attr(data, &cp, &mut r, &format!("class attribute #{k}"))?;
     }
@@ -689,12 +696,12 @@ fn parse_member<'a>(
     r: &mut Rd<'a>,
     ctx: &str,
 ) -> Result<Member, String> {
-    let access_flags = r.u2(&format!("{ctx} access_flags"))?;
-    let name_idx = r.u2(&format!("{ctx} name_index"))?;
-    let desc_idx = r.u2(&format!("{ctx} descriptor_index"))?;
+    let access_flags = r.u2(|| format!("{ctx} access_flags"))?;
+    let name_idx = r.u2(|| format!("{ctx} name_index"))?;
+    let desc_idx = r.u2(|| format!("{ctx} descriptor_index"))?;
     let name = utf8(cp, name_idx, ctx)?;
     let descriptor = utf8(cp, desc_idx, ctx)?;
-    let attrs_count = r.u2(&format!("{ctx} attributes_count"))? as usize;
+    let attrs_count = r.u2(|| format!("{ctx} attributes_count"))? as usize;
     let mut code = None;
     for k in 0..attrs_count {
         let a = parse_sub_attr(data, cp, r, &format!("{ctx} attribute #{k}"))?;
@@ -719,11 +726,11 @@ fn parse_sub_attr<'a>(
     r: &mut Rd<'a>,
     ctx: &str,
 ) -> Result<SubAttr, String> {
-    let name_idx = r.u2(&format!("{ctx} attribute_name_index"))?;
-    let len = r.u4(&format!("{ctx} attribute_length"))? as usize;
+    let name_idx = r.u2(|| format!("{ctx} attribute_name_index"))?;
+    let len = r.u4(|| format!("{ctx} attribute_length"))? as usize;
     let name = utf8(cp, name_idx, ctx)?;
     let off = r.p;
-    r.take(len, &format!("{ctx} ({name}) payload"))?;
+    r.take(len, || format!("{ctx} ({name}) payload"))?;
     Ok(SubAttr { name, off, len })
 }
 
@@ -2404,5 +2411,189 @@ mod bench_hotpath {
             "BENCH transform match+inject: {:.0} ns/op (min of {rounds}x{iters})",
             best * 1e9
         );
+    }
+
+    /// Verbatim replica of `apply_slow`'s tail from `parse_class` down to the
+    /// `apply_edits` return (TASK-206 iso arm; same-module access to the
+    /// private parse/plan machinery). The probe/collect head is NOT part of
+    /// this replica — callers pass the pre-collected `matched` rules.
+    fn transform_tail_replica(
+        name: &str,
+        bytes: &[u8],
+        matched: &[(usize, &Arc<Rule>)],
+    ) -> Result<Option<Vec<u8>>, String> {
+        let class = parse_class(bytes).map_err(|e| format!("transform {name}: {e}"))?;
+        let mut plan = Plan::default();
+        for (_, rule) in matched.iter().copied() {
+            for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
+                match &rule.injection {
+                    Injection::MethodEntry => {
+                        plan_method_entry(&class, m, &rule.helper, &mut plan)?;
+                    }
+                    Injection::BeforeCall(target) => {
+                        plan_before_call(&class, m, target, &rule.helper, &mut plan)?;
+                    }
+                }
+            }
+        }
+        if plan.is_empty() {
+            return Ok(None);
+        }
+        let mut edits = plan.edits;
+        if plan.cp_added > 0 {
+            edits.push(Edit::Insert(class.cp_end, plan.cp_bytes.into_boxed_slice()));
+            edits.push(Edit::SetU2(8, class.cp.len() as u16 + plan.cp_added));
+        }
+        let mut attr_len_edits: Vec<Edit> = Vec::new();
+        for m in &class.methods {
+            let Some(code) = &m.code else { continue };
+            for (payload_off, payload_len) in
+                std::iter::once((code.attr_len_off + 4, code.attr_len)).chain(code.sub.iter().map(|s| (s.off, s.len)))
+            {
+                let payload_end = payload_off + payload_len;
+                let delta: i64 = edits
+                    .iter()
+                    .filter(|e| {
+                        let o = e.offset();
+                        o >= payload_off
+                            && o <= payload_end
+                            && !matches!(e, Edit::Insert(_, _) if plan.restores.contains(&o))
+                    })
+                    .map(|e| match e {
+                        Edit::Insert(_, b) => b.len() as i64,
+                        _ => 0,
+                    })
+                    .sum();
+                if delta != 0 {
+                    attr_len_edits.push(Edit::SetU4(
+                        payload_off - 4,
+                        (payload_len as i64 + delta) as u32,
+                    ));
+                }
+            }
+        }
+        edits.extend(attr_len_edits);
+        let out = apply_edits(bytes, edits)?;
+        Ok(Some(out))
+    }
+
+    /// TASK-206: stage decomposition of the transform match line
+    /// (3544-3563 ns in the ledger). Four independent min-of-5x200k arms
+    /// over the same engine + kernelish class:
+    ///   - `e2e`           — the real entry (reference; ~= stages + overhead)
+    ///   - `probe+collect` — gen gate + fnv1a + VIEW_MEMO probe + snapshot +
+    ///                       exact/wildcard collect + registration sort
+    ///   - `parse`         — parse_class alone (the full JVMS walk)
+    ///   - `plan+edits`    — parse + plan build + cp/attr-length edits +
+    ///                       apply_edits (verbatim tail replica)
+    /// The replica is asserted byte-identical to the real entry's output
+    /// once before timing. No global state is touched (engine-local), so
+    /// arm order is context-free.
+    #[test]
+    #[ignore]
+    fn bench_transform_stages_iso() {
+        use std::hint::black_box;
+        const NAME: &str = "net/minecraft/server/MinecraftServer";
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // Replica correctness gate: same output bytes as the real entry.
+        let want = e.apply(NAME, &bytes).expect("apply ok").expect("matched");
+        let hash = super::super::rcu::fnv1a(NAME.as_bytes());
+        let view = e.view_snapshot();
+        let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
+        if let Some(slot) = view.exact_find(hash, NAME) {
+            matched.extend(slot.idxs.iter().map(|&i| (i, &view.rules[i])));
+        }
+        for w in &view.wildcards {
+            let hit = match &w.kind {
+                WildKind::Any => true,
+                WildKind::Suffix(s) => NAME.ends_with(&**s),
+                WildKind::Prefix(p) => NAME.starts_with(&**p),
+            };
+            if hit {
+                matched.push((w.idx, &view.rules[w.idx]));
+            }
+        }
+        matched.sort_unstable_by_key(|(i, _)| *i);
+        assert!(!matched.is_empty(), "engine must match the bench name");
+        let replica = transform_tail_replica(NAME, &bytes, &matched)
+            .expect("replica ok")
+            .expect("replica matched");
+        assert_eq!(replica, want.bytes, "replica must be byte-identical");
+
+        let id = e.id;
+        fn collect(view: &RulesView, hash: u64, name: &str) -> usize {
+            let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
+            if let Some(slot) = view.exact_find(hash, name) {
+                matched.extend(slot.idxs.iter().map(|&i| (i, &view.rules[i])));
+            }
+            for w in &view.wildcards {
+                let hit = match &w.kind {
+                    WildKind::Any => true,
+                    WildKind::Suffix(s) => name.ends_with(&**s),
+                    WildKind::Prefix(p) => name.starts_with(&**p),
+                };
+                if hit {
+                    matched.push((w.idx, &view.rules[w.idx]));
+                }
+            }
+            matched.sort_unstable_by_key(|(i, _)| *i);
+            matched.len()
+        }
+        fn time(label: &str, rounds: u32, iters: u32, mut f: impl FnMut()) {
+            for _ in 0..10_000u32 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
+            }
+            println!(
+                "BENCH transform stage {label}: {:.0} ns/op (min of {rounds}x{iters})",
+                best * 1e9
+            );
+        }
+
+        time("e2e", rounds, iters, || {
+            let _ = black_box(e.apply(black_box(NAME), &bytes));
+        });
+        time("probe+collect", rounds, iters, || {
+            let gen = e.view.gen();
+            assert_ne!(gen, 0);
+            let mut fast_none = false;
+            VIEW_MEMO.with(|m| {
+                let slot = m.take();
+                if let Some((eid, g, view)) = slot.as_ref() {
+                    if *eid == id && *g == gen {
+                        let exact_hit = view.exact_find(hash, NAME).is_some();
+                        let wild_hit = !view.wildcards.is_empty()
+                            && view.wildcards.iter().any(|w| match &w.kind {
+                                WildKind::Any => true,
+                                WildKind::Suffix(s) => NAME.ends_with(&**s),
+                                WildKind::Prefix(p) => NAME.starts_with(&**p),
+                            });
+                        fast_none = !exact_hit && !wild_hit;
+                    }
+                }
+                m.set(slot);
+            });
+            assert!(!fast_none, "memo probe must report the match");
+            let view = e.view_snapshot();
+            black_box(collect(&view, hash, NAME));
+        });
+        time("parse", rounds, iters, || {
+            black_box(parse_class(&bytes).expect("parse ok"));
+        });
+        time("plan+edits", rounds, iters, || {
+            let out = transform_tail_replica(NAME, &bytes, &matched).expect("replica ok");
+            black_box(out);
+        });
     }
 }
