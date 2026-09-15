@@ -729,6 +729,32 @@ mod tests {
     /// engine rules) which live for the whole test process.
     pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Restore the module's process-wide state to its boot shape: the
+    /// connection registry (the LRU test fills it to `MAX_CONNS`, the other
+    /// tests attach conns), the live-conn counter, the packet counters and
+    /// the hook chain. Every test starts from this state, so an assertion on
+    /// an absolute count cannot depend on which test happened to run first —
+    /// `TEST_LOCK` serializes the tests, it does not clean up after them (the
+    /// observed CI red was exactly that: the LRU test left 4096 conns behind
+    /// and the next test asserted `conn_count() == 1`).
+    pub(super) fn reset_state() {
+        CONNS
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .map
+            .clear();
+        CONNS_LIVE.store(0, Ordering::Relaxed);
+        PACKETS_IN.store(0, Ordering::Relaxed);
+        PACKETS_OUT.store(0, Ordering::Relaxed);
+        DROPPED.store(0, Ordering::Relaxed);
+        // Empty hook chain (and its fast gate): each test registers its own
+        // hooks, and a leftover one from a previous test must never decide
+        // this test's verdict.
+        let empty: Arc<[PacketHookFn]> = Arc::new([]);
+        HOOKS.store(empty);
+        PACKET_HOOKS_LIVE.store(0, Ordering::Release);
+    }
+
     pub(super) fn packet(direction: Direction, conn_id: u64, state: u8, payload: &[u8]) -> Packet {
         Packet {
             direction,
@@ -741,7 +767,8 @@ mod tests {
 
     #[test]
     fn hooks_drop_and_pass() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let h = Arc::new(|p: &mut Packet| {
             if p.state == 9 {
                 Verdict::Drop
@@ -758,7 +785,8 @@ mod tests {
 
     #[test]
     fn conn_registry_lru_eviction() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         for i in 0..(MAX_CONNS + 10) as u64 {
             assert!(attach_conn(i, None));
         }
@@ -775,7 +803,8 @@ mod tests {
 
     #[test]
     fn conn_registry_attach_detach_and_uuid() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         assert!(attach_conn(7, Some(0x1234)));
         assert_eq!(state_of(7), Some(ProtocolState::Handshake.code()));
         // re-attach refreshes the uuid but is not a new entry
@@ -789,7 +818,8 @@ mod tests {
 
     #[test]
     fn state_tracking_transitions() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         attach_conn(1, None);
         // handshake -> login
         assert!(set_conn_state(1, 2));
@@ -816,7 +846,8 @@ mod tests {
 
     #[test]
     fn run_hooks_state_comes_from_registry() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let seen = Arc::new(Mutex::new(0u8));
         let hook_seen = seen.clone();
         add_hook(Arc::new(move |p: &mut Packet| {
@@ -833,7 +864,8 @@ mod tests {
 
     #[test]
     fn counters_increment_per_direction() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let (in0, out0, drop0) = packet_counters();
         for _ in 0..5 {
             run_hooks(packet(Direction::Inbound, 0, 3, &[]));
@@ -861,7 +893,8 @@ mod tests {
 
     #[test]
     fn disconnect_carries_reason() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let seen = Arc::new(Mutex::new(None::<String>));
         let hook_seen = seen.clone();
         // payload-gated so later tests are unaffected
@@ -890,7 +923,8 @@ mod tests {
 
     #[test]
     fn install_default_rules_is_idempotent() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         // Other bricks register into the same global engine, so only count
         // the NetHooks rules this brick owns; the OnceLock guarantees exactly
         // five are ever installed, even with repeat calls.
@@ -949,7 +983,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_run_hooks_packet_path() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         // one registered no-op hook (payload-gated pass so it never drops)
@@ -977,7 +1012,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_registry_full_table() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         let table = MAX_CONNS as u64;
@@ -1064,7 +1100,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_conn_count() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         // empty-table line: the steady state before the first player joins
@@ -1102,7 +1139,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_run_hooks_concurrent_4t() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 50_000u32;
         let threads = 4;
         let rounds = 5;
@@ -1139,7 +1177,7 @@ mod tests {
 mod bench_default_shape {
     //! Release-only A/B bench (TASK-163): `cargo test --release -- --ignored --nocapture bench_packet_default`.
     use super::*;
-    use super::tests::{bench_drain, bench_fill, packet, TEST_LOCK};
+    use super::tests::{bench_drain, bench_fill, packet, reset_state, TEST_LOCK};
     use std::time::Instant;
 
     /// Per-packet cost on the production-default shape: zero plugin hooks,
@@ -1147,7 +1185,8 @@ mod bench_default_shape {
     #[test]
     #[ignore]
     fn bench_run_hooks_default_shape() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         // warmup
@@ -1175,7 +1214,8 @@ mod bench_default_shape {
     #[test]
     #[ignore]
     fn bench_run_hooks_frame() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         for i in 0..10_000u64 {
@@ -1200,7 +1240,8 @@ mod bench_default_shape {
     #[test]
     #[ignore]
     fn bench_run_hooks_64conns_nohooks() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
         let iters = 200_000u32;
         let rounds = 5;
         bench_fill(64);

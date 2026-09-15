@@ -2236,7 +2236,7 @@ mod tests {
     /// (pre-TASK-194 shape) exactly like the solo C-entry test does.
     #[test]
     fn snapshot_json_cache_parity() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
 
         // The exact pre-TASK-194 expression, re-derived independently.
@@ -2563,7 +2563,7 @@ mod tests {
 
     #[test]
     fn setters_write_to_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
         set_server_name("alpha");
         set_tps(19.5);
@@ -2583,7 +2583,7 @@ mod tests {
 
     #[test]
     fn metric_cap_is_enforced() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
         for i in 0..(MAX_METRICS + 10) {
             publish_metric(&format!("m{i}"), i as f64, None, None);
@@ -2593,7 +2593,7 @@ mod tests {
 
     #[test]
     fn tps_window_math() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
 
         // 100 samples of 50ms -> avg 50ms -> tps 20. Timestamps are
@@ -2624,7 +2624,7 @@ mod tests {
         // TASK-195: the TSC-fed ring (push_tick_time_ts, caller-supplied
         // process-relative ns) must produce identical window semantics to
         // the Instant-fed path — same math on the same ring.
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
         for i in 0..100u64 {
             push_tick_time_ts(1_000_000_000 + i * 50_000_000, 50_000_000);
@@ -2641,7 +2641,7 @@ mod tests {
 
     #[test]
     fn push_tick_time_drives_tps() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_state();
         for _ in 0..100 {
             push_tick_time(50_000_000);
@@ -2652,6 +2652,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handler_slots_are_bounded() {
+        // The slots are process-wide and a telemetry server thread started by
+        // an earlier test (`init_connect_receive_roundtrip`) may still be
+        // serving a connection, so the refill below polls instead of
+        // demanding the very next try: the invariant under test is that a
+        // released slot becomes available again, not that nobody else is
+        // using the pool.
         let mut held = Vec::new();
         while let Some(g) = HandlerGuard::try_acquire() {
             held.push(g);
@@ -2659,13 +2665,27 @@ mod tests {
         assert!(held.len() <= MAX_HANDLERS);
         assert!(HandlerGuard::try_acquire().is_none());
         let _ = held.pop();
-        assert!(HandlerGuard::try_acquire().is_some());
+        let mut reacquired = None;
+        for _ in 0..200 {
+            if let Some(g) = HandlerGuard::try_acquire() {
+                reacquired = Some(g);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(reacquired.is_some(), "a released handler slot must be reusable");
     }
 
     #[cfg(unix)]
     #[test]
     fn init_connect_receive_roundtrip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The first assertion below pins the DEFAULT server name, and the
+        // snapshot globals are process-wide: another test that ran first and
+        // renamed the server (`setters_write_to_snapshot` sets "alpha") would
+        // otherwise decide this test's result. TEST_LOCK serializes the
+        // writers; the reset makes the default visible again.
+        reset_state();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2733,6 +2753,13 @@ mod tests {
     #[test]
     fn snapshot_c_entry_single_lock_parity() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Deterministic starting state: the metric list is append-only and
+        // shared for the whole test process, so a test that ran earlier and
+        // published metrics (the cache-parity corpus publishes labeled ones)
+        // would otherwise be counted here too — the CI red was exactly this
+        // (8 labeled metrics instead of 4). TEST_LOCK serializes the
+        // publishers; this reset makes the count assertion hermetic.
+        reset_state();
 
         // (a) probe-guarded byte parity, empty state then labeled state.
         // Probe = the same triple the tps_memo capture uses (content gen,

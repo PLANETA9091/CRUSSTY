@@ -302,6 +302,21 @@ fn with_gate<R>(id: &str, f: impl FnOnce(Option<&Arc<ModuleGate>>) -> R) -> R {
 /// keep working on the previous snapshot the whole time).
 fn gates_mutate(f: impl FnOnce(&mut HashMap<Box<str>, Arc<ModuleGate>>)) {
     let _swap = swap_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates_mutate_locked(f);
+}
+
+/// [`gates_mutate`] for callers that already hold [`swap_lock`].
+///
+/// The registry and the gate map are two views of one state: a module's
+/// admission/reload must publish both under the same lock hold, so
+/// `insert_entry` (which takes `swap_lock` around the registry write) calls
+/// this variant instead of the wrapper. `std::sync::Mutex` is NOT reentrant
+/// — calling the locking wrapper from there self-deadlocks the caller
+/// (TASK-177 shipped exactly that: the first module admission froze
+/// `Agent_OnLoad` forever, which in turn kept `JNI_CreateJavaVM` running long
+/// enough for the module's kernel-ready thread to attach mid-init and
+/// SIGSEGV the JVM on every boot).
+fn gates_mutate_locked(f: impl FnOnce(&mut HashMap<Box<str>, Arc<ModuleGate>>)) {
     let mut next: HashMap<Box<str>, Arc<ModuleGate>> = gate_view()
         .map(|m| (*m).clone())
         .unwrap_or_default();
@@ -499,7 +514,10 @@ fn insert_entry(
         },
     );
     drop(reg);
-    gates_mutate(|m| {
+    // `swap_lock` is already held (above): publish the gate slot through the
+    // locked variant — the wrapper would re-take the same non-reentrant lock
+    // and deadlock the admission.
+    gates_mutate_locked(|m| {
         m.insert(id.into(), gate);
     });
     Ok(())
@@ -1148,5 +1166,56 @@ mod tests {
             !loaded_libraries().contains(&"reg-fail".to_string()),
             "failed registration must not appear"
         );
+    }
+
+    /// Regression for the TASK-177 admission deadlock (the e2e red from
+    /// 2026-09-11 until the fix): `insert_entry` holds `swap_lock` and then
+    /// published the gate map through `gates_mutate`, which re-takes the same
+    /// non-reentrant lock. Every startup admission therefore blocked forever,
+    /// `Agent_OnLoad` never returned, and the module's kernel-ready thread
+    /// attached while `JNI_CreateJavaVM` was still running — SIGSEGV on every
+    /// boot (the crash was the symptom; this was the cause).
+    ///
+    /// The real path is exercised end to end — a standalone dlopen stands in
+    /// for a module `.so`, no stub — so the test also covers the
+    /// registry+gate publication ordering. The watchdog converts a
+    /// reintroduced deadlock into a failure instead of a hung suite.
+    #[cfg(unix)]
+    #[test]
+    fn insert_entry_publishes_gate_without_relocking_swap() {
+        use libloading::os::unix::Library as OsLibrary;
+
+        let id = "admit-relock-probe";
+        // A handle to this process: same `Library` shape as a module's, no
+        // new image, no initialisers (libloading's documented safe way in).
+        let lib = Library::from(OsLibrary::this());
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let worker = std::thread::spawn(move || {
+            let rc = insert_entry(
+                id,
+                PathBuf::from("/probe/libprobe.so"),
+                lib,
+                7,
+                8,
+                CString::new("modules=/probe").expect("options"),
+            );
+            let _ = tx.send(rc.map_err(|(e, _)| e));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {
+                worker.join().expect("admission thread");
+                let gates = gate_view().expect("gate map published");
+                assert!(
+                    gates.contains_key(id),
+                    "admission must publish the module's gate slot"
+                );
+                assert!(
+                    registry().lock().unwrap().contains_key(id),
+                    "admission must register the module"
+                );
+            }
+            Ok(Err(e)) => panic!("admission failed: {e}"),
+            Err(_) => panic!("insert_entry deadlocked: gates_mutate re-took swap_lock"),
+        }
     }
 }

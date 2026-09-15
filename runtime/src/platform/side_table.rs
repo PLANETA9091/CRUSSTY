@@ -713,8 +713,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Serializes the tests in this module. Every `SideTable::new()`
+    /// registers the table in the process-wide `TABLES_REGISTRY`, and
+    /// [`gc_collect`] sweeps its dead keys out of EVERY registered table —
+    /// so a test that collects a key another test is using corrupts it
+    /// (the parallel-run flake was exactly that: the gc test's
+    /// `ObjectKey(11)` erased `k1` out of the mirror test's table, whose
+    /// `t.get(&k1)` then answered `None`). Holds for the whole test body.
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn insert_get_remove() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         let k = ObjectKey(42);
         assert!(!t.contains(&k));
@@ -727,6 +737,7 @@ mod tests {
 
     #[test]
     fn key_tokens_are_unique_and_nonzero() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let a = next_key();
         let b = next_key();
         let c = next_key();
@@ -738,6 +749,7 @@ mod tests {
 
     #[test]
     fn key_from_jobject_without_vm_returns_none() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // No JVM in unit tests: crate::VM is unset, so every JNI path must
         // degrade to None, including for a non-null bogus pointer.
         assert!(crate::VM.get().is_none());
@@ -748,6 +760,7 @@ mod tests {
 
     #[test]
     fn registry_identity_index_rebuilds_after_removal() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut reg = Registry::default();
         let k1 = ObjectKey(1);
         let k2 = ObjectKey(2);
@@ -764,6 +777,7 @@ mod tests {
 
     #[test]
     fn gc_collect_fires_callback_and_removes_entries() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         let fired = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -789,6 +803,7 @@ mod tests {
 
     #[test]
     fn gc_collect_without_callback_still_removes_entries() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         t.insert(ObjectKey(1), 5);
         gc_collect(&[ObjectKey(1)]);
@@ -797,6 +812,7 @@ mod tests {
 
     #[test]
     fn set_on_collect_replaces_previous_callback() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         let a = Arc::new(AtomicUsize::new(0));
         let b = Arc::new(AtomicUsize::new(0));
@@ -816,6 +832,7 @@ mod tests {
 
     #[test]
     fn table_drop_unregisters_and_sweep_prunes_dangling() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let id;
         {
             let t = SideTable::<u64>::new();
@@ -842,6 +859,7 @@ mod tests {
 
     #[test]
     fn get_or_insert_returns_existing_or_inserts() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<String>::new();
         let k = ObjectKey(5);
         assert_eq!(t.get_or_insert(k, || "first".to_string()), "first");
@@ -851,6 +869,7 @@ mod tests {
 
     #[test]
     fn mirror_roundtrip_overwrite_remove_and_latch() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Mirror-encodable value type: gets/contains answer from the lock-free
         // mirror once it is raised, and semantics must be identical to the map.
         let t = SideTable::<u64>::new();
@@ -891,6 +910,7 @@ mod tests {
 
     #[test]
     fn mirror_concurrent_reads_never_see_garbage() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = Arc::new(SideTable::<u64>::new());
         for i in 0..64u64 {
             t.insert(ObjectKey(i + 1), i * 3 + 1);
@@ -935,6 +955,7 @@ mod tests {
 
     #[test]
     fn values_clones_current_entries() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         t.insert(ObjectKey(1), 10);
         t.insert(ObjectKey(2), 20);
@@ -945,6 +966,7 @@ mod tests {
 
     #[test]
     fn named_table_returns_none_when_unregistered() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(named_table("entities"), None);
     }
 }
@@ -953,11 +975,13 @@ mod tests {
 mod bench_hotpath {
     //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_side_table`.
     use super::*;
+    use super::tests::TEST_LOCK;
     use std::time::Instant;
 
     #[test]
     #[ignore]
     fn bench_side_table_get_churn() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let t = SideTable::<u64>::new();
         let n = 4096u64;
         for i in 0..n {

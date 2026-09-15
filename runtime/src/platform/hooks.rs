@@ -33,24 +33,42 @@ static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
 
 // --- SchedulerHooks natives (wired 1:1 onto the scheduler brick) ----------
 
+/// # Safety
+/// Called by the JVM as the JNI native of `SchedulerHooks.onTick`; `env` and
+/// `class` are owned by the caller and the body performs no JNI calls.
 unsafe extern "C" fn n_on_tick(_env: *mut jni::sys::JNIEnv, _class: jclass) {
     let _ = scheduler::on_tick_boundary();
 }
 
+/// # Safety
+/// Called by the JVM as the JNI native of `SchedulerHooks.onLevelTick`;
+/// `env` and `class` are owned by the caller and the body performs no JNI
+/// calls.
 unsafe extern "C" fn n_on_level_tick(_env: *mut jni::sys::JNIEnv, _class: jclass) {
     scheduler::on_level_tick();
 }
 
+/// # Safety
+/// Called by the JVM as the JNI native of `SchedulerHooks.onTaskScheduled`;
+/// `env` and `class` are owned by the caller and the body performs no JNI
+/// calls.
 unsafe extern "C" fn n_on_task_scheduled(_env: *mut jni::sys::JNIEnv, _class: jclass) {
     let _ = scheduler::on_task_scheduled();
 }
 
+/// # Safety
+/// Called by the JVM as the JNI native of `SchedulerHooks.onBlockTicks`;
+/// `env` and `class` are owned by the caller and the body performs no JNI
+/// calls.
 unsafe extern "C" fn n_on_block_ticks(_env: *mut jni::sys::JNIEnv, _class: jclass) {
     let _ = scheduler::on_block_ticks();
 }
 
 // --- NetHooks / TickHook natives (probes carry no data; no-op for now) -----
 
+/// # Safety
+/// Called by the JVM as the JNI native of the `NetHooks`/`TickHook` probes;
+/// `env` and `class` are owned by the caller; the body is deliberately empty.
 unsafe extern "C" fn n_noop(_env: *mut jni::sys::JNIEnv, _class: jclass) {}
 
 /// Define one hook class into the system class loader and register its
@@ -185,15 +203,30 @@ fn install_once() -> Result<(), String> {
         .clone()
 }
 
-/// Install the hook classes after the VM is fully created and this thread is
-/// genuinely attached — `AttachCurrentThread` from inside `JNI_CreateJavaVM`
-/// (agent init) SIGSEGVs the JVM (thread not yet attachable). Kernel classes
-/// (and tick boundaries, where the probes run) load many seconds later.
+/// Install the hook classes once the VM is live and this thread is genuinely
+/// attachable — `AttachCurrentThread` from inside `JNI_CreateJavaVM` (agent
+/// init / the OnLoad phase) SIGSEGVs the JVM (thread not yet attachable), so
+/// the install thread waits on [`crate::vm_live`] instead of guessing with a
+/// sleep (the old fixed 2 s lost the race whenever VM init ran longer, which
+/// is exactly how a slower CI runner felled it). Kernel classes (and tick
+/// boundaries, where the probes run) load after `VMInit`, and the transform
+/// engine stays gated on [`crate::mark_hook_classes_ready`], so nothing is
+/// patched while we wait.
 pub fn schedule_install() {
     std::thread::Builder::new()
         .name("crussty-hook-install".into())
         .spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !crate::vm_live() {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "[crussty-runtime] !!! transform hook classes NOT installed: \
+                         the VM never reached the live phase"
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // Voice the outcome either way: a failed install leaves patched
             // kernel classes with NoClassDefFoundError on first execution.
             match install_once() {

@@ -155,6 +155,23 @@ static JVMTI_ENV: OnceLock<usize> = OnceLock::new();
 /// Raw JavaVM* as usize, for attaching plugin threads (JVMTI calls like
 /// GetLoadedClasses/RetransformClasses need an attached thread).
 static VM: OnceLock<usize> = OnceLock::new();
+/// True once the JVM has left the OnLoad phase (the `VMInit` callback fired,
+/// or `JNI_OnLoad` found it already live). Native threads must not call
+/// `AttachCurrentThread` before this: attaching a thread while
+/// `JNI_CreateJavaVM` is still running faults the JVM (SIGSEGV in
+/// `ThreadLocalAllocBuffer::initialize` on a null heap) instead of returning
+/// an error. Module kernel-ready workers and the hook-class installer gate
+/// on it.
+static VM_LIVE: AtomicBool = AtomicBool::new(false);
+/// Module bring-up captured during the OnLoad phase and executed from the
+/// `VMInit` callback (live phase): `(parsed options, raw options string)`.
+static DEFERRED_BRING_UP: OnceLock<(AgentOptions, String)> = OnceLock::new();
+
+/// Whether the VM has reached the live phase (see [`VM_LIVE`]).
+pub fn vm_live() -> bool {
+    VM_LIVE.load(Ordering::Acquire)
+}
+
 /// Loaded plugin libraries, kept alive for the whole JVM lifetime (fallback
 /// keep-alive for modules the hot-reload registry could not take over; the
 /// registry itself owns the libraries of modules admitted for reload).
@@ -259,7 +276,14 @@ impl CrusstyRuntime {
             eprintln!("[crussty-runtime] set callbacks failed: {e:?}");
             return jni::JNI_ERR;
         }
-        if let Err(e) = jvmti.enable_events_global(&[jvmti::JVMTI_EVENT_CLASS_FILE_LOAD_HOOK]) {
+        // VMInit is our "the VM is fully initialized" edge, and JVMTI only
+        // accepts the request from the OnLoad phase.
+        let onload = matches!(jvmti.get_phase(), Ok(p) if p == jvmti::JVMTI_PHASE_ONLOAD);
+        let mut events = vec![jvmti::JVMTI_EVENT_CLASS_FILE_LOAD_HOOK];
+        if onload {
+            events.push(jvmti::JVMTI_EVENT_VM_INIT);
+        }
+        if let Err(e) = jvmti.enable_events_global(&events) {
             eprintln!("[crussty-runtime] enable event failed: {e:?}");
             return jni::JNI_ERR;
         }
@@ -267,17 +291,44 @@ impl CrusstyRuntime {
         let _ = VM.set(vm as usize);
 
         let opts = parse_options(options);
-        if let Some(dir) = &opts.modules {
-            load_plugins(dir, vm as JavaVmPtr, options);
+        if onload {
+            // `Agent_OnLoad` runs INSIDE `JNI_CreateJavaVM`: the collector is
+            // not up yet, so a thread that attaches here faults the JVM
+            // (SIGSEGV in `ThreadLocalAllocBuffer::initialize` on a null
+            // heap — attach does not fail, it crashes). Module code is
+            // allowed to spawn threads and attach them, and the shipped
+            // modules do exactly that, so module bring-up is deferred to
+            // `vm_init` (live phase, JNI fully functional, still before the
+            // kernel's main class loads). Only JVMTI setup is safe here.
+            let _ = DEFERRED_BRING_UP.set((opts, options.to_string()));
         } else {
-            eprintln!("[crussty-runtime] no modules= in options; nothing injected");
+            // `JNI_OnLoad` (single-jar path): a Java thread in the live phase.
+            bring_up(&opts, vm as JavaVmPtr, options);
         }
-        eprintln!(
-            "[crussty-runtime] pipeline ready: {} module hook(s)",
-            hooks().lock().unwrap().len()
-        );
 
-        // Platform default transform rules (network / scheduler / storage
+        jni::JNI_OK
+    }
+}
+
+/// Everything after the JVMTI handshake: module loading, platform rules,
+/// hook-class install, crash handlers, telemetry. LIVE phase only — see
+/// [`CrusstyRuntime::init`] for why `Agent_OnLoad` cannot run it.
+fn bring_up(opts: &AgentOptions, vm: JavaVmPtr, options: &str) {
+    // Published first: module kernel-ready workers and the hook-class
+    // installer wait on this edge instead of guessing with a sleep.
+    VM_LIVE.store(true, Ordering::Release);
+
+    if let Some(dir) = &opts.modules {
+        load_plugins(dir, vm, options);
+    } else {
+        eprintln!("[crussty-runtime] no modules= in options; nothing injected");
+    }
+    eprintln!(
+        "[crussty-runtime] pipeline ready: {} module hook(s)",
+        hooks().lock().unwrap().len()
+    );
+
+    // Platform default transform rules (network / scheduler / storage
         // surfaces). Idempotent; must be registered before kernel classes
         // load — the agent claims class hooks before boot, so the rules
         // fire at class load (the engine runs them in the hook pipeline).
@@ -298,9 +349,9 @@ impl CrusstyRuntime {
         // Define the transform hook classes (SchedulerHooks/StorageHooks/
         // NetHooks/TickHook) into the system class loader and register their
         // natives — the injected ()V probes must resolve at first execution
-        // of a patched kernel method. Deliberately scheduled off this thread:
-        // agent init runs inside JNI_CreateJavaVM where AttachCurrentThread
-        // faults the JVM (SIGSEGV at libjvm).
+        // of a patched kernel method. Scheduled off this thread (the install
+        // attaches), and gated on the live phase inside: attaching a thread
+        // before `JNI_CreateJavaVM` returns faults the JVM.
         platform::hooks::schedule_install();
 
         // Platform bricks: crash handlers first (any fault from here on must
@@ -324,9 +375,6 @@ impl CrusstyRuntime {
             platform::events::lifecycle::PLUGIN_LOADED,
             &serde_json::json!({ "runtime": "crussty", "phase": "ready" }),
         );
-
-        jni::JNI_OK
-    }
 }
 
 /// Single-jar entry point: the Java bootstrapper loads this library with
@@ -362,6 +410,24 @@ pub extern "system" fn JNI_OnUnload(_vm: *mut jni::JavaVM, _reserved: *mut c_voi
 impl Agent for CrusstyRuntime {
     fn on_load(&self, vm: *mut jni::JavaVM, options: &str) -> jni::jint {
         self.init(vm, options)
+    }
+
+    /// `VMInit`: the VM left the OnLoad phase. JNI is fully functional and
+    /// module threads may attach, so this is where the bring-up captured in
+    /// `Agent_OnLoad` runs (module dlopen + `cplugin_init`, then the platform
+    /// bricks). Still before the kernel's main class starts, so module class
+    /// hooks still observe every kernel class load.
+    fn vm_init(&self, _jni: *mut jni::JNIEnv, _thread: jni::jthread) {
+        match DEFERRED_BRING_UP.get() {
+            Some((opts, options)) => {
+                let vm = VM.get().copied().unwrap_or_default() as JavaVmPtr;
+                bring_up(opts, vm, options);
+            }
+            // Nothing deferred (already brought up inline, or VMInit was not
+            // requested): still publish the live edge for the threads that
+            // gate on it.
+            None => VM_LIVE.store(true, Ordering::Release),
+        }
     }
     fn class_file_load_hook(
         &self,
@@ -861,6 +927,11 @@ fn publish_class_loaded(name: &str, bytes_len: usize) {
 }
 
 /// Trampolines handed to plugins through CPluginApi.
+///
+/// # Safety
+/// Called by a module through `CPluginApi::register_class_hook`; `ctx` and
+/// `hook` are that module's own opaque context and `extern "C"` trampoline,
+/// replayed only to the owning module and dropped with its generation.
 unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn) -> i32 {
     let owner = registration_owner();
     hooks().lock().unwrap().push(HookEntry {
@@ -874,6 +945,11 @@ unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn
     PLUGIN_HOOKS_LIVE.fetch_add(1, Ordering::Release);
     0
 }
+
+/// # Safety
+/// Called by a module through `CPluginApi::jvmti_allocate`; the returned
+/// buffer is JVMTI-owned and stays valid until the module deallocates it
+/// through its own JVMTI environment.
 unsafe extern "C" fn api_jvmti_allocate(size: usize) -> *mut u8 {
     match jvmti_env().and_then(|env| env.allocate(size as jni::jlong).ok()) {
         Some(p) => p,
@@ -893,6 +969,9 @@ unsafe extern "C" fn api_jvmti_allocate(size: usize) -> *mut u8 {
 /// redefine the same class or overwrite each other's natives.
 static CLAIMS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
+/// # Safety
+/// Called by a module through `CPluginApi::claim`; `key` must be a valid
+/// NUL-terminated string for the duration of the call.
 unsafe extern "C" fn api_claim(owner: usize, key: *const c_char) -> i32 {
     let key = if key.is_null() {
         return -2;
@@ -920,6 +999,10 @@ unsafe extern "C" fn api_claim(owner: usize, key: *const c_char) -> i32 {
     }
 }
 
+/// # Safety
+/// Called by a module through `CPluginApi::retransform_class`; `name` must
+/// be a valid NUL-terminated internal class name for the duration of the
+/// call (the hook classes and every patched kernel class are named by it).
 unsafe extern "C" fn api_retransform_class(name: *const c_char) -> i32 {
     with_attached(|| {
         let Some(env) = jvmti_env() else {
@@ -1121,6 +1204,10 @@ mod tests {
 mod purge_tests {
     use super::*;
 
+    /// # Safety
+    /// Test fixture only: never reached by the VM. The signature matches
+    /// `ClassHookFn`, whose contract is that `name`/`data` are valid for the
+    /// call and `out`/`out_len` receive an optional replacement buffer.
     unsafe extern "C" fn dummy_hook(
         _ctx: *mut c_void,
         _name: *const c_char,
