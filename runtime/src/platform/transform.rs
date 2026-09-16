@@ -79,8 +79,17 @@ pub enum Injection {
 pub struct Rule {
     /// Class internal name pattern, e.g. "net/minecraft/server/level/ServerLevel" or "a/b/*"
     pub class_pattern: String,
-    /// Optional method name filter ("*" = any)
+    /// Optional method name filter ("*" = any), in Mojang (official) names
     pub method: String,
+    /// Alternative runtime names for the same member (Forge 1.20.1 Searge
+    /// names and friends). Filled by [`Rule::new`] from
+    /// [`super::runtime_names`]; a rule matches when the member name equals
+    /// [`Rule::method`] **or** any alias.
+    pub method_aliases: Vec<&'static str>,
+    /// Allow resolving the target by descriptor alone when the name matches no
+    /// member (see [`Rule::platform`]). Off for module-authored rules: a typo
+    /// in a method name must never instrument an unrelated method.
+    pub descriptor_fallback: bool,
     /// Optional method descriptor filter ("*" = any), e.g. "()V"
     pub descriptor: String,
     /// What to inject
@@ -97,13 +106,43 @@ impl Rule {
         injection: Injection,
         helper: impl Into<String>,
     ) -> Self {
+        let class_pattern = class_pattern.into();
+        let method = method.into();
+        let descriptor = descriptor.into();
+        let helper = helper.into();
+        let method_aliases = super::runtime_names::aliases(&class_pattern, &method, &descriptor);
         Self {
-            class_pattern: class_pattern.into(),
-            method: method.into(),
-            descriptor: descriptor.into(),
+            class_pattern,
+            method,
+            method_aliases,
+            descriptor_fallback: false,
+            descriptor,
             injection,
-            helper: helper.into(),
+            helper,
         }
+    }
+
+    /// Platform-brick rule: like [`Rule::new`], but the target may also be
+    /// resolved by a descriptor that is unique inside the class.
+    ///
+    /// Platform rules name stable vanilla methods (`tickServer`,
+    /// `saveAllChunks`, `handleIntention`, ...) that exist across kernels under
+    /// different naming namespaces (Mojang on Paper 1.20.5+/NeoForge, Searge on
+    /// Forge, ...). When no alias covers a kernel, an exact descriptor that
+    /// occurs once in the class still identifies the target unambiguously —
+    /// and a descriptor is the part of a signature obfuscation families do not
+    /// rewrite. Ambiguous descriptors stay unresolved on purpose and are
+    /// reported by [`report_unresolved`].
+    pub fn platform(
+        class_pattern: impl Into<String>,
+        method: impl Into<String>,
+        descriptor: impl Into<String>,
+        injection: Injection,
+        helper: impl Into<String>,
+    ) -> Self {
+        let mut rule = Self::new(class_pattern, method, descriptor, injection, helper);
+        rule.descriptor_fallback = true;
+        rule
     }
 }
 
@@ -309,6 +348,25 @@ impl TransformEngine {
     /// matched but the transform failed, returns `Err` — the platform may
     /// then choose to fail the class load or run it untransformed. Never
     /// panics; parse failures return `Err` with context.
+
+/// Debug trace for rule matching (`CRUSSTY_TRACE_ENGINE=1`, optional
+/// `CRUSSTY_TRACE_ENGINE_CLASS=<substring>` filter). Without it there is no
+/// way to tell "no rule is registered for this class" apart from "the class
+/// never reached the engine at all" — the difference between a Forge/ModLauncher
+/// gap and a config problem.
+fn engine_trace(name: &str) -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CRUSSTY_TRACE_ENGINE").is_some()) {
+        return false;
+    }
+    match FILTER.get_or_init(|| std::env::var("CRUSSTY_TRACE_ENGINE_CLASS").ok()).as_deref() {
+        Some(f) => name.contains(f),
+        None => true,
+    }
+}
+
     pub fn apply(&self, class_name: &str, bytes: &[u8]) -> Result<Option<TransformedClass>, String> {
         // Lock-free gate (TASK-165): ONE acquire load. The view generation
         // is 0 until the first `register` stores a compiled view — and every
@@ -324,6 +382,10 @@ impl TransformEngine {
         // probes through the taken-out memo slot — no Arc refcount traffic,
         // no allocation, no borrow flag; only an actual class hit pays the
         // snapshot clone for the plan.
+        let trace = Self::engine_trace(class_name);
+        if trace {
+            eprintln!("[crussty-engine] probe {class_name} gen={gen}");
+        }
         let mut fast_none = false;
         VIEW_MEMO.with(|m| {
             // TASK-165: take/probe/put-back — no RefCell borrow flag on the
@@ -348,6 +410,9 @@ impl TransformEngine {
             m.set(slot);
         });
         if fast_none {
+            if trace {
+                eprintln!("[crussty-engine] {class_name}: memo says no rule");
+            }
             return Ok(None);
         }
         // TASK-166: everything past the probe — snapshot, match collection,
@@ -362,6 +427,7 @@ impl TransformEngine {
     #[cold]
     #[inline(never)]
     fn apply_slow(&self, class_name: &str, bytes: &[u8], hash: u64) -> Result<Option<TransformedClass>, String> {
+        let trace = Self::engine_trace(class_name);
         let view = self.view_snapshot();
         let mut matched: Vec<(usize, &Arc<Rule>)> = Vec::new();
         if let Some(slot) = view.exact_find(hash, class_name) {
@@ -377,6 +443,29 @@ impl TransformEngine {
                 matched.push((w.idx, &view.rules[w.idx]));
             }
         }
+        if trace {
+            eprintln!("[crussty-engine] {class_name}: matched={} rule(s)", matched.len());
+            for (_, r) in matched.iter() {
+                eprintln!(
+                    "[crussty-engine]   rule method={} desc={} helper={}",
+                    r.method, r.descriptor, r.helper
+                );
+            }
+            // Which methods does the class actually carry? (Forge 1.20.1 runs
+            // SRG method names at runtime, so a Mojang-named rule may match the
+            // class but no method.)
+            let parsed = parse_class(bytes);
+            match parsed {
+                Ok(c) => {
+                    for m in c.methods.iter() {
+                        if matched.iter().any(|(_, r)| r.descriptor == "*" || r.descriptor == m.descriptor) {
+                            eprintln!("[crussty-engine]   class method {} {}", m.name, m.descriptor);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[crussty-engine]   parse failed: {e}"),
+            }
+        }
         if matched.is_empty() {
             return Ok(None);
         }
@@ -385,16 +474,44 @@ impl TransformEngine {
         let class = parse_class(bytes).map_err(|e| format!("transform {class_name}: {e}"))?;
         let mut plan = Plan::default();
         for (_, rule) in matched.iter().copied() {
+            let mut hits = 0usize;
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
-                match &rule.injection {
-                    Injection::MethodEntry => {
-                        plan_method_entry(&class, m, &rule.helper, &mut plan)?;
+                hits += 1;
+                inject_into(&class, rule, m, &mut plan)?;
+            }
+            if hits == 0 && rule.descriptor_fallback && rule.descriptor != "*" {
+                // Namespace-agnostic fallback: the *descriptor* is the part of
+                // a signature that obfuscation families (Searge) do not
+                // rewrite, so a descriptor that is unique in the class names
+                // the target unambiguously even when its name does not match.
+                // (Ambiguous descriptors — e.g. tickServer vs tickChildren,
+                // both `(BooleanSupplier)V` — stay unresolved on purpose and
+                // are covered by `runtime_names` aliases instead.)
+                let mut candidates = class
+                    .methods
+                    .iter()
+                    .filter(|m| m.descriptor == rule.descriptor && m.code.is_some());
+                if let (Some(only), None) = (candidates.next(), candidates.next()) {
+                    hits += 1;
+                    if trace {
+                        eprintln!(
+                            "[crussty-engine] {class_name}: rule {} resolved by descriptor to {} {}",
+                            rule.method, only.name, only.descriptor
+                        );
                     }
-                    Injection::BeforeCall(target) => {
-                        plan_before_call(&class, m, target, &rule.helper, &mut plan)?;
-                    }
+                    inject_into(&class, rule, only, &mut plan)?;
                 }
             }
+            if hits == 0 {
+                report_unresolved(class_name, rule);
+            }
+        }
+        if trace {
+            eprintln!(
+                "[crussty-engine] {class_name}: plan edits={} cp_added={}",
+                plan.edits.len(),
+                plan.cp_added
+            );
         }
         if plan.is_empty() {
             return Ok(None);
@@ -458,7 +575,45 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 }
 
 fn rule_matches_method(rule: &Rule, m: &Member) -> bool {
-    (rule.method == "*" || rule.method == m.name) && (rule.descriptor == "*" || rule.descriptor == m.descriptor)
+    let name_ok = rule.method == "*"
+        || rule.method == m.name
+        || rule.method_aliases.iter().any(|a| *a == m.name);
+    name_ok && (rule.descriptor == "*" || rule.descriptor == m.descriptor)
+}
+
+/// Inject one rule's helper into one matched method.
+fn inject_into(class: &ClassFile<'_>, rule: &Rule, m: &Member, plan: &mut Plan) -> Result<(), String> {
+    match &rule.injection {
+        Injection::MethodEntry => plan_method_entry(class, m, &rule.helper, plan),
+        Injection::BeforeCall(target) => plan_before_call(class, m, target, &rule.helper, plan),
+    }
+}
+
+/// Report a rule that matched a class but no member — the failure shape that
+/// used to be silent (a naming-namespace mismatch produced an empty plan and
+/// the surface simply never wired). Rate-limited: each (class, rule) pair is
+/// reported once, and at most [`UNRESOLVED_REPORT_LIMIT`] pairs are ever
+/// printed, so a systematically mismatched rule set cannot flood a boot log.
+const UNRESOLVED_REPORT_LIMIT: usize = 32;
+
+fn report_unresolved(class_name: &str, rule: &Rule) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
+    let mut seen = seen.lock().unwrap();
+    if seen.len() >= UNRESOLVED_REPORT_LIMIT {
+        return;
+    }
+    let key = format!("{class_name}#{}#{}", rule.method, rule.descriptor);
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    eprintln!(
+        "[crussty-engine] rule '{}' matched class {} but no method (descriptor {}); \
+         the kernel may use another naming namespace — add a runtime_names alias",
+        rule.method, class_name, rule.descriptor
+    );
 }
 
 /// Process-wide engine used by the platform hook pipeline. Returns the
@@ -1079,6 +1234,46 @@ fn code_at_invokes_helper(class: &ClassFile<'_>, code: &CodeAttr, pc: usize, mr:
         && class.data[code.code_off + pc + 1] as u16 * 256 + class.data[code.code_off + pc + 2] as u16 == mr
 }
 
+
+/// Injection payload length that cannot move a switch off its alignment.
+///
+/// A switch's padding is implicit (it is the gap to the next 4-byte boundary
+/// from the opcode), so it is not expressible as a branch-operand fixup: the VM
+/// derives it from the instruction's absolute offset. Rounding every injected
+/// payload up to 4 bytes therefore preserves the alignment of every switch
+/// behind it by construction. Without this, the 3-byte `invokestatic` inserted
+/// before a switch produced invalid bytecode (`VerifyError: Bad instruction`).
+#[inline]
+fn padded_len(len: usize, has_switch: bool) -> usize {
+    if has_switch {
+        (len + 3) & !3
+    } else {
+        len
+    }
+}
+
+/// True when the method carries a `tableswitch`/`lookupswitch`.
+///
+/// Decoded linearly (not by scanning for 0xAA/0xAB byte values), so a constant
+/// pool index or an operand that happens to look like a switch opcode cannot
+/// produce a false answer.
+fn code_has_switch(class: &ClassFile<'_>, code: &CodeAttr) -> Result<bool, String> {
+    let code_bytes = &class.data[code.code_off..code.code_off + code.code_len];
+    Ok(instr_sizes(code_bytes)?.iter().any(|&(_, _, op)| op == 0xAA || op == 0xAB))
+}
+
+/// Pad an injected payload for [`padded_len`] with NOPs (0x00). NOP is a
+/// fall-through instruction: free on the entry path, inert after a call site.
+fn align_payload_for_switches(
+    class: &ClassFile<'_>,
+    code: &CodeAttr,
+    mut payload: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let want = padded_len(payload.len(), code_has_switch(class, code)?);
+    payload.resize(want, 0x00);
+    Ok(payload)
+}
+
 fn plan_method_entry(class: &ClassFile<'_>, m: &Member, helper: &str, plan: &mut Plan) -> Result<(), String> {
     let code = match &m.code {
         Some(c) => c,
@@ -1089,9 +1284,11 @@ fn plan_method_entry(class: &ClassFile<'_>, m: &Member, helper: &str, plan: &mut
     if code_at_invokes_helper(class, code, 0, mr) {
         return Ok(());
     }
-    plan.edits.push(Edit::Insert(code.code_off, invokestatic_bytes(mr).into()));
-    plan.bump_u4(code.code_len_off, code.code_len as u32, 3);
-    plan_code_fixups(class, code, 0, 3, plan)
+    let payload = align_payload_for_switches(class, code, invokestatic_bytes(mr).to_vec())?;
+    let ins_len = payload.len() as i32;
+    plan.edits.push(Edit::Insert(code.code_off, payload.into()));
+    plan.bump_u4(code.code_len_off, code.code_len as u32, ins_len as i64);
+    plan_code_fixups(class, code, 0, ins_len, plan)
 }
 
 fn plan_before_call(
@@ -1120,9 +1317,11 @@ fn plan_before_call(
         if o >= 3 && code_at_invokes_helper(class, code, o - 3, mr) {
             continue;
         }
-        plan.edits.push(Edit::Insert(code.code_off + o, invokestatic_bytes(mr).into()));
-        plan.bump_u4(code.code_len_off, code.code_len as u32, 3);
-        plan_code_fixups(class, code, o, 3, plan)?;
+        let payload = align_payload_for_switches(class, code, invokestatic_bytes(mr).to_vec())?;
+        let ins_len = payload.len() as i32;
+        plan.edits.push(Edit::Insert(code.code_off + o, payload.into()));
+        plan.bump_u4(code.code_len_off, code.code_len as u32, ins_len as i64);
+        plan_code_fixups(class, code, o, ins_len, plan)?;
     }
     Ok(())
 }
@@ -1734,6 +1933,18 @@ fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn switch_bearing_methods_get_four_byte_aligned_payloads() {
+        // The invariant the switch fix enforces: in a method that contains a
+        // tableswitch/lookupswitch, every injected payload is a multiple of 4
+        // (3-byte invokestatic -> 4 with one NOP), so the implicit switch
+        // padding cannot change when the code shifts.
+        assert_eq!(padded_len(3, true), 4);
+        assert_eq!(padded_len(3, false), 3);
+        assert_eq!(padded_len(7, true), 8);
+        assert_eq!(padded_len(4, true), 4);
+    }
+
     use super::*;
 
     // --- synthetic class builder -------------------------------------------

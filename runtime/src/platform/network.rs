@@ -679,7 +679,7 @@ pub fn install_default_rules() {
     RULES_INSTALLED.get_or_init(|| {
         let engine = global_engine();
         // Inbound codec: raw frame bytes arrive here first.
-        engine.register(Rule::new(
+        engine.register(Rule::platform(
             "net/minecraft/network/PacketDecoder",
             "decode",
             DESCR_DECODE,
@@ -687,7 +687,7 @@ pub fn install_default_rules() {
             format!("{HOOK_CLASS}.onDecode"),
         ));
         // Outbound codec: raw frame bytes leave here.
-        engine.register(Rule::new(
+        engine.register(Rule::platform(
             "net/minecraft/network/PacketEncoder",
             "encode",
             DESCR_ENCODE,
@@ -695,7 +695,7 @@ pub fn install_default_rules() {
             format!("{HOOK_CLASS}.onEncode"),
         ));
         // Handshake handler: intention packet picks status/login.
-        engine.register(Rule::new(
+        engine.register(Rule::platform(
             "net/minecraft/server/network/ServerHandshakePacketListenerImpl",
             "handleIntention",
             DESCR_INTENTION,
@@ -703,7 +703,7 @@ pub fn install_default_rules() {
             format!("{HOOK_CLASS}.onIntention"),
         ));
         // Every later state swap (login -> configuration -> play).
-        engine.register(Rule::new(
+        engine.register(Rule::platform(
             "net/minecraft/network/Connection",
             "setupInboundProtocol",
             DESCR_PROTOCOL,
@@ -711,7 +711,7 @@ pub fn install_default_rules() {
             format!("{HOOK_CLASS}.onProtocolSwap"),
         ));
         // Conn teardown: forget the registry entry.
-        engine.register(Rule::new(
+        engine.register(Rule::platform(
             "net/minecraft/network/Connection",
             "channelInactive",
             DESCR_CHANNEL_CTX,

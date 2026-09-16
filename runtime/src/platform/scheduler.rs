@@ -345,7 +345,7 @@ pub fn install_default_rules() {
     DEFAULT_RULES.get_or_init(|| {
         let engine = global_engine();
         for (class, method, descriptor, helper) in DEFAULT_RULES_TABLE {
-            engine.register(Rule::new(class, method, descriptor, Injection::MethodEntry, helper));
+            engine.register(Rule::platform(class, method, descriptor, Injection::MethodEntry, helper));
         }
     });
 }
@@ -381,6 +381,20 @@ pub fn current_tick() -> u64 {
 /// boundary only establishes the baseline). Returns the number of injected
 /// tasks drained.
 pub fn on_tick_boundary() -> usize {
+    // CRUSSTY_TRACE_TICK: prove the injected entry point actually executes on
+    // this kernel (an absent line = the transformed method is never called).
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        static N: AtomicU64 = AtomicU64::new(0);
+        if *ON.get_or_init(|| std::env::var_os("CRUSSTY_TRACE_TICK").is_some()) {
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3 || n % 100 == 0 {
+                eprintln!("[crussty-tick] on_tick_boundary #{n}");
+            }
+        }
+    }
     let tick = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     let drained = drain_injected();
     // Fast path (TASK-161): skip the payload allocation and the publish
@@ -388,6 +402,19 @@ pub fn on_tick_boundary() -> usize {
     // in default deployments. One cached bus lookup instead of a five-Arc
     // clone per tick.
     let bus = tick_bus();
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        if std::env::var_os("CRUSSTY_TRACE_TICK").is_some() {
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 100 == 1 {
+                eprintln!(
+                    "[crussty-tick] tick_boundary has_subscribers={} (probe #{n})",
+                    bus.has_subscribers(TICK_BOUNDARY)
+                );
+            }
+        }
+    }
     if bus.has_subscribers(TICK_BOUNDARY) {
         // TASK-176: the payload rides the queue as a shared Arc instead of
         // a per-publish deep clone — one atomic increment replaces cloning

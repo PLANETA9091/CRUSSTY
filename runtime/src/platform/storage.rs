@@ -302,34 +302,34 @@ const DESC_FLUSH_LEVEL: &str = "(Lnet/minecraft/server/level/ServerLevel;)V";
 /// against the shipped jar).
 pub fn default_rules() -> Vec<Rule> {
     vec![
-        Rule::new(
+        Rule::platform(
             CLASS_REGION_FILE_STORAGE,
             "moonrise$startWrite",
             DESC_MOONRISE_START_WRITE,
             Injection::MethodEntry,
             HELPER_ON_CHUNK_WRITE,
         ),
-        Rule::new(CLASS_REGION_FILE_STORAGE, "write", DESC_WRITE, Injection::MethodEntry, HELPER_ON_CHUNK_WRITE),
-        Rule::new(
+        Rule::platform(CLASS_REGION_FILE_STORAGE, "write", DESC_WRITE, Injection::MethodEntry, HELPER_ON_CHUNK_WRITE),
+        Rule::platform(
             CLASS_REGION_FILE_STORAGE,
             "moonrise$readData",
             DESC_MOONRISE_READ_DATA,
             Injection::MethodEntry,
             HELPER_ON_CHUNK_READ,
         ),
-        Rule::new(CLASS_REGION_FILE_STORAGE, "read", DESC_READ, Injection::MethodEntry, HELPER_ON_CHUNK_READ),
-        Rule::new(
+        Rule::platform(CLASS_REGION_FILE_STORAGE, "read", DESC_READ, Injection::MethodEntry, HELPER_ON_CHUNK_READ),
+        Rule::platform(
             CLASS_REGION_FILE_STORAGE,
             "moonrise$finishWrite",
             DESC_MOONRISE_FINISH_WRITE,
             Injection::MethodEntry,
             HELPER_ON_CHUNK_WRITE_DONE,
         ),
-        Rule::new(CLASS_MINECRAFT_SERVER, "saveAllChunks", DESC_SAVE_ALL_3, Injection::MethodEntry, HELPER_ON_SAVE_START),
-        Rule::new(CLASS_MINECRAFT_SERVER, "saveAllChunks", DESC_SAVE_ALL_4, Injection::MethodEntry, HELPER_ON_SAVE_START),
-        Rule::new(CLASS_MINECRAFT_SERVER, "autoSave", DESC_AUTO_SAVE, Injection::MethodEntry, HELPER_ON_AUTOSAVE),
-        Rule::new(CLASS_MOONRISE_IO, "flush", DESC_FLUSH_SERVER, Injection::MethodEntry, HELPER_ON_SAVE_END),
-        Rule::new(CLASS_MOONRISE_IO, "flush", DESC_FLUSH_LEVEL, Injection::MethodEntry, HELPER_ON_SAVE_END),
+        Rule::platform(CLASS_MINECRAFT_SERVER, "saveAllChunks", DESC_SAVE_ALL_3, Injection::MethodEntry, HELPER_ON_SAVE_START),
+        Rule::platform(CLASS_MINECRAFT_SERVER, "saveAllChunks", DESC_SAVE_ALL_4, Injection::MethodEntry, HELPER_ON_SAVE_START),
+        Rule::platform(CLASS_MINECRAFT_SERVER, "autoSave", DESC_AUTO_SAVE, Injection::MethodEntry, HELPER_ON_AUTOSAVE),
+        Rule::platform(CLASS_MOONRISE_IO, "flush", DESC_FLUSH_SERVER, Injection::MethodEntry, HELPER_ON_SAVE_END),
+        Rule::platform(CLASS_MOONRISE_IO, "flush", DESC_FLUSH_LEVEL, Injection::MethodEntry, HELPER_ON_SAVE_END),
     ]
 }
 
