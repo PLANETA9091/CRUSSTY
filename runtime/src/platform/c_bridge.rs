@@ -21,7 +21,7 @@ use cplug_abi::{
     StorageEndSaveCb, StorageNameCb, StorageReadCb, StorageWriteCb,
 };
 use serde_json::{Number, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::AtomicUsize;
@@ -124,6 +124,26 @@ pub const C_PUBLISH_FASTPARSE: bool = true;
 /// replace in place; parity is locked by c_publish_shellbacked_parity
 /// and c_publish_parse itself is untouched (byte corpus stays).
 pub const C_PUBLISH_SHELLBACK: bool = true;
+
+/// TASK-223 A/B toggle: tape identity for the warm C-publish payload —
+/// the c_fill record pattern (telemetry.rs) extended to the publish leg.
+/// A per-thread tag records the LAST flat payload's buffer identity (ptr +
+/// len + a full byte copy, <= 64 B) bound to the shell slot holding its
+/// parsed map. A publish whose payload bytes are IDENTICAL to the record
+/// hands the recorded map out untouched: identity implies parse-identity
+/// (the parse is deterministic), so the whole scan-probe-write leg is
+/// skipped — the same argument that lets snapshot consumers skip
+/// reassembly on unchanged C buffers (c_fill). Costs on a tape miss: two
+/// compares + one short memcmp + a byte copy snapped DURING the publishing
+/// call (never re-read after dispatch, so a handler that rewrites the
+/// buffer mid-dispatch cannot poison the association). Every flat publish
+/// re-records (self-healing across shape changes); sequence tokens guard
+/// nested publishes; evictions and displaced putbacks invalidate. `false`
+/// = the post-220 shellbacked shape verbatim (no tag reads or writes).
+/// Semantics are identical in both states: the delivered Value equals
+/// serde's parse of the payload in every case — parity locked by
+/// c_publish_tape_parity. A/B: bench_c_publish_tape_ab.
+pub const C_PUBLISH_TAPE: bool = true;
 
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
@@ -432,6 +452,36 @@ thread_local! {
         const { RefCell::new([None, None]) };
 }
 
+/// TASK-223: the tape identity tag (see C_PUBLISH_TAPE). `bytes_len == 0`
+/// or `slot == CPUB_TAPE_NONE` = no usable record; `seq` is a monotone
+/// token that detects nested-publish overwrites of a pending record.
+/// Held in a Cell (Copy) so the hit-path tag read needs no RefCell boot.
+#[derive(Clone, Copy)]
+struct CpubTape {
+    ptr: usize,
+    len: u32,
+    bytes_len: u32,
+    slot: i8,
+    seq: u32,
+    bytes: [u8; CPUB_TAPE_CAP],
+}
+
+const CPUB_TAPE_CAP: usize = 64;
+const CPUB_TAPE_NONE: i8 = -1;
+
+thread_local! {
+    static CPUB_PUBLISH_TAPE: Cell<CpubTape> = const {
+        Cell::new(CpubTape {
+            ptr: 0,
+            len: 0,
+            bytes_len: 0,
+            slot: CPUB_TAPE_NONE,
+            seq: 0,
+            bytes: [0; CPUB_TAPE_CAP],
+        })
+    };
+}
+
 /// A parsed C-publish payload that knows how to go back where it came
 /// from. `shell = true` means `val` is the TLS shell map lent out as a
 /// `Value::Object`; Drop returns it (displacing any map a nested publish
@@ -443,7 +493,19 @@ thread_local! {
 struct CpubPayload {
     val: Option<Value>,
     shell: bool,
+    /// TASK-223: the shell slot this map came from (255 = cold/unknown);
+    /// put-back is positional so the tape's bytes<->slot binding survives
+    /// nested publishes (a nested seed must not steal the home slot).
+    home: u8,
+    /// TASK-223: this publish recorded its bytes into the tape (every
+    /// flat success except the tape-hit arm itself).
+    recorded: bool,
+    /// TASK-223: the tape seq at record time (0 = none); the Drop
+    /// finalize runs only if the tag still carries THIS record.
+    seq: u32,
 }
+
+const CPUB_HOME_NONE: u8 = 255;
 
 impl CpubPayload {
     fn value(&self) -> &Value {
@@ -455,15 +517,43 @@ impl Drop for CpubPayload {
     fn drop(&mut self) {
         if self.shell {
             if let Some(Value::Object(map)) = self.val.take() {
-                // First free slot: during a warm dispatch exactly one slot
-                // is empty (the hit map is OUT), so a nested publish's
-                // payload lands there and the outer put-back below cannot
-                // drop it silently. With both slots occupied (3+ shape
-                // rotation) slot 0 is the deliberate LRU eviction.
-                CPUB_SHELL.with(|slots| {
+                // Positional put-back: the map returns to its home slot
+                // when free (the tape identity is positional), else the
+                // first free slot (a nested publish's payload lands there
+                // and cannot be dropped silently), else slot 0 is the
+                // deliberate LRU eviction (3+ shape rotation).
+                let (p, evicted) = CPUB_SHELL.with(|slots| {
                     let mut slots = slots.borrow_mut();
-                    let free = slots.iter().position(|s| s.is_none()).unwrap_or(0);
-                    slots[free] = Some(map);
+                    let p = if (self.home as usize) < slots.len()
+                        && slots[self.home as usize].is_none()
+                    {
+                        self.home as usize
+                    } else {
+                        slots.iter().position(|s| s.is_none()).unwrap_or(0)
+                    };
+                    let evicted = slots[p].is_some();
+                    slots[p] = Some(map);
+                    (p, evicted)
+                });
+                // Tape finalize / invalidate (Cell, outside the slots
+                // borrow). Finalize wins: a recorded map OWNS the tag it
+                // just recorded. Invalidate only when a foreign put-back
+                // displaced the tagged slot's map.
+                CPUB_PUBLISH_TAPE.with(|cell| {
+                    let mut t = cell.get();
+                    if self.recorded && self.seq != 0 && t.seq == self.seq {
+                        t.slot = p as i8;
+                        cell.set(t);
+                    } else if evicted && t.slot == p as i8 {
+                        // p holds a foreign map now; if the tagged map
+                        // lived at p it was displaced by THIS put-back.
+                        // (The finalize arm above already re-bound the tag
+                        // when this publish recorded, so this arm only
+                        // fires for foreign displacements.)
+                        t.bytes_len = 0;
+                        t.slot = CPUB_TAPE_NONE;
+                        cell.set(t);
+                    }
                 });
             }
         }
@@ -480,8 +570,15 @@ const CPUB_INLINE: usize = 8;
 /// wide objects, anything the flat scanner rejects) is the verbatim
 /// pre-220 c_publish_parse route with `shell = false`.
 fn c_publish_value(s: &str) -> CpubPayload {
+    c_publish_value_inner::<C_PUBLISH_TAPE>(s)
+}
+
+/// Const-generic body so the A/B bench can compile BOTH tape states into
+/// one binary (c_publish_value_inner::<false> = the post-220 shape
+/// verbatim; ::<true> = the production shape when C_PUBLISH_TAPE).
+fn c_publish_value_inner<const TAPE: bool>(s: &str) -> CpubPayload {
     if C_PUBLISH_SHELLBACK && C_PUBLISH_FASTPARSE && s.as_bytes().first() == Some(&b'{') {
-        if let Some(pl) = c_publish_value_flat(s) {
+        if let Some(pl) = c_publish_value_flat::<TAPE>(s) {
             return pl;
         }
         // flat scan rejected -> serde decides (the TASK-193 parity
@@ -491,6 +588,9 @@ fn c_publish_value(s: &str) -> CpubPayload {
     CpubPayload {
         val: Some(c_publish_parse(s)),
         shell: false,
+        home: CPUB_HOME_NONE,
+        recorded: false,
+        seq: 0,
     }
 }
 
@@ -500,10 +600,39 @@ fn c_publish_value(s: &str) -> CpubPayload {
 /// verbatim owned map from the already-scanned spans (cold). Returns
 /// None only for shapes the pre-220 route must decide (serde fallback
 /// or scan_flat_object's owned path).
-fn c_publish_value_flat(s: &str) -> Option<CpubPayload> {
+fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
     let b = s.as_bytes();
     if b.len() < 2 || b[b.len() - 1] != b'}' {
         return None;
+    }
+    // TASK-223 tape hit: byte-identical to the recorded payload AND the
+    // recorded slot still holds its map -> hand the map out untouched.
+    // The record's bytes were snapped during the publish that parsed the
+    // map, so identity implies parse-identity. Two compares + one short
+    // memcmp replace the whole scan-probe-write leg. A nested dispatch
+    // finds the slot empty and falls through to the scan below.
+    if TAPE {
+        let t = CPUB_PUBLISH_TAPE.get();
+        if t.bytes_len > 0
+            && t.slot >= 0
+            && s.len() == t.len as usize
+            && s.as_ptr() as usize == t.ptr
+            && t.bytes[..t.bytes_len as usize] == b[..t.bytes_len as usize]
+        {
+            let hit = CPUB_SHELL.with(|slots| {
+                let mut slots = slots.borrow_mut();
+                slots[t.slot as usize].take()
+            });
+            if let Some(map) = hit {
+                return Some(CpubPayload {
+                    val: Some(Value::Object(map)),
+                    shell: true,
+                    home: t.slot as u8,
+                    recorded: false,
+                    seq: 0,
+                });
+            }
+        }
     }
     let mut pairs: [Option<(&str, Value)>; CPUB_INLINE] = Default::default();
     let mut k = 0usize;
@@ -539,6 +668,31 @@ fn c_publish_value_flat(s: &str) -> Option<CpubPayload> {
             }
         }
     }
+    // TASK-223: record the tape identity from the bytes AS SCANNED — the
+    // copy is snapped during the publishing call and bound to the slot on
+    // Drop (seq token). Over-cap payloads record bytes_len = 0 (the
+    // identity never matches; the slot bind stays inert). The tape-hit
+    // arm above returns before this point — a hit needs no re-record.
+    let (tseq, recorded) = if TAPE {
+        CPUB_PUBLISH_TAPE.with(|cell| {
+            let mut t = cell.get();
+            t.ptr = s.as_ptr() as usize;
+            t.len = s.len() as u32;
+            t.slot = CPUB_TAPE_NONE;
+            t.seq = if t.seq == u32::MAX { 1 } else { t.seq + 1 };
+            if s.len() <= CPUB_TAPE_CAP {
+                t.bytes[..s.len()].copy_from_slice(b);
+                t.bytes_len = s.len() as u32;
+            } else {
+                t.bytes_len = 0;
+            }
+            let seq = t.seq;
+            cell.set(t);
+            (seq, true)
+        })
+    } else {
+        (0, false)
+    };
     // Warm commit needs the WHOLE key set proven BEFORE any mutation —
     // a partial fill that then bails would corrupt the shell (the R49
     // stale-shell lesson, inverted). Both slots are probed; the first
@@ -557,15 +711,18 @@ fn c_publish_value_flat(s: &str) -> Option<CpubPayload> {
                     let (key, v) = p.take().expect("pair filled");
                     *m.get_mut(key).expect("validated above") = v;
                 }
-                return Some(slots[si].take().expect("checked above"));
+                return Some((si, slots[si].take().expect("checked above")));
             }
         }
         None
     });
-    if let Some(map) = hit {
+    if let Some((si, map)) = hit {
         return Some(CpubPayload {
             val: Some(Value::Object(map)),
             shell: true,
+            home: si as u8,
+            recorded,
+            seq: tseq,
         });
     }
     // Cold: the pre-220 owned construct from the already-scanned spans —
@@ -581,6 +738,9 @@ fn c_publish_value_flat(s: &str) -> Option<CpubPayload> {
     Some(CpubPayload {
         val: Some(Value::Object(map)),
         shell: true,
+        home: CPUB_HOME_NONE,
+        recorded,
+        seq: tseq,
     })
 }
 
@@ -620,7 +780,7 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
         // the async queue's deep-clone are complete — the &Value borrow
         // contract keeps the payload unobservable past this point.
         let payload = if payload_json.is_null() {
-            CpubPayload { val: Some(Value::Null), shell: false }
+            CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
         } else {
             c_publish_value(cstr(payload_json))
         };
@@ -648,7 +808,7 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
     // TASK-220: shellbacked payload — see the gate-first arm above for
     // the contract; identical semantics in both entry shapes.
     let payload = if payload_json.is_null() {
-        CpubPayload { val: Some(Value::Null), shell: false }
+        CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
     } else {
         c_publish_value(cstr(payload_json))
     };
@@ -2289,6 +2449,335 @@ mod tests {
                 serde_json::from_str(shapes[i % shapes.len()]).unwrap_or(Value::Null);
             assert_eq!(v, &want, "shape {} diverged from serde", shapes[i % shapes.len()]);
         }
+    }
+
+    /// TASK-223 tape identity contract: byte-identical repeats serve the
+    /// recorded map (parity by construction), ANY byte change must MISS
+    /// the tape and deliver the NEW parse (the staleness killer), records
+    /// self-heal across shape changes, rejected/non-flat/wide shapes leave
+    /// the tape untouched, string-valued leaves survive identity hand-out,
+    /// and a nested publish inside a tape-hit dispatch corrupts neither
+    /// payload. Every delivered value must equal serde's parse.
+    #[test]
+    fn c_publish_tape_parity() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let sub = events::global().subscribe("c.t223.parity", Arc::new(move |_, v| {
+            seen2.lock().unwrap().push(v.clone());
+        }));
+        let mut inputs: Vec<&str> = Vec::new();
+        let ev = CString::new("c.t223.parity").unwrap();
+        let a = CString::new("{\"tick\":7,\"drained\":3}").unwrap();
+        let b = CString::new("{\"a\":1,\"b\":2,\"c\":3}").unwrap();
+        let dup = CString::new("{\"k\":1,\"k\":2}").unwrap();
+        let arr = CString::new("[1,2,3]").unwrap();
+        let wide = CString::new(
+            "{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9}",
+        )
+        .unwrap();
+        let empty = CString::new("{}").unwrap();
+        let strv = CString::new("{\"name\":\"crussty\",\"on\":true}").unwrap();
+
+        let mut pub_in = |pj: &CString, inputs: &mut Vec<&'static str>| {
+            // SAFETY: n_events_publish is the C entry under test; the
+            // payload pointers outlive each call.
+            let n = unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) };
+            assert_eq!(n, 1, "one sync subscriber must be invoked");
+            inputs.push(pj.to_str().unwrap().to_string().leak());
+        };
+        // 1. static repeat + shape change + self-heal
+        pub_in(&a, &mut inputs);
+        pub_in(&a, &mut inputs); // tape hit
+        pub_in(&b, &mut inputs);
+        pub_in(&a, &mut inputs); // re-recorded
+        // 2. rejected / non-flat / wide shapes leave the tape intact
+        pub_in(&dup, &mut inputs);
+        pub_in(&a, &mut inputs); // tape hit expected
+        pub_in(&arr, &mut inputs);
+        pub_in(&a, &mut inputs); // tape hit expected
+        pub_in(&wide, &mut inputs);
+        pub_in(&a, &mut inputs); // tape hit expected
+        // 3. empty object records + hits
+        pub_in(&empty, &mut inputs);
+        pub_in(&empty, &mut inputs); // tape hit
+        // 4. string-valued leaves record + hit
+        pub_in(&strv, &mut inputs);
+        pub_in(&strv, &mut inputs); // tape hit
+        // (the parity subscription stays alive through the re-entrancy
+        // phase so the post-storm publish lands in the same vector)
+
+        // 5. re-entrancy: an outer TAPE-HIT dispatch whose handler
+        // publishes a nested flat payload — neither payload may corrupt,
+        // and the tape must self-heal for the next outer publish.
+        // (The parity subscription stays alive so the post-storm publish
+        // is captured in the same aligned vector.)
+        let outer_saw: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let inner_saw: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let isw = Arc::clone(&inner_saw);
+        let sub_inner = events::global().subscribe("c.t223.inner", Arc::new(move |_, v| {
+            isw.lock().unwrap().push(v.clone());
+        }));
+        let osw = Arc::clone(&outer_saw);
+        let sub_outer = events::global().subscribe("c.t223.outer", Arc::new(move |_, v| {
+            osw.lock().unwrap().push(v.clone());
+            let ev_i = CString::new("c.t223.inner").unwrap();
+            let pj_i = CString::new("{\"in\":7}").unwrap();
+            unsafe { n_events_publish(ev_i.as_ptr(), pj_i.as_ptr()) };
+        }));
+        let evo = CString::new("c.t223.outer").unwrap();
+        let pjo = CString::new("{\"tick\":9,\"drained\":8}").unwrap();
+        for _ in 0..2 {
+            let n = unsafe { n_events_publish(evo.as_ptr(), pjo.as_ptr()) };
+            assert_eq!(n, 1);
+        }
+        // After the nested storm the parity event must still be correct
+        // (tape re-recorded or cleanly missed).
+        pub_in(&a, &mut inputs);
+        let _ = events::global().unsubscribe("c.t223.inner", &sub_inner);
+        let _ = events::global().unsubscribe("c.t223.outer", &sub_outer);
+        let _ = events::global().unsubscribe("c.t223.parity", &sub);
+
+        // Assertions: every captured value equals serde's parse of its input.
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), inputs.len(), "capture/publish misalignment");
+        for (v, s) in got.iter().zip(inputs.iter()) {
+            let want: Value = serde_json::from_str(s).unwrap_or(Value::Null);
+            assert_eq!(v, &want, "tape parity diverged on {}", s);
+        }
+        drop(got);
+        assert_eq!(inner_saw.lock().unwrap().len(), 2, "inner delivered twice");
+        let osaw = outer_saw.lock().unwrap();
+        let want_outer: Value =
+            serde_json::from_str("{\"tick\":9,\"drained\":8}").unwrap_or(Value::Null);
+        for v in osaw.iter() {
+            assert_eq!(v, &want_outer, "outer payload diverged under re-entrancy");
+        }
+        drop(osaw);
+
+        // 6. STALENESS KILLER (own capture channel): same buffer, one
+        // digit rewritten in place — the tape must MISS on the changed
+        // bytes and deliver the NEW value, then 1 again after the flip
+        // back. Digits 1, 2, 1 must deliver 1, 2, 1.
+        let mut_cap: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let mc2 = Arc::clone(&mut_cap);
+        let sub2 = events::global().subscribe("c.t223.mut", Arc::new(move |_, v| {
+            mc2.lock().unwrap().push(v.clone());
+        }));
+        let evm = CString::new("c.t223.mut").unwrap();
+        let raw = CString::new("{\"tick\":1,\"drained\":0}").unwrap().into_raw();
+        let mut mdigits: Vec<u8> = Vec::new();
+        for digit in [b'1', b'2', b'1'] {
+            unsafe { *raw.add(8) = digit as c_char };
+            let n = unsafe { n_events_publish(evm.as_ptr(), raw) };
+            assert_eq!(n, 1);
+            mdigits.push(digit);
+        }
+        // The leaked raw buffer is intentionally never freed (test process).
+        let _ = events::global().unsubscribe("c.t223.mut", &sub2);
+        let mgot = mut_cap.lock().unwrap();
+        assert_eq!(mgot.len(), 3);
+        for (v, d) in mgot.iter().zip(mdigits.iter()) {
+            let s = format!("{{\"tick\":{},\"drained\":0}}", *d as char);
+            let want: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+            assert_eq!(v, &want, "staleness killer: digit {} must re-parse", d);
+        }
+    }
+
+    /// TASK-223 A/B: tape identity vs the post-220 shellbacked shape.
+    /// Arms compile BOTH tape states into one binary via the const-generic
+    /// inner (c_publish_value_inner::<false> / ::<true>); the full entry
+    /// shape (gate + cstr walks + publish + put-back) is identical in
+    /// both, so the delta IS the tape effect. Lines (min of 5x200k):
+    ///   static     — the same payload buffer repeated (the identity
+    ///                regime: a tape hit skips the whole scan-probe-write
+    ///                leg; PRE-REGISTERED GATE >=3% on this line);
+    ///   changing   — SAME buffer pointer, one digit rewritten per
+    ///                iteration (same length, same shape): the honest
+    ///                miss-path cost — ptr/len match, memcmp fails, full
+    ///                shell route + the record copy. REPORTED, not gated:
+    ///                the trade the static win must dominate;
+    ///   alternation— X,Y per pair (the shell's alternation regime):
+    ///                failed verify + re-record per publish. REPORTED.
+    ///   e2e-ref    — n_events_publish on the static fixture (band tie).
+    /// Parity gates BEFORE timing (untimed): the tape arm delivers
+    /// serde's parse on every line's fixture, including the staleness
+    /// killer (a changed digit must deliver the NEW digit).
+    #[test]
+    #[ignore]
+    fn bench_c_publish_tape_ab() {
+        #[inline(never)]
+        unsafe fn arm_publish<const TAPE: bool>(ev: *const c_char, pj: *const c_char) -> usize {
+            let bus = events::global_ref();
+            if !bus.may_have_subscribers() {
+                return 0;
+            }
+            let event = cstr(ev);
+            if event.is_empty() {
+                return 0;
+            }
+            let payload = if pj.is_null() {
+                CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
+            } else {
+                c_publish_value_inner::<TAPE>(cstr(pj))
+            };
+            let n = bus.publish(event, payload.value());
+            drop(payload);
+            n
+        }
+
+        const S_FIX: &str = "{\"tick\":1,\"drained\":0}";
+        const S_B: &str = "{\"a\":1,\"b\":2,\"c\":3}";
+        const S_X: &str = "{\"tick\":1,\"drained\":0}";
+        const S_Y: &str = "{\"a\":10,\"b\":20,\"c\":30}";
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        let pj_fix = CString::new(S_FIX).unwrap();
+        let pj_b = CString::new(S_B).unwrap();
+        let pj_x = CString::new(S_X).unwrap();
+        let pj_y = CString::new(S_Y).unwrap();
+        let raw = CString::new(S_FIX).unwrap().into_raw(); // byte 8 = tick digit
+
+        // Parity gates (untimed) through the TAPE arm.
+        {
+            let cap: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let cap2 = Arc::clone(&cap);
+            let sub = events::global().subscribe("c.bench.tape.parity", Arc::new(move |_, v| {
+                cap2.lock().unwrap().push(v.clone());
+            }));
+            let evp = CString::new("c.bench.tape.parity").unwrap();
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_fix.as_ptr()) };
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_fix.as_ptr()) }; // tape hit
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_b.as_ptr()) };
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_fix.as_ptr()) }; // self-heal
+            unsafe { *raw.add(8) = b'1' as c_char };
+            unsafe { arm_publish::<true>(evp.as_ptr(), raw) };
+            unsafe { *raw.add(8) = b'2' as c_char };
+            unsafe { arm_publish::<true>(evp.as_ptr(), raw) }; // staleness killer
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_x.as_ptr()) };
+            unsafe { arm_publish::<true>(evp.as_ptr(), pj_y.as_ptr()) };
+            let _ = events::global().unsubscribe("c.bench.tape.parity", &sub);
+            let got = cap.lock().unwrap();
+            let want = [
+                serde_json::from_str::<Value>(S_FIX).unwrap_or(Value::Null),
+                serde_json::from_str::<Value>(S_FIX).unwrap_or(Value::Null),
+                serde_json::from_str::<Value>(S_B).unwrap_or(Value::Null),
+                serde_json::from_str::<Value>(S_FIX).unwrap_or(Value::Null),
+                serde_json::from_str::<Value>("{\"tick\":1,\"drained\":0}").unwrap_or(Value::Null),
+                serde_json::from_str::<Value>("{\"tick\":2,\"drained\":0}").unwrap_or(Value::Null),
+                serde_json::from_str::<Value>(S_X).unwrap_or(Value::Null),
+                serde_json::from_str::<Value>(S_Y).unwrap_or(Value::Null),
+            ];
+            assert_eq!(got.len(), want.len(), "parity gate capture misalignment");
+            for (v, w) in got.iter().zip(want.iter()) {
+                assert_eq!(v, w, "tape parity diverged");
+            }
+        }
+
+        // Line 1: STATIC regime (same buffer, unchanged bytes).
+        let sub = events::global().subscribe("c.bench.tape", Arc::new(|_, _| {}));
+        let ev = CString::new("c.bench.tape").unwrap();
+        for _ in 0..10_000u32 {
+            black_box(unsafe { arm_publish::<false>(ev.as_ptr(), pj_fix.as_ptr()) });
+            black_box(unsafe { arm_publish::<true>(ev.as_ptr(), pj_fix.as_ptr()) });
+        }
+        let mut best_static_off = f64::MAX;
+        let mut best_static_on = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { arm_publish::<false>(ev.as_ptr(), pj_fix.as_ptr()) });
+            }
+            best_static_off = best_static_off.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { arm_publish::<true>(ev.as_ptr(), pj_fix.as_ptr()) });
+            }
+            best_static_on = best_static_on.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_ref = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj_fix.as_ptr()) });
+            }
+            best_ref = best_ref.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.tape", &sub);
+
+        // Line 2: CHANGING regime (same pointer, digit rewritten per iter).
+        let sub2 = events::global().subscribe("c.bench.tape.chg", Arc::new(|_, _| {}));
+        let ev2 = CString::new("c.bench.tape.chg").unwrap();
+        for _ in 0..10_000u32 {
+            unsafe { *raw.add(8) = b'1' as c_char };
+            black_box(unsafe { arm_publish::<false>(ev2.as_ptr(), raw) });
+            unsafe { *raw.add(8) = b'2' as c_char };
+            black_box(unsafe { arm_publish::<true>(ev2.as_ptr(), raw) });
+        }
+        let mut best_chg_off = f64::MAX;
+        let mut best_chg_on = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for i in 0..iters {
+                unsafe { *raw.add(8) = if i & 1 == 0 { b'1' } else { b'2' } as c_char };
+                black_box(unsafe { arm_publish::<false>(ev2.as_ptr(), raw) });
+            }
+            best_chg_off = best_chg_off.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let start = Instant::now();
+            for i in 0..iters {
+                unsafe { *raw.add(8) = if i & 1 == 0 { b'1' } else { b'2' } as c_char };
+                black_box(unsafe { arm_publish::<true>(ev2.as_ptr(), raw) });
+            }
+            best_chg_on = best_chg_on.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.tape.chg", &sub2);
+
+        // Line 3: ALTERNATION regime (X,Y per pair), both arms per pair.
+        let sub3 = events::global().subscribe("c.bench.tape.alt", Arc::new(|_, _| {}));
+        let ev3 = CString::new("c.bench.tape.alt").unwrap();
+        for _ in 0..10_000u32 {
+            black_box(unsafe {
+                arm_publish::<false>(ev3.as_ptr(), pj_x.as_ptr())
+                    + arm_publish::<false>(ev3.as_ptr(), pj_y.as_ptr())
+            });
+            black_box(unsafe {
+                arm_publish::<true>(ev3.as_ptr(), pj_x.as_ptr())
+                    + arm_publish::<true>(ev3.as_ptr(), pj_y.as_ptr())
+            });
+        }
+        let mut best_alt_off = f64::MAX;
+        let mut best_alt_on = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    arm_publish::<false>(ev3.as_ptr(), pj_x.as_ptr())
+                        + arm_publish::<false>(ev3.as_ptr(), pj_y.as_ptr())
+                });
+            }
+            best_alt_off = best_alt_off.min(start.elapsed().as_secs_f64() / f64::from(iters));
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    arm_publish::<true>(ev3.as_ptr(), pj_x.as_ptr())
+                        + arm_publish::<true>(ev3.as_ptr(), pj_y.as_ptr())
+                });
+            }
+            best_alt_on = best_alt_on.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.tape.alt", &sub3);
+
+        println!(
+            "BENCH c_publish_tape_ab: static shell {:.0} vs tape {:.0} ns/op | changing shell {:.0} vs tape {:.0} ns/op | alternation shell {:.0} vs tape {:.0} ns/pair | e2e-ref {:.0} ns/op (min of {rounds}x{iters})",
+            best_static_off * 1e9,
+            best_static_on * 1e9,
+            best_chg_off * 1e9,
+            best_chg_on * 1e9,
+            best_alt_off * 1e9,
+            best_alt_on * 1e9,
+            best_ref * 1e9,
+        );
     }
 
     /// TASK-220 shell-safety contract: a handler that publishes
