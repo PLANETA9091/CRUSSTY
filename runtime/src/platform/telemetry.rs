@@ -119,7 +119,19 @@ static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 /// relaxed atomic stores + one fetch_add — no mutex, no window scan, no
 /// division on the hot path. The 60s-window average is computed lazily at
 /// `snapshot()` time (panel-cold path).
-const RING_CAP: usize = 4096;
+/// TASK-222 (lever (f), ring sizing): RING_CAP sizes the tps ceiling — the
+/// ring must hold a FULL 60 s window at the maximum sustained tick rate,
+/// else the window silently degrades to a ring-sized sub-window average
+/// AND the memo's evict cursor stalls on rewritten in-window slots
+/// (head - a_evict crosses RING_CAP on the first read after every
+/// rebuild, so every read pays the verbatim rebuild — see
+/// `bench_tps_memo_ab`'s high_tps arm for the measured A/B). The ceiling
+/// is RING_CAP / 60: 4096 = 68 tps (below a 20 tps server's 3.4x headroom
+/// but breakable by faster loops); 16384 = 273 tps with 262 KB of static
+/// storage. The scan cost is bounded by WRITTEN samples (the backward
+/// walk breaks at the never-written tail), so a larger cap costs nothing
+/// until the ring actually fills.
+const RING_CAP: usize = 16384;
 static RING_HEAD: AtomicU64 = AtomicU64::new(0);
 static RING_TS: [AtomicU64; RING_CAP] = [const { AtomicU64::new(0) }; RING_CAP];
 static RING_NS: [AtomicU64; RING_CAP] = [const { AtomicU64::new(0) }; RING_CAP];
@@ -217,9 +229,10 @@ struct CFill {
 /// WHY: the landed snapshot_json lines are an empty-ring shape — the bench
 /// never pushes ticks, so `ring_tps()` returns None after one load. In
 /// production the per-tick path feeds the ring and `ring_tps()` scans up
-/// to RING_CAP (4096) slots per read (measured 1290 ns/op warm vs the
-/// landed 92 ns line): the TASK-194 cache win is masked behind that scan
-/// plus a per-read serde f64 format.
+/// to RING_CAP slots per read (bounded by WRITTEN samples — the backward
+/// walk breaks at the never-written tail; measured 1290 ns/op on a ~1200
+/// sample warm ring vs the landed 92 ns line): the TASK-194 cache win is
+/// masked behind that scan plus a per-read serde f64 format.
 ///
 /// VALUE CONTRACT: the memo serves EXACTLY the verbatim expression
 /// `ring_tps().unwrap_or_else(current_tps)`:
@@ -1276,6 +1289,23 @@ mod bench_hotpath {
     /// - tick_then_read: one push + one snapshot_json_write per iter — the
     ///                   amortized production shape (a tick lands between
     ///                   panel reads).
+    /// - high_tps:       TASK-222 lever (f) gate line — the >RING_CAP/60
+    ///                   regime. Prefill 70 s at 250 tps (4 ms spacing,
+    ///                   17500 pushes: the 60 s window holds 15000 samples,
+    ///                   3.7x the legacy 4096 ring, inside the sized ring);
+    ///                   timed loop = one push + one memo read per iter
+    ///                   (the tick-boundary shape at this rate). At the
+    ///                   legacy cap the window cannot fit the ring: the
+    ///                   evict cursor stalls on rewritten in-window slots,
+    ///                   head - a_evict crosses RING_CAP on the first read
+    ///                   after every rebuild (a_evict = oldest_kept = head
+    ///                   - RING_CAP), so EVERY read pays the verbatim
+    ///                   rebuild (a full backward scan of the wrapped
+    ///                   ring). Pre-registered cross-binary gate: >=3% on
+    ///                   this line (expected ~50x), empty/memo_warm/
+    ///                   tick_then_read unchanged; the value contract is
+    ///                   asserted by the suite test
+    ///                   tps_window_survives_high_tps_wrap.
     ///
     /// The AFTER implementation (TASK-198 tps memo) must keep the resolved
     /// value bit-identical to `ring_tps().unwrap_or_else(current_tps)` —
@@ -1420,17 +1450,65 @@ mod bench_hotpath {
             best_ttr = best_ttr.min(start.elapsed().as_secs_f64() / f64::from(iters));
         }
 
+        // ---- TASK-222 high_tps: the >RING_CAP/60 regime (lever (f)) ----
+        // Prefill 70 s at 250 tps; timed loop = push 1 + memo read 1 per
+        // iter. Parity canary first (the memo must equal the verbatim scan
+        // in this regime — the value contract is regime-independent).
+        for i in 0..17_500u64 {
+            push_tick_time_ts(2_000_000_000 + i * 4_000_000, 4_000_000);
+        }
+        {
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                tps_memo_resolve(&mut cache.tps_memo),
+                "f64 format failed (unreachable)"
+            );
+            let scan = ring_tps().unwrap_or_else(current_tps);
+            assert_eq!(
+                cache.tps_memo.tps.to_bits(),
+                scan.to_bits(),
+                "high-tps memo diverged from the verbatim scan"
+            );
+        }
+        let mut hi_ts = 2_000_000_000 + 17_500 * 4_000_000;
+        let mut hi_value = 0.0f64;
+        for _ in 0..1_000u32 {
+            hi_ts += 4_000_000;
+            push_tick_time_ts(hi_ts, 4_000_000);
+            let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            if tps_memo_resolve(&mut cache.tps_memo) {
+                hi_value = cache.tps_memo.tps;
+            }
+            std::hint::black_box(hi_value.to_bits());
+        }
+        let mut best_hi = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                hi_ts += 4_000_000;
+                push_tick_time_ts(hi_ts, 4_000_000);
+                let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                if tps_memo_resolve(&mut cache.tps_memo) {
+                    hi_value = cache.tps_memo.tps;
+                }
+                std::hint::black_box(hi_value.to_bits());
+            }
+            best_hi = best_hi.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
         // teardown: leave a clean state for whatever runs next (solo)
         test_reset_ring();
 
         println!(
-            "BENCH tps_memo A/B: empty_e2e {:.0} ns/op, scan_warm {:.0} ns/op (tps {:.2}), memo_warm {:.0} ns/op, warm_e2e {:.0} ns/op, tick_then_read {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH tps_memo A/B: empty_e2e {:.0} ns/op, scan_warm {:.0} ns/op (tps {:.2}), memo_warm {:.0} ns/op, warm_e2e {:.0} ns/op, tick_then_read {:.0} ns/op, high_tps {:.0} ns/op (tps {:.1}) (min of {rounds}x{iters})",
             best_empty * 1e9,
             best_scan * 1e9,
             scan_value,
             best_memo * 1e9,
             best_warm * 1e9,
-            best_ttr * 1e9
+            best_ttr * 1e9,
+            best_hi * 1e9,
+            hi_value
         );
     }
 
@@ -2876,6 +2954,55 @@ mod tests {
         push_tick_time_ts(1_000_000_000 + 61_000_000_000, 40_000_000);
         let s2 = snapshot();
         assert!((s2.tps - 25.0).abs() < 1e-6, "tps {} != 25", s2.tps);
+    }
+
+    #[test]
+    fn tps_window_survives_high_tps_wrap() {
+        // TASK-222 lever (f): at tps above the legacy RING_CAP/60 ceiling
+        // the 60 s window must STILL be served from the ring — the value
+        // must equal the true trailing-window average over the full feed,
+        // not a ring-sized sub-window average. Feed: 120 s at 100 tps then
+        // 30 s at 250 tps; the read instant sits 30 s into the fast phase,
+        // so the true 60 s window mixes both rates (30 s x 100 tps + 30 s
+        // x 250 tps = 3000 + 7500 samples = 15000 <= the sized ring). The
+        // legacy 4096-slot ring (68 tps ceiling) lost the slow phase
+        // entirely and the evict cursor stalled; the reference below
+        // mirrors ring_tps's edge semantics (keep ts >= newest - 60 s)
+        // over the FULL feed history.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+        let mut hist: Vec<(u64, u64)> = Vec::with_capacity(19_500);
+        let mut ts = 1_000_000_000u64;
+        for _ in 0..12_000u32 {
+            hist.push((ts, 10_000_000));
+            ts += 10_000_000;
+        }
+        for _ in 0..7_500u32 {
+            hist.push((ts, 4_000_000));
+            ts += 4_000_000;
+        }
+        for &(t, ns) in &hist {
+            push_tick_time_ts(t, ns);
+        }
+        let newest = ts - 4_000_000; // the last push consumed ts - spacing
+        let cutoff = newest.saturating_sub(60_000_000_000);
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for &(t, ns) in &hist {
+            if t >= cutoff {
+                sum += ns;
+                n += 1;
+            }
+        }
+        assert!(n > 0, "reference window must be non-empty");
+        let expected = tps_formula(sum, n);
+        let s = snapshot();
+        assert!(
+            (s.tps - expected).abs() < 1e-9,
+            "window tps {} != full-feed reference {} (ring lost the 60 s window)",
+            s.tps,
+            expected
+        );
     }
 
     #[test]
