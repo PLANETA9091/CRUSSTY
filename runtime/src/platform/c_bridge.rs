@@ -21,6 +21,7 @@ use cplug_abi::{
     StorageEndSaveCb, StorageNameCb, StorageReadCb, StorageWriteCb,
 };
 use serde_json::{Number, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::AtomicUsize;
@@ -109,6 +110,20 @@ pub const TELEM_SNAP_ONELOCK: bool = true;
 /// leading zeros, "-0", escapes, raw control bytes, nested containers,
 /// any whitespace inside containers — every one of those routes to serde.
 pub const C_PUBLISH_FASTPARSE: bool = true;
+
+/// TASK-220 A/B toggle: shellbacked C-publish payload construct. `true` =
+/// flat objects (<= 8 keys, fast-path subset) build their map from a
+/// per-thread recycled shell (warm shapes: ZERO heap allocs — the key
+/// Strings and BTreeMap nodes persist across publishes; cold/odd shapes:
+/// the verbatim pre-220 construct whose fresh map becomes the shell,
+/// LRU-of-1). `false` = the pre-220 owned-construct shape verbatim.
+/// Semantics are identical in both states: the published Value equals
+/// serde's parse of the same payload in every case — the warm commit
+/// runs only after the shell's key set is PROVEN equal to the payload's
+/// (len == k, every key present, no duplicate spans), and value writes
+/// replace in place; parity is locked by c_publish_shellbacked_parity
+/// and c_publish_parse itself is untouched (byte corpus stays).
+pub const C_PUBLISH_SHELLBACK: bool = true;
 
 unsafe fn cstr(p: *const c_char) -> &'static str {
     if p.is_null() {
@@ -238,15 +253,24 @@ fn scan_simple_string(s: &str) -> Option<String> {
 /// A raw inner quote ends the token early and the caller's structural
 /// check then rejects the input — parity is preserved through the fallback.
 fn scan_string_at(s: &str, i: &mut usize) -> Option<String> {
+    scan_string_span(s, i).map(str::to_string)
+}
+
+/// TASK-220 borrowed twin of the string-token walk: IDENTICAL cursor
+/// semantics (first closing quote; escapes and control bytes rejected;
+/// a raw inner quote ends the token early so the caller's structural
+/// check rejects) but returns the &str span instead of an owned String —
+/// the shellbacked flat-object path warm-checks its key set off spans
+/// and only allocates on the cold (owned-map) commit.
+fn scan_string_span<'s>(s: &'s str, i: &mut usize) -> Option<&'s str> {
     let b = s.as_bytes();
     let start = *i + 1;
     let mut j = start;
     loop {
         let c = *b.get(j)?;
         if c == b'"' {
-            let t = s[start..j].to_string();
             *i = j + 1;
-            return Some(t);
+            return Some(&s[start..j]);
         }
         if c == b'\\' || c < 0x20 {
             return None;
@@ -387,6 +411,179 @@ fn scan_flat_array(s: &str) -> Option<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TASK-220: shellbacked C-publish payload (borrowed-key warm construct)
+// ---------------------------------------------------------------------------
+
+// TLS shell for the C-publish payload map — the R49 shell pattern applied
+// to the c_publish construct, in a TWO-slot LRU layout. A per-thread pair
+// of serde_json::Maps recycled across publishes: warm shape = one slot's
+// map holds EXACTLY the incoming payload's key set (len == k, every key
+// already present, no duplicate spans) -> the construct is one stack-span
+// scan plus k in-place value writes with ZERO heap allocs (no key
+// Strings, no BTreeMap node, no drop work). Any other shape builds a
+// fresh owned map at the pre-220 cost and Drop seeds it into the first
+// free slot (evicting slot 0 only when both slots are occupied — the 3+
+// rotating-shape corner). Repeating shapes, ALTERNATING shapes and phase
+// changes all warm (each shape keeps its own slot); only strict 3-way
+// rotation pays the pre-220 cost plus a failed two-slot probe.
+thread_local! {
+    static CPUB_SHELL: RefCell<[Option<serde_json::Map<String, Value>>; 2]> =
+        const { RefCell::new([None, None]) };
+}
+
+/// A parsed C-publish payload that knows how to go back where it came
+/// from. `shell = true` means `val` is the TLS shell map lent out as a
+/// `Value::Object`; Drop returns it (displacing any map a nested publish
+/// left behind — the nested call always finds the slot empty and takes
+/// the owned route). Safety rests on the publish contract: sync handlers
+/// only borrow the &Value for the dispatch duration, and the async queue
+/// deep-clones inside publish, so a recycled map can never alias live
+/// state after publish returns.
+struct CpubPayload {
+    val: Option<Value>,
+    shell: bool,
+}
+
+impl CpubPayload {
+    fn value(&self) -> &Value {
+        self.val.as_ref().expect("payload value present until drop")
+    }
+}
+
+impl Drop for CpubPayload {
+    fn drop(&mut self) {
+        if self.shell {
+            if let Some(Value::Object(map)) = self.val.take() {
+                // First free slot: during a warm dispatch exactly one slot
+                // is empty (the hit map is OUT), so a nested publish's
+                // payload lands there and the outer put-back below cannot
+                // drop it silently. With both slots occupied (3+ shape
+                // rotation) slot 0 is the deliberate LRU eviction.
+                CPUB_SHELL.with(|slots| {
+                    let mut slots = slots.borrow_mut();
+                    let free = slots.iter().position(|s| s.is_none()).unwrap_or(0);
+                    slots[free] = Some(map);
+                });
+            }
+        }
+    }
+}
+
+/// Inline cap: flat objects wider than this skip the shell protocol and
+/// take the verbatim owned construct (the warm key-set check needs the
+/// span set; the stack array is its zero-alloc store).
+const CPUB_INLINE: usize = 8;
+
+/// Shellbacked C-entry payload parse. Flat objects within the inline cap
+/// take the warm/cold shell protocol; every other shape (non-object,
+/// wide objects, anything the flat scanner rejects) is the verbatim
+/// pre-220 c_publish_parse route with `shell = false`.
+fn c_publish_value(s: &str) -> CpubPayload {
+    if C_PUBLISH_SHELLBACK && C_PUBLISH_FASTPARSE && s.as_bytes().first() == Some(&b'{') {
+        if let Some(pl) = c_publish_value_flat(s) {
+            return pl;
+        }
+        // flat scan rejected -> serde decides (the TASK-193 parity
+        // contract, unchanged); the pre-220 route below re-walks the
+        // same bytes and lands on the same answer
+    }
+    CpubPayload {
+        val: Some(c_publish_parse(s)),
+        shell: false,
+    }
+}
+
+/// Flat-object arm of the shellbacked parse. Accepts EXACTLY what
+/// scan_flat_object accepts (same walk, same rejections, duplicate keys
+/// routed out) and either commits into the shell (warm) or builds the
+/// verbatim owned map from the already-scanned spans (cold). Returns
+/// None only for shapes the pre-220 route must decide (serde fallback
+/// or scan_flat_object's owned path).
+fn c_publish_value_flat(s: &str) -> Option<CpubPayload> {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[b.len() - 1] != b'}' {
+        return None;
+    }
+    let mut pairs: [Option<(&str, Value)>; CPUB_INLINE] = Default::default();
+    let mut k = 0usize;
+    let mut i = 1usize;
+    if b[i] != b'}' {
+        loop {
+            if b[i] != b'"' {
+                return None;
+            }
+            let key = scan_string_span(s, &mut i)?;
+            if b.get(i) != Some(&b':') {
+                return None;
+            }
+            i += 1;
+            let v = scan_leaf(s, &mut i)?;
+            if k == CPUB_INLINE {
+                return None; // wide object -> verbatim owned construct
+            }
+            // Duplicate spans break the warm key-set proof (len == k
+            // would not imply set equality) — route them out.
+            for q in pairs.iter().take(k) {
+                let (qk, _) = q.as_ref().expect("pair filled");
+                if *qk == key {
+                    return None;
+                }
+            }
+            pairs[k] = Some((key, v));
+            k += 1;
+            match b.get(i) {
+                Some(b',') => i += 1,
+                Some(b'}') => break,
+                _ => return None,
+            }
+        }
+    }
+    // Warm commit needs the WHOLE key set proven BEFORE any mutation —
+    // a partial fill that then bails would corrupt the shell (the R49
+    // stale-shell lesson, inverted). Both slots are probed; the first
+    // matching key set takes the zero-alloc in-place commit.
+    let hit = CPUB_SHELL.with(|slot| {
+        let mut slots = slot.borrow_mut();
+        for si in 0..slots.len() {
+            let is_warm = matches!(&slots[si], Some(m) if m.len() == k
+                && pairs.iter().take(k).all(|p| {
+                    let (key, _) = p.as_ref().expect("pair filled");
+                    m.contains_key(*key)
+                }));
+            if is_warm {
+                let m = slots[si].as_mut().expect("checked above");
+                for p in pairs.iter_mut().take(k) {
+                    let (key, v) = p.take().expect("pair filled");
+                    *m.get_mut(key).expect("validated above") = v;
+                }
+                return Some(slots[si].take().expect("checked above"));
+            }
+        }
+        None
+    });
+    if let Some(map) = hit {
+        return Some(CpubPayload {
+            val: Some(Value::Object(map)),
+            shell: true,
+        });
+    }
+    // Cold: the pre-220 owned construct from the already-scanned spans —
+    // exactly scan_flat_object's allocation profile (one key String per
+    // key, node mallocs per insert) — and the fresh map becomes a shell
+    // slot on Drop (two-slot seeding; any repeating or alternating shape
+    // warms by its second call of the cycle).
+    let mut map = serde_json::Map::new();
+    for p in pairs.iter_mut().take(k) {
+        let (key, v) = p.take().expect("pair filled");
+        map.insert(key.to_string(), v);
+    }
+    Some(CpubPayload {
+        val: Some(Value::Object(map)),
+        shell: true,
+    })
+}
+
 unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const c_char) -> usize {
     // TASK-203: gate-first ordering (C_ENTRY_PREGATE_FIRST). With the
     // toggle on, the TASK-179 gate consumes the event pointer FIRST —
@@ -414,15 +611,22 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
         if event.is_empty() {
             return 0;
         }
-        let payload: Value = if payload_json.is_null() {
-            Value::Null
+        // TASK-220: shellbacked payload — warm flat shapes construct with
+        // ZERO heap allocs (TLS shell map lent out as a Value, in-place
+        // value writes); every other shape is the verbatim pre-220
+        // construct. The published Value equals serde's parse in every
+        // state (parity locked by c_publish_shellbacked_parity). The
+        // shell map returns on drop, AFTER publish's sync dispatch and
+        // the async queue's deep-clone are complete — the &Value borrow
+        // contract keeps the payload unobservable past this point.
+        let payload = if payload_json.is_null() {
+            CpubPayload { val: Some(Value::Null), shell: false }
         } else {
-            // TASK-193: fast path for the flat producer shapes, serde
-            // fallback for everything else — same Value in every case
-            // (see C_PUBLISH_FASTPARSE for the parity argument).
-            c_publish_parse(cstr(payload_json))
+            c_publish_value(cstr(payload_json))
         };
-        return bus.publish(event, &payload);
+        let invoked = bus.publish(event, payload.value());
+        drop(payload);
+        return invoked;
     }
     // Verbatim pre-TASK-203 shape (C_ENTRY_PREGATE_FIRST = false arm).
     let event = cstr(event);
@@ -441,15 +645,16 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
     if C_ENTRY_PREGATE && !bus.may_have_subscribers() {
         return 0;
     }
-    let payload: Value = if payload_json.is_null() {
-        Value::Null
+    // TASK-220: shellbacked payload — see the gate-first arm above for
+    // the contract; identical semantics in both entry shapes.
+    let payload = if payload_json.is_null() {
+        CpubPayload { val: Some(Value::Null), shell: false }
     } else {
-        // TASK-193: fast path for the flat producer shapes, serde fallback
-        // for everything else — same Value in every case (see
-        // C_PUBLISH_FASTPARSE for the parity argument).
-        c_publish_parse(cstr(payload_json))
+        c_publish_value(cstr(payload_json))
     };
-    bus.publish(event, &payload)
+    let invoked = bus.publish(event, payload.value());
+    drop(payload);
+    invoked
 }
 
 unsafe extern "C" fn n_events_unsubscribe(token: u64) -> i32 {
@@ -1903,6 +2108,258 @@ mod tests {
             best_map * 1e9,
             best_serde * 1e9
         );
+    }
+
+    /// TASK-220 A/B: the C events publish entry's payload construct —
+    /// arm A = the pre-220 owned shape, verbatim replica (gate + cstr +
+    /// c_publish_parse + publish); arm B = the REAL n_events_publish with
+    /// C_PUBLISH_SHELLBACK = true. Line 1: the ledger line (one sync
+    /// subscriber, the {"tick":1,"drained":0} fixture — warm on every
+    /// timed iteration after the 10k warmup). Line 2: the alternation
+    /// control (two flat shapes X/Y through the SAME arm per iteration,
+    /// reported as a pair sum) — the two-slot shell gives each shape its
+    /// own slot, so the alternation must WARM (not regress vs owned).
+    /// Parity gates run BEFORE any timing: the handler-captured Value
+    /// must equal serde's parse for every shape through both arms.
+    /// NAMED to sort after the parse benches and AFTER
+    /// bench_c_events_publish: that bench's no-subs ledger line needs a
+    /// never-subscribed bus, and this bench's subscribe cycle leaves
+    /// gens nonzero forever (same caveat as bench_c_publish_gfirst_ab,
+    /// documented there).
+    #[test]
+    #[ignore]
+    fn bench_c_publish_shell_ab() {
+        // Arm A: the pre-220 entry body, verbatim (owned construct).
+        #[inline(never)]
+        unsafe fn arm_a_owned(event: *const c_char, payload_json: *const c_char) -> usize {
+            let bus = events::global_ref();
+            if !bus.may_have_subscribers() {
+                return 0;
+            }
+            let event = cstr(event);
+            if event.is_empty() {
+                return 0;
+            }
+            let payload: Value = c_publish_parse(cstr(payload_json));
+            bus.publish(event, &payload)
+        }
+
+        let shapes_ab: [&str; 2] = [
+            "{\"tick\":1,\"drained\":0}",
+            "{\"a\":10,\"b\":20,\"c\":30}",
+        ];
+
+        // Parity gates (untimed): every shape through both arms must
+        // deliver serde's parse to the handler.
+        {
+            let cap: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let cap2 = Arc::clone(&cap);
+            let sub = events::global().subscribe("c.bench.shell.parity", Arc::new(move |_, v| {
+                cap2.lock().unwrap().push(v.clone());
+            }));
+            let ev = CString::new("c.bench.shell.parity").unwrap();
+            for s in shapes_ab {
+                let pj = CString::new(s).unwrap();
+                unsafe { arm_a_owned(ev.as_ptr(), pj.as_ptr()) };
+                unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) };
+            }
+            let _ = events::global().unsubscribe("c.bench.shell.parity", &sub);
+            let got = cap.lock().unwrap();
+            assert_eq!(got.len(), 2 * shapes_ab.len());
+            for (i, v) in got.iter().enumerate() {
+                let want: Value =
+                    serde_json::from_str(shapes_ab[i / 2]).unwrap_or(Value::Null);
+                assert_eq!(v, &want, "arm parity diverged on {}", shapes_ab[i / 2]);
+            }
+        }
+
+        let iters = 200_000u32;
+        let rounds = 5;
+        let pj_fix = CString::new(shapes_ab[0]).unwrap();
+        let pj_x = CString::new(shapes_ab[0]).unwrap();
+        let pj_y = CString::new(shapes_ab[1]).unwrap();
+
+        // Line 1: warm repeat shape, one sync subscriber, both arms.
+        let sub = events::global().subscribe("c.bench.shell", Arc::new(|_, _| {}));
+        let ev = CString::new("c.bench.shell").unwrap();
+        for _ in 0..10_000u32 {
+            black_box(unsafe { n_events_publish(ev.as_ptr(), pj_fix.as_ptr()) });
+        }
+        let mut best_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { arm_a_owned(ev.as_ptr(), pj_fix.as_ptr()) });
+            }
+            best_a = best_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe { n_events_publish(ev.as_ptr(), pj_fix.as_ptr()) });
+            }
+            best_b = best_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.shell", &sub);
+
+        // Line 2: alternation control — X,Y per iteration, both arms,
+        // reported per PAIR (2 publishes) so the arms stay comparable.
+        let sub2 = events::global().subscribe("c.bench.shell.alt", Arc::new(|_, _| {}));
+        let ev2 = CString::new("c.bench.shell.alt").unwrap();
+        for _ in 0..10_000u32 {
+            black_box(unsafe { arm_a_owned(ev2.as_ptr(), pj_x.as_ptr()) });
+            black_box(unsafe { arm_a_owned(ev2.as_ptr(), pj_y.as_ptr()) });
+            black_box(unsafe { n_events_publish(ev2.as_ptr(), pj_x.as_ptr()) });
+            black_box(unsafe { n_events_publish(ev2.as_ptr(), pj_y.as_ptr()) });
+        }
+        let mut best_alt_a = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    arm_a_owned(ev2.as_ptr(), pj_x.as_ptr())
+                        + arm_a_owned(ev2.as_ptr(), pj_y.as_ptr())
+                });
+            }
+            best_alt_a = best_alt_a.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let mut best_alt_b = f64::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(unsafe {
+                    n_events_publish(ev2.as_ptr(), pj_x.as_ptr())
+                        + n_events_publish(ev2.as_ptr(), pj_y.as_ptr())
+                });
+            }
+            best_alt_b = best_alt_b.min(start.elapsed().as_secs_f64() / f64::from(iters));
+        }
+        let _ = events::global().unsubscribe("c.bench.shell.alt", &sub2);
+
+        println!(
+            "BENCH c_publish_shell_ab: warm-shape owned {:.0} vs shellbacked {:.0} ns/op | alternation owned {:.0} vs shellbacked {:.0} ns/pair (min of {rounds}x{iters})",
+            best_a * 1e9,
+            best_b * 1e9,
+            best_alt_a * 1e9,
+            best_alt_b * 1e9,
+        );
+    }
+
+    /// TASK-220 parity + shell-integrity contract: every shape published
+    /// through the REAL C entry must deliver the handler EXACTLY serde's
+    /// parse of the payload, across warm repeats, shape changes, the
+    /// empty object, duplicate keys (serde: last wins), string-valued
+    /// leaves, the wide (> inline cap) object and the owned-route shapes
+    /// (array, bare string), over two passes so every flat shape hits a
+    /// warm shell after other shapes churned the slot. Any stale-key
+    /// leak or partial warm commit breaks the equality.
+    #[test]
+    fn c_publish_shellbacked_parity() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let shapes: [&str; 9] = [
+            "{\"tick\":1,\"drained\":0}",
+            "{\"tick\":2,\"drained\":3}",
+            "{}",
+            "{\"a\":\"x\",\"b\":-5}",
+            "{\"a\":1,\"a\":2}",
+            "{\"tick\":1}",
+            "{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8}",
+            "[1,2,3]",
+            "\"plain\"",
+        ];
+        let ev = CString::new("c.t220.parity").unwrap();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let sub = events::global().subscribe("c.t220.parity", Arc::new(move |_, v| {
+            seen2.lock().unwrap().push(v.clone());
+        }));
+        for _ in 0..2 {
+            for s in shapes {
+                let pj = CString::new(s).unwrap();
+                let n = unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) };
+                assert_eq!(n, 1, "one sync subscriber must be invoked");
+            }
+        }
+        let _ = events::global().unsubscribe("c.t220.parity", &sub);
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 2 * shapes.len());
+        for (i, v) in got.iter().enumerate() {
+            let want: Value =
+                serde_json::from_str(shapes[i % shapes.len()]).unwrap_or(Value::Null);
+            assert_eq!(v, &want, "shape {} diverged from serde", shapes[i % shapes.len()]);
+        }
+    }
+
+    /// TASK-220 shell-safety contract: a handler that publishes
+    /// RE-ENTRANTLY (nested C publish while the outer shell map is lent
+    /// out) must not corrupt either payload — the nested call finds the
+    /// slot empty and takes the owned route; and an ASYNC subscriber
+    /// must receive a deep-cloned payload that still equals serde's
+    /// parse after the shell has been recycled by later publishes (the
+    /// clone is taken inside publish, before put-back).
+    #[test]
+    fn c_publish_shellbacked_reentrant_and_async() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let inner_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outer_saw: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let async_saw: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let ih = Arc::clone(&inner_hits);
+        let sub_inner = events::global().subscribe("c.t220.inner", Arc::new(move |_, _| {
+            ih.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let os = Arc::clone(&outer_saw);
+        let sub_outer = events::global().subscribe("c.t220.outer", Arc::new(move |_, v| {
+            os.lock().unwrap().push(v.clone());
+            let ev_i = CString::new("c.t220.inner").unwrap();
+            let pj_i = CString::new("{\"in\":7}").unwrap();
+            unsafe { n_events_publish(ev_i.as_ptr(), pj_i.as_ptr()) };
+        }));
+        let asw = Arc::clone(&async_saw);
+        let sub_async = events::global().subscribe_async("c.t220.async", Arc::new(move |_, v| {
+            asw.lock().unwrap().push(v.clone());
+        }));
+
+        let ev_outer = CString::new("c.t220.outer").unwrap();
+        let pj_outer = CString::new("{\"tick\":9,\"drained\":8}").unwrap();
+        for _ in 0..3 {
+            let n = unsafe { n_events_publish(ev_outer.as_ptr(), pj_outer.as_ptr()) };
+            assert_eq!(n, 1);
+        }
+        let ev_async = CString::new("c.t220.async").unwrap();
+        // publish's return is the SYNC dispatch count — an async-only
+        // event returns 0 (the async task is queued, not counted).
+        let n = unsafe { n_events_publish(ev_async.as_ptr(), pj_outer.as_ptr()) };
+        assert_eq!(n, 0, "async-only event has no sync invocations");
+
+        let want: Value = serde_json::from_str("{\"tick\":9,\"drained\":8}").unwrap();
+        let saw = outer_saw.lock().unwrap();
+        assert_eq!(saw.len(), 3, "outer payload seen once per publish");
+        for v in saw.iter() {
+            assert_eq!(v, &want, "outer payload diverged under re-entrancy");
+        }
+        drop(saw);
+        // inner delivered once per outer publish (sync dispatch)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while inner_hits.load(std::sync::atomic::Ordering::SeqCst) < 3
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(inner_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // async delivery: the queued clone must equal serde's parse
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while async_saw.lock().unwrap().len() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let agot = async_saw.lock().unwrap();
+        assert_eq!(agot.len(), 1, "async subscriber must deliver exactly once");
+        assert_eq!(agot[0], want, "async queued clone diverged from serde");
+        drop(agot);
+        let _ = events::global().unsubscribe("c.t220.inner", &sub_inner);
+        let _ = events::global().unsubscribe("c.t220.outer", &sub_outer);
+        let _ = events::global().unsubscribe("c.t220.async", &sub_async);
     }
 
     /// TASK-180: C telemetry entry state-independent contract. These two
