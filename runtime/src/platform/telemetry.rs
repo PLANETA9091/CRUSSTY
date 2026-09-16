@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -349,6 +350,79 @@ static SNAP_JSON_CACHE: Mutex<SnapshotJsonCache> = Mutex::new(SnapshotJsonCache 
     valid: false,
 });
 
+/// TASK-221 A/B toggle: TLS snapshot read repr. `true` = the snapshot hit
+/// paths ([`snapshot_json_write`] and [`snapshot_c_entry`]) run LOCK-FREE
+/// in the steady state — three relaxed loads (SNAP_GEN, RING_HEAD,
+/// TPS_LAST_BITS — the SAME atomics the memo resolve fast paths key on),
+/// a per-thread state compare, and the assemble from per-thread copies;
+/// the cache Mutex remains ONLY on the locked refresh path (gen bump,
+/// ring advance, fallback bits change, first call) where it serializes
+/// the miss rebuild exactly as before. NO new shared state: a per-thread
+/// copy is provably fresh iff the live gen matches the fill gen and the
+/// live ring head / fallback bits match the keys the copied memo was
+/// resolved under — the exact conditions [`tps_memo_resolve`]'s fast
+/// paths test. `false` = the pre-221 single-lock shape verbatim (both
+/// entries, shared c_buf). Byte output is IDENTICAL in both states;
+/// a ring push that lands between a locked refresh and the key record
+/// delays that thread's re-read by at most one tick (the next push
+/// re-keys it) — the same pre-mutation-coherence class the TASK-199 gen
+/// load documents. The unreachable `{}` fallback arms leave a thread's
+/// TLS serving its last coherent assemble (strictly better than `{}`;
+/// only reachable on a serde failure the byte-identity tests would flag
+/// loudly).
+pub const TELEM_SNAP_REPR: bool = true;
+
+/// TASK-221: per-thread snapshot read state (the TLS-epoch repr). Each
+/// thread holds its own memo-byte copy (epoch-gated), prefix/suffix
+/// range copies (gen-gated) and its own C-entry output buffer — so the
+/// steady hit path reads NO shared mutable state at all and the C
+/// entry's returned pointer is per-thread stable. The returned-pointer
+/// contract becomes: valid until the NEXT call FROM THIS THREAD — a
+/// strict strengthening of the pre-221 "any thread" bound (other
+/// threads' calls no longer invalidate an outstanding pointer; no
+/// consumer can observe the difference, single-thread consumers see
+/// identical behavior including the repeated-identical-pointer
+/// zero-copy fill).
+struct SnapTls {
+    memo_bytes: [u8; 40],
+    memo_len: usize,
+    // The resolve keys the copied memo bytes are a function of — the
+    // steady gate re-reads the same atomics (TASK-221).
+    memo_ring_keyed: bool,
+    memo_key_head: u64,
+    memo_key_bits: u64,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    ranges_gen: u64,
+    ranges_valid: bool,
+    cbuf: Vec<u8>,
+    cfill_gen: u64,
+    cfill_valid: bool,
+}
+
+impl SnapTls {
+    fn new() -> Self {
+        SnapTls {
+            memo_bytes: [0; 40],
+            memo_len: 0,
+            memo_ring_keyed: false,
+            memo_key_head: 0,
+            memo_key_bits: 0,
+            prefix: Vec::new(),
+            suffix: Vec::new(),
+            ranges_gen: 0,
+            ranges_valid: false,
+            cbuf: Vec::new(),
+            cfill_gen: 0,
+            cfill_valid: false,
+        }
+    }
+}
+
+thread_local! {
+    static SNAP_TLS: RefCell<SnapTls> = RefCell::new(SnapTls::new());
+}
+
 /// TASK-194 A/B toggle: ON = generation-gated pre-encoded cache (O(buffer)
 /// assemble on a clean generation); OFF = the pre-TASK-194 in-place
 /// reserialize shape, kept verbatim (the byte-identity tests re-derive it
@@ -530,8 +604,101 @@ pub(crate) fn metrics_full_checked() -> bool {
 #[inline(never)]
 #[allow(dead_code)] // TASK-181 E2b bisect (caller parked in c_bridge patch)
 pub(crate) fn snapshot_json_write(out: &mut Vec<u8>) {
+    if TELEM_SNAP_REPR {
+        // TASK-221 lock-free steady state: the per-thread ranges + memo
+        // copy are fresh iff the live gen and memo epoch both match what
+        // they were taken at — then the assemble needs NO lock and NO
+        // shared read.
+        let steady = SNAP_TLS.with(|t| {
+            let t = t.borrow();
+            let gen = SNAP_GEN.load(Ordering::Relaxed);
+            let head = RING_HEAD.load(Ordering::Relaxed);
+            let memo_fresh = if t.memo_ring_keyed {
+                head == t.memo_key_head
+            } else {
+                head == t.memo_key_head
+                    && TPS_LAST_BITS.load(Ordering::Relaxed) == t.memo_key_bits
+            };
+            if t.ranges_valid && t.ranges_gen == gen && memo_fresh {
+                out.extend_from_slice(&t.prefix);
+                out.extend_from_slice(&t.memo_bytes[..t.memo_len]);
+                out.extend_from_slice(&t.suffix);
+                true
+            } else {
+                false
+            }
+        });
+        if steady {
+            return;
+        }
+        snapshot_json_write_repr_slow(out);
+        return;
+    }
+    // Pre-221 shape, verbatim (A/B / rollback arm).
     let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     snapshot_json_write_inner(&mut cache, SnapshotOut::Ext(out));
+}
+
+/// TASK-221: the locked refresh path of the repr json entry. Takes the
+/// cache Mutex once (the pre-221 acquisition), resolves the memo under
+/// it (epoch bump if the ring advanced), then either copies the fresh
+/// shared ranges into the thread's TLS (cache hit — the next steady
+/// calls are lock-free) or lets the write body rebuild + serve `out`
+/// directly (miss — same body, same discipline, byte-identical output).
+#[inline(never)]
+fn snapshot_json_write_repr_slow(out: &mut Vec<u8>) {
+    let mut served = false;
+    SNAP_TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if !tps_memo_resolve(&mut cache.tps_memo) {
+            t.ranges_valid = false;
+            out.clear();
+            out.extend_from_slice(b"{}");
+            served = true; // output already final — the tail assemble must not run
+            return;
+        }
+        let ml = cache.tps_memo.bytes_len;
+        t.memo_len = ml;
+        t.memo_bytes[..ml].copy_from_slice(&cache.tps_memo.bytes[..ml]);
+        t.memo_ring_keyed = cache.tps_memo.ring_keyed;
+        t.memo_key_head = RING_HEAD.load(Ordering::Relaxed);
+        t.memo_key_bits = cache.tps_memo.k_bits;
+        let gen = SNAP_GEN.load(Ordering::Relaxed);
+        if cache.valid && cache.gen == gen {
+            t.prefix.clear();
+            t.prefix.extend_from_slice(&cache.prefix);
+            t.suffix.clear();
+            t.suffix.extend_from_slice(&cache.suffix);
+            t.ranges_gen = gen;
+            t.ranges_valid = true;
+        } else {
+            // Miss: the write body rebuilds the shared ranges AND serves
+            // this call's output directly (byte-identical to the pre-221
+            // miss path). Copy the rebuilt ranges for the next steady call.
+            snapshot_json_write_inner(&mut cache, SnapshotOut::Ext(out));
+            served = true;
+            if cache.valid {
+                t.prefix.clear();
+                t.prefix.extend_from_slice(&cache.prefix);
+                t.suffix.clear();
+                t.suffix.extend_from_slice(&cache.suffix);
+                t.ranges_gen = cache.gen;
+                t.ranges_valid = true;
+            } else {
+                t.ranges_valid = false;
+            }
+        }
+    });
+    if !served {
+        // Assemble outside the cache lock (the TLS copies are thread-local).
+        SNAP_TLS.with(|t| {
+            let t = t.borrow();
+            out.extend_from_slice(&t.prefix);
+            out.extend_from_slice(&t.memo_bytes[..t.memo_len]);
+            out.extend_from_slice(&t.suffix);
+        });
+    }
 }
 
 /// Output target for [`snapshot_json_write_inner`] (TASK-200): an
@@ -729,6 +896,33 @@ fn snapshot_json_write_inner(cache: &mut SnapshotJsonCache, out: SnapshotOut<'_>
 /// `{}` fallbacks invalidate the guard).
 #[inline(never)]
 pub(crate) fn snapshot_c_entry() -> *const std::os::raw::c_char {
+    if TELEM_SNAP_REPR {
+        // TASK-221 lock-free steady state (the TASK-201 zero-copy guard,
+        // lifted out of the lock): the per-thread fill is current iff the
+        // live gen matches the fill gen and the memo epoch matches what
+        // the fill's memo bytes were taken at — then the existing per-
+        // thread pointer is served with NO lock and NO shared read.
+        let steady = SNAP_TLS.with(|t| {
+            let t = t.borrow();
+            let head = RING_HEAD.load(Ordering::Relaxed);
+            let memo_fresh = if t.memo_ring_keyed {
+                head == t.memo_key_head
+            } else {
+                head == t.memo_key_head
+                    && TPS_LAST_BITS.load(Ordering::Relaxed) == t.memo_key_bits
+            };
+            t.cfill_valid
+                && t.cfill_gen == SNAP_GEN.load(Ordering::Relaxed)
+                && memo_fresh
+        });
+        if steady {
+            return SNAP_TLS.with(|t| {
+                t.borrow().cbuf.as_ptr() as *const std::os::raw::c_char
+            });
+        }
+        return snapshot_c_entry_repr_slow();
+    }
+    // Pre-221 shape, verbatim (A/B / rollback arm).
     let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     // TASK-201 zero-copy steady state: the check MUST run before the
     // clear — once c_buf is cleared the recorded identity would still
@@ -758,7 +952,52 @@ pub(crate) fn snapshot_c_entry() -> *const std::os::raw::c_char {
     cache.c_buf.as_ptr() as *const std::os::raw::c_char
 }
 
-/// TASK-201: the zero-copy steady-state check for [`snapshot_c_entry`].
+/// TASK-221: the locked refresh path of the repr C entry. One cache-
+/// Mutex acquisition (the pre-221 discipline), then the SAME assemble
+/// body (write_inner with an Ext target — the thread's own buffer), the
+/// same NUL push, and the fill identity recorded per-thread. The shared
+/// `c_buf` is no longer touched on this path at all.
+#[inline(never)]
+fn snapshot_c_entry_repr_slow() -> *const std::os::raw::c_char {
+    SNAP_TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut cache = SNAP_JSON_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if !tps_memo_resolve(&mut cache.tps_memo) {
+            t.cfill_valid = false;
+            t.ranges_valid = false;
+            t.cbuf.clear();
+            t.cbuf.extend_from_slice(b"{}");
+            t.cbuf.push(0);
+            return t.cbuf.as_ptr() as *const std::os::raw::c_char;
+        }
+        let ml = cache.tps_memo.bytes_len;
+        t.memo_len = ml;
+        t.memo_bytes[..ml].copy_from_slice(&cache.tps_memo.bytes[..ml]);
+        t.memo_ring_keyed = cache.tps_memo.ring_keyed;
+        t.memo_key_head = RING_HEAD.load(Ordering::Relaxed);
+        t.memo_key_bits = cache.tps_memo.k_bits;
+        t.cbuf.clear();
+        snapshot_json_write_inner(&mut cache, SnapshotOut::Ext(&mut t.cbuf));
+        t.cbuf.push(0);
+        // The write body recorded the generation it assembled at (hit
+        // branch: cache.gen was already live; rebuild branch: set under
+        // this lock). A fallback fill leaves cache.valid false — the
+        // guard below then stays off until a coherent refresh.
+        t.cfill_valid = cache.valid;
+        t.cfill_gen = cache.gen;
+        t.ranges_valid = cache.valid;
+        t.ranges_gen = cache.gen;
+        if cache.valid {
+            t.prefix.clear();
+            t.prefix.extend_from_slice(&cache.prefix);
+            t.suffix.clear();
+            t.suffix.extend_from_slice(&cache.suffix);
+        }
+        t.cbuf.as_ptr() as *const std::os::raw::c_char
+    })
+}
+
+/// TASK-201: the zero-copy steady-state check for the pre-221 C entry.
 /// Returns true when `c_buf` ALREADY holds the exact output the entry
 /// would assemble — `prefix + resolved tps memo bytes + suffix + NUL` at
 /// the live generation — so the caller can return the existing pointer
@@ -3109,7 +3348,14 @@ mod tests {
             h.join().expect("mixed-phase writer must not panic");
         }
 
-        // Phase 2: quiet — pure fast path, one frozen pointer for all.
+        // Phase 2: quiet — pure fast path, one frozen pointer per thread.
+        // TASK-221: the repr gives each thread its OWN zero-copy buffer,
+        // so the frozen-pointer guarantee is PER THREAD (each thread's
+        // repeated quiet calls return one identical pointer; different
+        // threads may hold different frozen pointers carrying identical
+        // bytes — the delivered JSON is unchanged, only the buffer
+        // identity differs, and the returned-pointer contract now binds
+        // to the thread that made the call).
         let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
         let mut handles = Vec::new();
         for _ in 0..2u32 {
@@ -3131,11 +3377,18 @@ mod tests {
             all.extend(v);
         }
         assert_eq!(all.len(), 2000, "every quiet-phase call must report its pointer");
-        let distinct: std::collections::HashSet<usize> = all.iter().copied().collect();
-        assert_eq!(
-            distinct.len(),
-            1,
-            "quiet-state fast path must return ONE frozen pointer (zero writes), got {distinct:?} head"
+        for chunk in all.chunks(1000) {
+            let distinct: std::collections::HashSet<usize> = chunk.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "quiet-state fast path must return ONE frozen pointer per thread (zero writes), got {distinct:?}"
+            );
+        }
+        let global: std::collections::HashSet<usize> = all.iter().copied().collect();
+        assert!(
+            global.len() <= 2,
+            "at most one frozen pointer per thread, got {global:?}"
         );
 
         // post-join: race-free read.
