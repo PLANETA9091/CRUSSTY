@@ -52,6 +52,8 @@ TARGETS = [
      "(Lnet/minecraft/network/ProtocolInfo;Lnet/minecraft/network/PacketListener;)V"),
     ("net/minecraft/network/Connection", "channelInactive",
      "(Lio/netty/channel/ChannelHandlerContext;)V"),
+    ("net/minecraft/network/Connection", "getPacketListener",
+     "()Lnet/minecraft/network/PacketListener;"),
 ]
 
 

@@ -15,8 +15,10 @@
 //! patched kernel classes will throw `NoClassDefFoundError` on first
 //! execution of a transformed method.
 
+use crate::platform::network::{self, Direction, Packet};
 use crate::platform::{scheduler, storage};
-use jni::objects::JClassLoader;
+use jni::objects::{JClassLoader, JObject};
+use jni::{EnvUnowned, JValue, jni_sig, jni_str};
 use jni::strings::JNIStr;
 use jni::sys::jclass;
 use jni::{Env, JavaVM, NativeMethod};
@@ -64,12 +66,394 @@ unsafe extern "C" fn n_on_block_ticks(_env: *mut jni::sys::JNIEnv, _class: jclas
     let _ = scheduler::on_block_ticks();
 }
 
-// --- NetHooks / TickHook natives (probes carry no data; no-op for now) -----
+// --- NetHooks / TickHook natives -------------------------------------------
 
 /// # Safety
-/// Called by the JVM as the JNI native of the `NetHooks`/`TickHook` probes;
-/// `env` and `class` are owned by the caller; the body is deliberately empty.
+/// Called by the JVM as the JNI native of the `TickHook` probes; `env` and
+/// `class` are owned by the caller; the body is deliberately empty.
 unsafe extern "C" fn n_noop(_env: *mut jni::sys::JNIEnv, _class: jclass) {}
+
+/// Largest inbound payload copied into a module hook (frames bigger than this
+/// are truncated, so one huge packet cannot stall the Netty loop).
+const MAX_PAYLOAD: i32 = 1 << 20;
+
+/// Hand a forwarded packet carrier to the network brick.
+///
+/// The transform rule injected `aload ...; invokestatic` at method entry, so
+/// the decoder's own locals arrive here as JNI arguments: no frame walk, no
+/// JVMTI capability (which JDK 25 refuses anyway), a few nanoseconds.
+///
+/// Runs on the Netty thread, which owns the objects. Every failure path returns
+/// quietly: a probing bridge must never disturb the kernel's packet path, and
+/// "no packets observed" must not become "server died".
+fn forward_packet(
+    env_ptr: *mut jni::sys::JNIEnv,
+    direction: Direction,
+    payload_ref: jni::sys::jobject,
+    ctx_ref: jni::sys::jobject,
+) {
+    if payload_ref.is_null() {
+        return;
+    }
+    let mut unowned = unsafe { EnvUnowned::from_raw(env_ptr) };
+    let outcome = unowned.with_env(|env| -> jni::errors::Result<(Vec<u8>, u64, u8)> {
+        // SAFETY: both are local references owned by the frame this native was
+        // called from (the injected call passed them straight through), and the
+        // wrapper takes ownership so they are released on drop.
+        let payload = unsafe { JObject::from_raw(env, payload_ref) };
+        let ctx = unsafe { JObject::from_raw(env, ctx_ref) };
+        let bytes = read_bytebuf(env, &payload).unwrap_or_default();
+        // Connection key + protocol state both come from the pipeline's
+        // `packet_handler` — the PacketListener the protocol-swap probe also
+        // receives. Deriving the state here (instead of only relying on the
+        // registry) keeps attribution correct even for a connection the swap
+        // probe has not seen, and needs no obfuscated field access.
+        let (conn_id, state) = if ctx.is_null() {
+            (0, 0)
+        } else {
+            // In 1.20.x the pipeline handler named `packet_handler` IS the
+            // Connection; its listener (which tells us handshake/login/play)
+            // comes from `getPacketListener()`. Keying on the Connection gives
+            // one stable id per session, and it is the same object the
+            // protocol-swap probe receives.
+            match packet_handler(env, &ctx) {
+                Some(conn) => {
+                    let id = identity_hash(env, &conn).unwrap_or(0);
+                    let state = conn_listener_state(env, &conn);
+                    let _ = env.delete_local_ref(conn);
+                    (id, state)
+                }
+                None => (channel_handle(env, &ctx), 0),
+            }
+        };
+        Ok((bytes, conn_id, state))
+    });
+    let (payload, conn_id, state) = match outcome.into_outcome() {
+        jni::Outcome::Ok(v) => v,
+        jni::Outcome::Err(_) | jni::Outcome::Panic(_) => return,
+    };
+    if payload.is_empty() {
+        return;
+    }
+    // First sighting of a connection: register it so later probes (and module
+    // queries) see it, with the state we can already read.
+    if conn_id != 0 && network::state_of(conn_id).is_none() {
+        let _ = network::attach_conn(conn_id, None);
+        let _ = network::set_conn_state(conn_id, state);
+    }
+    let _ = network::run_hooks(Packet {
+        direction,
+        state,
+        payload,
+        conn_id,
+        disconnect_reason: None,
+    });
+}
+
+/// Copy a Netty `ByteBuf`'s readable region out of the heap.
+///
+/// `getBytes(index, byte[], int, int)` is the bulk accessor every ByteBuf
+/// implementation has, and it copies without moving the reader index — the
+/// kernel's decoder must not see a buffer we drained.
+fn read_bytebuf(env: &mut Env<'_>, buf: &JObject<'_>) -> Option<Vec<u8>> {
+    let available = env
+        .call_method(buf, jni_str!("readableBytes"), jni_sig!("()I"), &[])
+        .ok()?
+        .i()
+        .ok()?;
+    if available <= 0 {
+        return Some(Vec::new());
+    }
+    let len = available.min(MAX_PAYLOAD);
+    let reader = env
+        .call_method(buf, jni_str!("readerIndex"), jni_sig!("()I"), &[])
+        .ok()?
+        .i()
+        .ok()?;
+    let array = env.new_byte_array(len as usize).ok()?;
+    let copied = env.call_method(
+        buf,
+        jni_str!("getBytes"),
+        jni_sig!("(I[BII)Lio/netty/buffer/ByteBuf;"),
+        &[
+            JValue::Int(reader),
+            JValue::Object(&array),
+            JValue::Int(0),
+            JValue::Int(len),
+        ],
+    );
+    if copied.is_err() {
+        let _ = env.exception_clear();
+        return None;
+    }
+    let out = env.convert_byte_array(&array).ok();
+    let _ = env.delete_local_ref(array);
+    out
+}
+
+/// Stable per-channel handle: `System.identityHashCode(ctx.channel())`.
+///
+/// A hash rather than a pointer so the value is comparable with what a Java
+/// adapter would compute, and enough to group packets per connection until the
+/// login phase supplies the player UUID.
+fn channel_handle(env: &mut Env<'_>, ctx: &JObject<'_>) -> u64 {
+    let channel = env
+        .call_method(ctx, jni_str!("channel"), jni_sig!("()Lio/netty/channel/Channel;"), &[])
+        .ok()
+        .and_then(|v| v.l().ok());
+    let Some(channel) = channel else {
+        let _ = env.exception_clear();
+        return 0;
+    };
+    let hash = env
+        .call_static_method(
+            jni_str!("java/lang/System"),
+            jni_str!("identityHashCode"),
+            jni_sig!("(Ljava/lang/Object;)I"),
+            &[JValue::Object(&channel)],
+        )
+        .ok()
+        .and_then(|v| v.i().ok())
+        .unwrap_or(0);
+    let _ = env.delete_local_ref(channel);
+    hash as u32 as u64
+}
+
+/// # Safety
+/// JNI native of `NetHooks.onDecode(ctx, buf)`: the decoder's own locals.
+unsafe extern "C" fn n_on_decode(
+    env: *mut jni::sys::JNIEnv,
+    _class: jclass,
+    ctx: jni::sys::jobject,
+    buf: jni::sys::jobject,
+) {
+    forward_packet(env, Direction::Inbound, buf, ctx);
+}
+
+/// # Safety
+/// JNI native of `NetHooks.onEncode(ctx, msg)`.
+///
+/// NOTE: the probe sits at *method entry*, where `PacketEncoder.encode` has not
+/// written the frame into `out` yet, so the caller passes the *message* object:
+/// `readableBytes` on a Packet is not meaningful, the copy fails and nothing is
+/// forwarded. Outbound payload observation needs a tail probe (the engine only
+/// injects at method entry today); the hook stays wired and honest rather than
+/// pretending to see the frame.
+unsafe extern "C" fn n_on_encode(
+    env: *mut jni::sys::JNIEnv,
+    _class: jclass,
+    ctx: jni::sys::jobject,
+    msg: jni::sys::jobject,
+) {
+    forward_packet(env, Direction::Outbound, msg, ctx);
+}
+
+/// # Safety
+/// JNI native of `NetHooks.onIntention(packet)`: the connection state machine
+/// consumes it (not implemented yet — the handshake packet is small and the
+/// state swap is driven by the protocol-swap probe below).
+unsafe extern "C" fn n_on_intention(_env: *mut jni::sys::JNIEnv, _class: jclass, _packet: jni::sys::jobject) {}
+
+/// # Safety
+/// JNI native of `NetHooks.onProtocolSwap(protocol, listener)`.
+unsafe extern "C" fn n_on_protocol_swap(
+    env: *mut jni::sys::JNIEnv,
+    _class: jclass,
+    _connection_or_protocol: jni::sys::jobject,
+    listener: jni::sys::jobject,
+) {
+    if listener.is_null() {
+        return;
+    }
+    let mut unowned = unsafe { EnvUnowned::from_raw(env) };
+    let outcome = unowned.with_env(|env| -> jni::errors::Result<(u64, u8)> {
+        let listener = unsafe { JObject::from_raw(env, listener) };
+        // 1.20.x forwards (Connection, listener); 1.21 forwards (ProtocolInfo,
+        // listener). The distinguishing detail: in 1.20.x the first argument is
+        // the same object as the pipeline's `packet_handler`, so key on it when
+        // it matches, otherwise fall back to the listener.
+        let first = unsafe { JObject::from_raw(env, _connection_or_protocol) };
+        let conn = identity_hash(env, &first)
+            .filter(|id| *id != 0 && Some(*id) == identity_hash(env, &first))
+            .unwrap_or_else(|| identity_hash(env, &listener).unwrap_or(0));
+        let state = listener_state(env, &listener);
+        Ok((conn, state))
+    });
+    let (conn, state) = match outcome.into_outcome() {
+        jni::Outcome::Ok(v) => v,
+        jni::Outcome::Err(_) | jni::Outcome::Panic(_) => return,
+    };
+    if conn == 0 {
+        return;
+    }
+    // Register (idempotent) and stamp the protocol state: every later packet of
+    // this connection is then attributed to the right state by `run_hooks`.
+    let _ = network::attach_conn(conn, None);
+    let _ = network::set_conn_state(conn, state);
+}
+
+fn packet_handler<'local>(env: &mut Env<'local>, ctx: &JObject<'_>) -> Option<JObject<'local>> {
+    let pipeline = env
+        .call_method(ctx, jni_str!("pipeline"), jni_sig!("()Lio/netty/channel/ChannelPipeline;"), &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let name = env.new_string("packet_handler").ok()?;
+    let handler = env
+        .call_method(
+            &pipeline,
+            jni_str!("get"),
+            jni_sig!("(Ljava/lang/String;)Lio/netty/channel/ChannelHandler;"),
+            &[JValue::Object(&name)],
+        )
+        .ok()
+        .and_then(|v| v.l().ok());
+    let _ = env.delete_local_ref(name);
+    let _ = env.delete_local_ref(pipeline);
+    let handler = match handler {
+        Some(h) if !h.is_null() => h,
+        _ => {
+            let _ = env.exception_clear();
+            return None;
+        }
+    };
+    Some(handler)
+}
+
+
+/// Rate-limited packet trace. The env lookup is cached in a `OnceLock` so the
+/// hot path pays one atomic load, never `std::env::var_os`.
+fn trace_packet(env: &mut Env<'_>, listener: &JObject<'_>, state: u8, id: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("CRUSSTY_TRACE_NET").is_some()) {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) < 6 {
+        let name = class_simple_name(env, listener).unwrap_or_else(|| "?".into());
+        eprintln!("[crussty-net] listener={name} state={state} conn={id}");
+    }
+}
+
+/// Protocol state of a `Connection`: read `getPacketListener()` and classify it.
+///
+/// The method name differs per kernel (Mojang on Paper/NeoForge, Searge on
+/// Forge 1.20.1), so the official name and every table alias are tried.
+fn conn_listener_state(env: &mut Env<'_>, conn: &JObject<'_>) -> u8 {
+    const DESC: &str = "()Lnet/minecraft/network/PacketListener;";
+    let mut names: Vec<&str> = vec!["getPacketListener"];
+    for alias in crate::platform::runtime_names::aliases(
+        "net/minecraft/network/Connection",
+        "getPacketListener",
+        DESC,
+    ) {
+        names.push(alias);
+    }
+    // The JNI name argument is a compile-time descriptor, so the candidates are
+    // spelled out here; `runtime_names` stays the source of truth for what the
+    // alias is (guarded by `alias_table_covers_the_connection_listener_getter`).
+    let _ = DESC;
+    for name in names {
+        let call = match name {
+            "getPacketListener" => env.call_method(
+                conn,
+                jni_str!("getPacketListener"),
+                jni_sig!("()Lnet/minecraft/network/PacketListener;"),
+                &[],
+            ),
+            "m_129538_" => env.call_method(
+                conn,
+                jni_str!("m_129538_"),
+                jni_sig!("()Lnet/minecraft/network/PacketListener;"),
+                &[],
+            ),
+            _ => continue,
+        };
+        let Ok(value) = call else {
+            let _ = env.exception_clear();
+            continue;
+        };
+        let Ok(listener) = value.l() else { continue };
+        if listener.is_null() {
+            continue;
+        }
+        let state = listener_state(env, &listener);
+        let _ = env.delete_local_ref(listener);
+        return state;
+    }
+    0
+}
+
+/// Protocol state from the listener's class name: `ServerGamePacketListenerImpl`
+/// -> play, `ServerLoginPacketListenerImpl` -> login, and so on. Class names are
+/// not rewritten by Searge mappings, so this holds on every kernel.
+fn listener_state(env: &mut Env<'_>, listener: &JObject<'_>) -> u8 {
+    let Some(name) = class_simple_name(env, listener) else {
+        return 0;
+    };
+    if name.contains("GamePacketListener") {
+        3
+    } else if name.contains("LoginPacketListener") {
+        2
+    } else if name.contains("StatusPacketListener") {
+        1
+    } else {
+        0
+    }
+}
+
+fn class_simple_name(env: &mut Env<'_>, obj: &JObject<'_>) -> Option<String> {
+    let class = env.get_object_class(obj).ok()?;
+    let dotted = env
+        .call_method(&class, jni_str!("getName"), jni_sig!("()Ljava/lang/String;"), &[])
+        .ok()
+        .and_then(|v| v.l().ok())?;
+    let js = unsafe { jni::objects::JString::from_raw(env, dotted.into_raw()) };
+    let text = js.try_to_string(env).ok().map(|v| v.to_string());
+    let _ = env.delete_local_ref(class);
+    text
+}
+
+/// `System.identityHashCode(obj)` — the adapter's stable per-object handle.
+fn identity_hash(env: &mut Env<'_>, obj: &JObject<'_>) -> Option<u64> {
+    let hash = env
+        .call_static_method(
+            jni_str!("java/lang/System"),
+            jni_str!("identityHashCode"),
+            jni_sig!("(Ljava/lang/Object;)I"),
+            &[JValue::Object(obj)],
+        )
+        .ok()?
+        .i()
+        .ok()?;
+    Some(hash as u32 as u64)
+}
+
+/// # Safety
+/// JNI native of `NetHooks.onChannelInactive(ctx)`.
+unsafe extern "C" fn n_on_channel_inactive(
+    env: *mut jni::sys::JNIEnv,
+    _class: jclass,
+    ctx: jni::sys::jobject,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let mut unowned = unsafe { EnvUnowned::from_raw(env) };
+    let conn = unowned
+        .with_env(|env| -> jni::errors::Result<u64> {
+            let ctx = unsafe { JObject::from_raw(env, ctx) };
+            Ok(channel_handle(env, &ctx))
+        })
+        .into_outcome();
+    if let jni::Outcome::Ok(conn) = conn {
+        if conn != 0 {
+            let _ = network::detach_conn(conn);
+        }
+    }
+}
 
 /// Define one hook class into the system class loader and register its
 /// natives. `env` must be attached and pinned for the whole call.
@@ -182,11 +566,31 @@ fn install_once() -> Result<(), String> {
                     jni::jni_str!("dev/crussty/hooks/NetHooks"),
                     NET_BYTES,
                     &[
-                        (jni::jni_str!("onDecode"), jni::jni_str!("()V"), n_noop as *const c_void),
-                        (jni::jni_str!("onEncode"), jni::jni_str!("()V"), n_noop as *const c_void),
-                        (jni::jni_str!("onIntention"), jni::jni_str!("()V"), n_noop as *const c_void),
-                        (jni::jni_str!("onProtocolSwap"), jni::jni_str!("()V"), n_noop as *const c_void),
-                        (jni::jni_str!("onChannelInactive"), jni::jni_str!("()V"), n_noop as *const c_void),
+                        (
+                            jni::jni_str!("onDecode"),
+                            jni::jni_str!("(Ljava/lang/Object;Ljava/lang/Object;)V"),
+                            n_on_decode as *const c_void,
+                        ),
+                        (
+                            jni::jni_str!("onEncode"),
+                            jni::jni_str!("(Ljava/lang/Object;Ljava/lang/Object;)V"),
+                            n_on_encode as *const c_void,
+                        ),
+                        (
+                            jni::jni_str!("onIntention"),
+                            jni::jni_str!("(Ljava/lang/Object;)V"),
+                            n_on_intention as *const c_void,
+                        ),
+                        (
+                            jni::jni_str!("onProtocolSwap"),
+                            jni::jni_str!("(Ljava/lang/Object;Ljava/lang/Object;)V"),
+                            n_on_protocol_swap as *const c_void,
+                        ),
+                        (
+                            jni::jni_str!("onChannelInactive"),
+                            jni::jni_str!("(Ljava/lang/Object;)V"),
+                            n_on_channel_inactive as *const c_void,
+                        ),
                     ],
                 )?;
                 define_and_register(

@@ -31,6 +31,7 @@ pub const SRG_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("net/minecraft/network/PacketEncoder", "encode", "(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;Lio/netty/buffer/ByteBuf;)V", "encode"),
     ("net/minecraft/server/network/ServerHandshakePacketListenerImpl", "handleIntention", "(Lnet/minecraft/network/protocol/handshake/ClientIntentionPacket;)V", "m_7322_"),
     ("net/minecraft/network/Connection", "channelInactive", "(Lio/netty/channel/ChannelHandlerContext;)V", "channelInactive"),
+    ("net/minecraft/network/Connection", "getPacketListener", "()Lnet/minecraft/network/PacketListener;", "m_129538_"),
 ];
 
 /// Alias names for `class.method(descriptor)`, empty when the runtime name is
@@ -85,4 +86,20 @@ mod tests {
         )
         .is_empty());
     }
+
+    #[test]
+    fn alias_table_covers_the_connection_listener_getter() {
+        // The network bridge resolves this getter by trying the official name
+        // and the table alias in turn; if the table ever stops matching, the
+        // protocol state silently degrades to "handshake" for every packet.
+        assert_eq!(
+            aliases(
+                "net/minecraft/network/Connection",
+                "getPacketListener",
+                "()Lnet/minecraft/network/PacketListener;"
+            ),
+            vec!["m_129538_"]
+        );
+    }
+
 }

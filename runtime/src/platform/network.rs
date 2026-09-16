@@ -685,7 +685,8 @@ pub fn install_default_rules() {
             DESCR_DECODE,
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onDecode"),
-        ));
+        )
+        .forwarding(&[1, 2]));
         // Outbound codec: raw frame bytes leave here.
         engine.register(Rule::platform(
             "net/minecraft/network/PacketEncoder",
@@ -693,7 +694,8 @@ pub fn install_default_rules() {
             DESCR_ENCODE,
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onEncode"),
-        ));
+        )
+        .forwarding(&[1, 2]));
         // Handshake handler: intention packet picks status/login.
         engine.register(Rule::platform(
             "net/minecraft/server/network/ServerHandshakePacketListenerImpl",
@@ -701,15 +703,29 @@ pub fn install_default_rules() {
             DESCR_INTENTION,
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onIntention"),
-        ));
+        )
+        .forwarding(&[1]));
         // Every later state swap (login -> configuration -> play).
+        //   * 1.21+: setupInboundProtocol(ProtocolInfo, PacketListener)
+        //   * 1.20.x: setListener(PacketListener) — same event, other name.
         engine.register(Rule::platform(
             "net/minecraft/network/Connection",
             "setupInboundProtocol",
             DESCR_PROTOCOL,
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onProtocolSwap"),
-        ));
+        )
+        .forwarding(&[1, 2]));
+        engine.register(
+            Rule::platform(
+                "net/minecraft/network/Connection",
+                "setListener",
+                "(Lnet/minecraft/network/PacketListener;)V",
+                Injection::MethodEntry,
+                format!("{HOOK_CLASS}.onProtocolSwap"),
+            )
+            .forwarding(&[0, 1]),
+        );
         // Conn teardown: forget the registry entry.
         engine.register(Rule::platform(
             "net/minecraft/network/Connection",
@@ -717,7 +733,8 @@ pub fn install_default_rules() {
             DESCR_CHANNEL_CTX,
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onChannelInactive"),
-        ));
+        )
+        .forwarding(&[1]));
     });
 }
 
@@ -937,7 +954,9 @@ mod tests {
         };
         install_default_rules();
         install_default_rules();
-        assert_eq!(nethooks(), 5);
+        // onDecode, onEncode, onIntention, onProtocolSwap (1.21 + 1.20 spelling),
+        // onChannelInactive
+        assert_eq!(nethooks(), 6);
         let expected = [
             "onDecode",
             "onEncode",

@@ -203,7 +203,7 @@ fn libs() -> &'static Mutex<Vec<Library>> {
     LIBS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn jvmti_env() -> Option<Jvmti> {
+pub(crate) fn jvmti_env() -> Option<Jvmti> {
     JVMTI_ENV
         .get()
         .map(|p| unsafe { Jvmti::from_raw(*p as *mut jvmti::jvmtiEnv) })
