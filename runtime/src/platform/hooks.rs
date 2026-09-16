@@ -141,13 +141,59 @@ fn forward_packet(
         let _ = network::attach_conn(conn_id, None);
         let _ = network::set_conn_state(conn_id, state);
     }
-    let _ = network::run_hooks(Packet {
+    let len_bytes = payload.len();
+    let verdict = network::run_hooks(Packet {
         direction,
         state,
         payload,
         conn_id,
         disconnect_reason: None,
     });
+    // The verdict is not advisory: `Drop` must actually cancel the packet, or a
+    // flag would only be a log line while the cheat still took effect. The probe
+    // runs at the *entry* of `PacketDecoder.decode`, so draining the frame's
+    // ByteBuf (reader index to the writer index) leaves Netty nothing to decode:
+    // the packet never reaches the server, so no other player ever sees it.
+    // The module then re-aligns the client with a set-back.
+    if matches!(verdict, network::Verdict::Drop) {
+        if std::env::var_os("CRUSSTY_TRACE_DROP").is_some() {
+            eprintln!("[crussty-net] DROP a packet of {len_bytes} bytes for conn {conn_id} (cancelled before the kernel saw it)");
+        }
+        // Re-enter the VM: the hooks ran inside their own env scope.
+        let mut unowned = unsafe { EnvUnowned::from_raw(env_ptr) };
+        let _ = unowned.with_env(|env| -> jni::errors::Result<()> {
+            drop_buffer(env, payload_ref);
+            Ok(())
+        });
+    }
+}
+
+
+/// Drain a Netty `ByteBuf` so `ByteToMessageDecoder` produces no packet.
+///
+/// `readerIndex(writerIndex())` is the cheapest way to say "nothing to read
+/// here": the decoder sees an empty frame, the packet id is never dispatched,
+/// and the server (and every other player) never learns about the action.
+fn drop_buffer(env: &mut Env<'_>, buf: jni::sys::jobject) {
+    if buf.is_null() {
+        return;
+    }
+    let obj = unsafe { JObject::from_raw(env, buf) };
+    let writer = env
+        .call_method(&obj, jni_str!("writerIndex"), jni_sig!("()I"), &[])
+        .ok()
+        .and_then(|v| v.i().ok());
+    let Some(writer) = writer else {
+        let _ = env.exception_clear();
+        return;
+    };
+    let _ = env.call_method(
+        &obj,
+        jni_str!("readerIndex"),
+        jni_sig!("(I)Lio/netty/buffer/ByteBuf;"),
+        &[JValue::Int(writer)],
+    );
+    let _ = env.exception_clear();
 }
 
 /// Copy a Netty `ByteBuf`'s readable region out of the heap.
