@@ -59,8 +59,9 @@
 //! - Instrumentation is idempotent per helper: re-running `apply` (e.g.
 //!   JVMTI retransformation) does not double-instrument.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -383,7 +384,7 @@ impl TransformEngine {
         // Registration order (identical to the legacy linear scan).
         matched.sort_unstable_by_key(|(i, _)| *i);
         let class = parse_class(bytes).map_err(|e| format!("transform {class_name}: {e}"))?;
-        let mut plan = Plan::default();
+        let mut plan = Plan::new();
         for (_, rule) in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
@@ -399,9 +400,14 @@ impl TransformEngine {
         if plan.is_empty() {
             return Ok(None);
         }
-        let mut edits = plan.edits;
+        // mem::take (not a move-out) keeps the plan whole for the TLS
+        // shell put-back in `Drop`.
+        let mut edits = std::mem::take(&mut plan.edits);
         if plan.cp_added > 0 {
-            edits.push(Edit::Insert(class.cp_end, plan.cp_bytes.into_boxed_slice()));
+            edits.push(Edit::Insert(
+                class.cp_end,
+                std::mem::take(&mut plan.cp_bytes).into_boxed_slice(),
+            ));
             edits.push(Edit::SetU2(8, class.cp.len() as u16 + plan.cp_added));
         }
         // Set edits rewrite in place, so only Insert edits change payload
@@ -893,38 +899,146 @@ impl Edit {
     }
 }
 
-/// Accumulates everything needed to rebuild a transformed class.
+/// Crate-internal FNV-1a hasher (TASK-219): deterministic, allocation-free,
+/// and much cheaper than SipHash on the plan's tiny keys (u16 pairs, file
+/// offsets). Determinism also keeps any map iteration order stable across
+/// runs, which the old `RandomState` never guaranteed.
+#[derive(Clone)]
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        FnvHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+/// Build hasher for the plan's lifetime-free maps.
+type FnvBuild = BuildHasherDefault<FnvHasher>;
+
+/// Per-thread recycled map shells (TASK-219): the five lifetime-free Plan
+/// maps are reused across class loads — swapped OUT into the plan on build
+/// and swapped back (full capacity intact) on drop — instead of being
+/// re-allocated seven maps deep per class load. The shells never carry
+/// borrows, so they can rest in TLS between loads.
 #[derive(Default)]
-struct Plan {
+struct MapShells {
+    cp_class: HashMap<u16, u16, FnvBuild>,
+    cp_nat: HashMap<(u16, u16), u16, FnvBuild>,
+    cp_mref: HashMap<(u16, u16), u16, FnvBuild>,
+    sums: HashMap<usize, i64, FnvBuild>,
+    smap: HashMap<usize, bool, FnvBuild>,
+}
+
+thread_local! {
+    static MAP_SHELLS: RefCell<MapShells> = RefCell::new(MapShells::default());
+}
+
+/// Accumulates everything needed to rebuild a transformed class.
+///
+/// TASK-219 repr: the string-keyed dedup maps hold **borrowed** keys
+/// (`&'p str`, drawn from the matched rules, the class bytes and the
+/// caller's intern arena) — zero string allocations per transform — and the
+/// five lifetime-free maps are recycled through per-thread shells. The
+/// tiny str maps are linear-scan vectors: a transform appends only a
+/// handful of constants, where memcmp beats hashing.
+struct Plan<'p> {
     edits: Vec<Edit>,
     /// Serialized constant-pool entries appended after the original pool.
     cp_bytes: Vec<u8>,
     /// Number of entries appended (long/double would count 2; ours never do).
     cp_added: u16,
-    cp_utf8: HashMap<String, u16>,
-    cp_class: HashMap<u16, u16>,
-    cp_nat: HashMap<(u16, u16), u16>,
-    cp_mref: HashMap<(u16, u16), u16>,
-    helpers: HashMap<String, u16>,
+    /// Utf8 entries appended this plan: borrowed key -> cp index.
+    cp_utf8: Vec<(&'p str, u16)>,
+    cp_class: HashMap<u16, u16, FnvBuild>,
+    cp_nat: HashMap<(u16, u16), u16, FnvBuild>,
+    cp_mref: HashMap<(u16, u16), u16, FnvBuild>,
+    /// Helper -> resolved methodref (borrowed `rule.helper` keys).
+    helpers: Vec<(&'p str, u16)>,
     /// Cumulative signed fixup delta per file offset, so several insertions
     /// that shift the same field sum up instead of overwriting (the last
     /// Set edit written carries the full cumulative value).
-    sums: HashMap<usize, i64>,
+    sums: HashMap<usize, i64, FnvBuild>,
     /// StackMapTable frames already bumped, keyed by the file offset of
     /// their frame_type byte; true once the frame has been rewritten in
     /// extended (u2 delta) form so the conversion is emitted only once.
-    smap: HashMap<usize, bool>,
+    smap: HashMap<usize, bool, FnvBuild>,
     /// File offsets of Insert edits that merely re-emit bytes consumed by a
     /// Set edit (StackMapTable u2 re-bumps); excluded from attribute-length
     /// deltas since they are net-zero.
     restores: Vec<usize>,
 }
 
-impl Plan {
+impl<'p> Plan<'p> {
+    /// Build a plan, recycling the per-thread map shells (swapped out; the
+    /// TLS slot keeps fresh empties so a re-entrant build stays correct).
+    fn new() -> Self {
+        MAP_SHELLS.with(|c| {
+            let mut b = c.borrow_mut();
+            Plan {
+                edits: Vec::new(),
+                cp_bytes: Vec::new(),
+                cp_added: 0,
+                cp_utf8: Vec::with_capacity(8),
+                cp_class: std::mem::take(&mut b.cp_class),
+                cp_nat: std::mem::take(&mut b.cp_nat),
+                cp_mref: std::mem::take(&mut b.cp_mref),
+                helpers: Vec::with_capacity(4),
+                sums: std::mem::take(&mut b.sums),
+                smap: std::mem::take(&mut b.smap),
+                restores: Vec::new(),
+            }
+        })
+    }
+
     fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }
 
+    /// Linear-scan lookup in the borrowed-utf8 map (a handful of entries;
+    /// memcmp beats hashing at this size).
+    fn utf8_get(&self, s: &str) -> Option<u16> {
+        self.cp_utf8.iter().find(|(k, _)| *k == s).map(|(_, v)| *v)
+    }
+
+    /// Linear-scan lookup in the borrowed-helper map.
+    fn helper_get(&self, s: &str) -> Option<u16> {
+        self.helpers.iter().find(|(k, _)| *k == s).map(|(_, v)| *v)
+    }
+}
+
+impl Drop for Plan<'_> {
+    fn drop(&mut self) {
+        // Return the lifetime-free maps to the thread's shell store with
+        // their capacity intact (swapped against fresh empties).
+        MAP_SHELLS.with(|c| {
+            let mut b = c.borrow_mut();
+            b.cp_class = std::mem::take(&mut self.cp_class);
+            b.cp_nat = std::mem::take(&mut self.cp_nat);
+            b.cp_mref = std::mem::take(&mut self.cp_mref);
+            b.sums = std::mem::take(&mut self.sums);
+            b.smap = std::mem::take(&mut self.smap);
+        });
+    }
+}
+
+impl<'p> Plan<'p> {
     /// Set a u2 field at `off` to `original + delta`, accumulating `delta`
     /// per offset so repeated shifts compose.
     fn bump_u2(&mut self, off: usize, original: u16, delta: i64) {
@@ -954,23 +1068,69 @@ fn cp_index(class: &ClassFile<'_>, plan: &Plan) -> Result<u16, String> {
     Ok(idx as u16)
 }
 
-fn cp_utf8(class: &ClassFile<'_>, plan: &mut Plan, s: &str) -> Result<u16, String> {
+fn cp_utf8<'p>(class: &ClassFile<'_>, plan: &mut Plan<'p>, s: &'p str) -> Result<u16, String> {
     if let Some(i) = class.cp.iter().enumerate().skip(1).find_map(|(i, e)| {
         (e.tag == TAG_UTF8 && e.payload == s.as_bytes()).then_some(i as u16)
     }) {
         return Ok(i);
     }
-    if let Some(&i) = plan.cp_utf8.get(s) {
+    if let Some(i) = plan.utf8_get(s) {
         return Ok(i);
     }
     let idx = cp_index(class, plan)?;
     if s.len() > usize::from(u16::MAX) {
         return Err("Utf8 constant too long".to_string());
     }
-    plan.cp_utf8.insert(s.to_string(), idx);
+    plan.cp_utf8.push((s, idx));
     plan.cp_bytes.push(TAG_UTF8);
     plan.cp_bytes.extend_from_slice(&(s.len() as u16).to_be_bytes());
     plan.cp_bytes.extend_from_slice(s.as_bytes());
+    plan.cp_added += 1;
+    Ok(idx)
+}
+
+/// Byte-equal comparison of a constant-pool Utf8 payload against `dotted`
+/// with every `.` read as `/` (TASK-219: the slash form of a helper owner,
+/// materialized without allocating).
+#[inline]
+fn eq_slash_form(payload: &[u8], dotted: &str) -> bool {
+    payload.len() == dotted.len()
+        && payload
+            .iter()
+            .zip(dotted.bytes())
+            .all(|(a, b)| *a == if b == b'.' { b'/' } else { b })
+}
+
+/// `cp_utf8` variant for helper owners: the plan key is the **dotted**
+/// borrowed form (`'p`), the pool scan compares slash-wise via
+/// [`eq_slash_form`], and the slash bytes are materialized only when an
+/// entry is actually appended. The dotted/slash rewrite is a per-byte
+/// bijection, so dedup by the dotted key is equivalent to dedup by the
+/// slash form — and it cannot alias the dot-free generic keys (`name`,
+/// `()V`) with different bytes. Net: zero allocations unless an entry is
+/// really appended (the owned-key repr paid one even on pool hits).
+fn cp_utf8_owner<'p>(
+    class: &ClassFile<'_>,
+    plan: &mut Plan<'p>,
+    dotted: &'p str,
+) -> Result<u16, String> {
+    if let Some(i) = class.cp.iter().enumerate().skip(1).find_map(|(i, e)| {
+        (e.tag == TAG_UTF8 && eq_slash_form(e.payload, dotted)).then_some(i as u16)
+    }) {
+        return Ok(i);
+    }
+    if let Some(i) = plan.utf8_get(dotted) {
+        return Ok(i);
+    }
+    let idx = cp_index(class, plan)?;
+    if dotted.len() > usize::from(u16::MAX) {
+        return Err("Utf8 constant too long".to_string());
+    }
+    plan.cp_utf8.push((dotted, idx));
+    let slash = dotted.replace('.', "/");
+    plan.cp_bytes.push(TAG_UTF8);
+    plan.cp_bytes.extend_from_slice(&(dotted.len() as u16).to_be_bytes());
+    plan.cp_bytes.extend_from_slice(slash.as_bytes());
     plan.cp_added += 1;
     Ok(idx)
 }
@@ -1046,8 +1206,12 @@ fn cp_methodref(class: &ClassFile<'_>, plan: &mut Plan, class_idx: u16, nat_idx:
 /// Resolve (appending if needed) the `invokestatic` target for `helper`,
 /// returning its constant-pool index. The helper must be a static method
 /// with descriptor `()V`.
-fn helper_methodref(class: &ClassFile<'_>, plan: &mut Plan, helper: &str) -> Result<u16, String> {
-    if let Some(&i) = plan.helpers.get(helper) {
+fn helper_methodref<'p>(
+    class: &ClassFile<'_>,
+    plan: &mut Plan<'p>,
+    helper: &'p str,
+) -> Result<u16, String> {
+    if let Some(i) = plan.helper_get(helper) {
         return Ok(i);
     }
     let (owner, name) = helper
@@ -1056,14 +1220,17 @@ fn helper_methodref(class: &ClassFile<'_>, plan: &mut Plan, helper: &str) -> Res
     if owner.is_empty() || name.is_empty() {
         return Err(format!("helper must be 'Owner.Class.method', got '{helper}'"));
     }
-    let owner = owner.replace('.', "/");
-    let c = cp_utf8(class, plan, &owner)?;
+    // TASK-219 repr: the owner is deduped under its borrowed DOTTED form
+    // (bijective with the slash form — see `cp_utf8_owner`); no intern
+    // arena, no owned keys, and the slash bytes exist only inside the
+    // append path.
+    let c = cp_utf8_owner(class, plan, owner)?;
     let n = cp_utf8(class, plan, name)?;
     let d = cp_utf8(class, plan, "()V")?;
     let cc = cp_class(class, plan, c)?;
     let nt = cp_name_and_type(class, plan, n, d)?;
     let mr = cp_methodref(class, plan, cc, nt)?;
-    plan.helpers.insert(helper.to_string(), mr);
+    plan.helpers.push((helper, mr));
     Ok(mr)
 }
 
@@ -1079,7 +1246,12 @@ fn code_at_invokes_helper(class: &ClassFile<'_>, code: &CodeAttr, pc: usize, mr:
         && class.data[code.code_off + pc + 1] as u16 * 256 + class.data[code.code_off + pc + 2] as u16 == mr
 }
 
-fn plan_method_entry(class: &ClassFile<'_>, m: &Member, helper: &str, plan: &mut Plan) -> Result<(), String> {
+fn plan_method_entry<'p>(
+    class: &ClassFile<'_>,
+    m: &Member,
+    helper: &'p str,
+    plan: &mut Plan<'p>,
+) -> Result<(), String> {
     let code = match &m.code {
         Some(c) => c,
         // abstract/native methods have no Code attribute — nothing to inject
@@ -1094,12 +1266,12 @@ fn plan_method_entry(class: &ClassFile<'_>, m: &Member, helper: &str, plan: &mut
     plan_code_fixups(class, code, 0, 3, plan)
 }
 
-fn plan_before_call(
+fn plan_before_call<'p>(
     class: &ClassFile<'_>,
     m: &Member,
     target: &str,
-    helper: &str,
-    plan: &mut Plan,
+    helper: &'p str,
+    plan: &mut Plan<'p>,
 ) -> Result<(), String> {
     let code = match &m.code {
         Some(c) => c,
@@ -2595,7 +2767,7 @@ mod bench_hotpath {
         matched: &[(usize, &Arc<Rule>)],
     ) -> Result<Option<Vec<u8>>, String> {
         let class = parse_class(bytes).map_err(|e| format!("transform {name}: {e}"))?;
-        let mut plan = Plan::default();
+        let mut plan = Plan::new();
         for (_, rule) in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
@@ -2611,9 +2783,12 @@ mod bench_hotpath {
         if plan.is_empty() {
             return Ok(None);
         }
-        let mut edits = plan.edits;
+        let mut edits = std::mem::take(&mut plan.edits);
         if plan.cp_added > 0 {
-            edits.push(Edit::Insert(class.cp_end, plan.cp_bytes.into_boxed_slice()));
+            edits.push(Edit::Insert(
+                class.cp_end,
+                std::mem::take(&mut plan.cp_bytes).into_boxed_slice(),
+            ));
             edits.push(Edit::SetU2(8, class.cp.len() as u16 + plan.cp_added));
         }
         let mut attr_len_edits: Vec<Edit> = Vec::new();
@@ -2780,6 +2955,79 @@ mod bench_hotpath {
     ///   - `fixup old/new x200p` over a workload-scale fixture (200 payloads
     ///     x 41 inserts, one restored offset): the crossover record — where
     ///     the refuted shape starts winning, banked for any future revival.
+    /// TASK-219 A/B parity gate: the borrowed-key plan repr must reproduce
+    /// the ce8bd0e owned-key repr's output bytes EXACTLY. The fingerprints
+    /// below were captured by this same probe (print form) on unmodified
+    /// ce8bd0e before the repr change; fixtures exercise every changed path
+    /// (cp_utf8 insert+dedup, dotted-owner slash scan, helpers dedup,
+    /// cp_class/cp_nat/cp_mref insert+dedup, TLS shell reuse across applies,
+    /// idempotent retransform, no-match).
+    #[test]
+    #[ignore]
+    fn parity_ab_bytes() {
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+
+        // (1) entry inject, single method (real bench fixture)
+        let out1 = e
+            .apply("net/minecraft/server/MinecraftServer", &bytes)
+            .expect("apply ok")
+            .expect("matched");
+
+        // (2) two-method inject, shared helper: cp_utf8/helpers dedup +
+        // dotted-owner map keys + cp_class/cp_nat/cp_mref chains
+        let (mut c, t, o) = tests::basic_cb();
+        let code_n = c.utf8("Code");
+        let n_run = c.utf8("run");
+        let d_run = c.utf8("()V");
+        let n_hb = c.utf8("mainThreadHeartbeat");
+        let m1 = tests::method_b(n_run, d_run, Some(tests::code_b(code_n, vec![0xB1])));
+        let m2 = tests::method_b(n_hb, d_run, Some(tests::code_b(code_n, vec![0xB1, 0x00])));
+        let bytes2 = c.fin(t, o, vec![m1, m2]);
+        let e2 = TransformEngine::new();
+        e2.register(Rule::new(
+            "org/bukkit/craftbukkit/scheduler/CraftScheduler",
+            "mainThreadHeartbeat",
+            "*",
+            Injection::MethodEntry,
+            "dev.crussty.hooks.SchedulerHooks.onTick",
+        ));
+        e2.register(Rule::new(
+            "org/bukkit/craftbukkit/scheduler/CraftScheduler",
+            "run",
+            "*",
+            Injection::MethodEntry,
+            "dev.crussty.hooks.SchedulerHooks.onTick",
+        ));
+        let out2 = e2
+            .apply("org/bukkit/craftbukkit/scheduler/CraftScheduler", &bytes2)
+            .expect("apply ok");
+
+        // ce8bd0e fingerprints (owned-key repr, min-fixture identical inputs)
+        assert_eq!(
+            (out1.bytes.len(), super::super::rcu::fnv1a(&out1.bytes)),
+            (244usize, 0x2aa1_5bc1_1867_feb5),
+            "P1 entry-inject bytes drifted from the ce8bd0e baseline"
+        );
+        let p2 = out2
+            .as_ref()
+            .map(|x| (x.bytes.len(), super::super::rcu::fnv1a(&x.bytes)));
+        assert_eq!(
+            p2,
+            Some((215usize, 9698_9726_2752_1195_171u64)),
+            "P2 dedup bytes drifted"
+        );
+        // (3) idempotent retransform over the already-instrumented bytes:
+        // pool-hit dedup paths + code_at_invokes_helper gate
+        let third = e
+            .apply("net/minecraft/server/MinecraftServer", &out1.bytes)
+            .expect("apply ok");
+        assert!(third.is_none(), "retransform must be a no-op");
+        // (4) no-match stays free
+        let fourth = e.apply("some/unrelated/Type", &bytes).expect("apply ok");
+        assert!(fourth.is_none(), "no-match must stay free");
+    }
+
     #[test]
     #[ignore]
     fn bench_transform_attrfixup_iso() {
@@ -2810,7 +3058,7 @@ mod bench_hotpath {
         assert!(!matched.is_empty(), "engine must match the bench name");
 
         let class = parse_class(&bytes).expect("parse ok");
-        let mut plan = Plan::default();
+        let mut plan = Plan::new();
         for (_, rule) in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
@@ -2824,9 +3072,12 @@ mod bench_hotpath {
             }
         }
         assert!(!plan.is_empty(), "fixture must produce edits");
-        let mut edits = plan.edits;
+        let mut edits = std::mem::take(&mut plan.edits);
         if plan.cp_added > 0 {
-            edits.push(Edit::Insert(class.cp_end, plan.cp_bytes.into_boxed_slice()));
+            edits.push(Edit::Insert(
+                class.cp_end,
+                std::mem::take(&mut plan.cp_bytes).into_boxed_slice(),
+            ));
             edits.push(Edit::SetU2(8, class.cp.len() as u16 + plan.cp_added));
         }
         let payloads: Vec<(usize, usize)> = class
