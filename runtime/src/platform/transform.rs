@@ -991,17 +991,31 @@ impl<'p> Plan<'p> {
     fn new() -> Self {
         MAP_SHELLS.with(|c| {
             let mut b = c.borrow_mut();
+            // Clear-on-take: a returned shell still carries the previous
+            // plan's entries (stale sums double-bump fixups, stale cp maps
+            // serve methodrefs for entries that were never appended to THIS
+            // plan). `clear()` keeps the allocated capacity.
+            let mut cp_class = std::mem::take(&mut b.cp_class);
+            cp_class.clear();
+            let mut cp_nat = std::mem::take(&mut b.cp_nat);
+            cp_nat.clear();
+            let mut cp_mref = std::mem::take(&mut b.cp_mref);
+            cp_mref.clear();
+            let mut sums = std::mem::take(&mut b.sums);
+            sums.clear();
+            let mut smap = std::mem::take(&mut b.smap);
+            smap.clear();
             Plan {
                 edits: Vec::new(),
                 cp_bytes: Vec::new(),
                 cp_added: 0,
                 cp_utf8: Vec::with_capacity(8),
-                cp_class: std::mem::take(&mut b.cp_class),
-                cp_nat: std::mem::take(&mut b.cp_nat),
-                cp_mref: std::mem::take(&mut b.cp_mref),
+                cp_class,
+                cp_nat,
+                cp_mref,
                 helpers: Vec::with_capacity(4),
-                sums: std::mem::take(&mut b.sums),
-                smap: std::mem::take(&mut b.smap),
+                sums,
+                smap,
                 restores: Vec::new(),
             }
         })
@@ -3026,6 +3040,17 @@ mod bench_hotpath {
         // (4) no-match stays free
         let fourth = e.apply("some/unrelated/Type", &bytes).expect("apply ok");
         assert!(fourth.is_none(), "no-match must stay free");
+        // (5) shell-recycle regression (caught by the stages replica gate):
+        // re-apply on the ORIGINAL bytes reuses the recycled TLS shells —
+        // stale sums would double-bump the code_len fixup (+6 instead of
+        // +3) and stale cp_class/cp_nat/cp_mref would serve a methodref
+        // whose constant-pool entries were never appended to THIS plan.
+        // The output must be byte-identical to the first transform.
+        let out4 = e
+            .apply("net/minecraft/server/MinecraftServer", &bytes)
+            .expect("apply ok")
+            .expect("matched");
+        assert_eq!(out4.bytes, out1.bytes, "shell recycle must be transparent");
     }
 
     #[test]
