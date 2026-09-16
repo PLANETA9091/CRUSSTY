@@ -92,6 +92,10 @@ pub struct Rule {
     pub descriptor_fallback: bool,
     /// Optional method descriptor filter ("*" = any), e.g. "()V"
     pub descriptor: String,
+    /// Local-variable slots forwarded as arguments to the helper, in order.
+    /// Empty for a plain `()V` probe; non-empty turns the injection into
+    /// `aload <slot>...; invokestatic helper(Ljava/lang/Object;...)V`.
+    pub forward_locals: Vec<u8>,
     /// What to inject
     pub injection: Injection,
     /// Fully-qualified static helper, e.g. "dev.crussty.hooks.TickHook.onEntry"
@@ -116,6 +120,7 @@ impl Rule {
             method,
             method_aliases,
             descriptor_fallback: false,
+            forward_locals: Vec::new(),
             descriptor,
             injection,
             helper,
@@ -143,6 +148,18 @@ impl Rule {
         let mut rule = Self::new(class_pattern, method, descriptor, injection, helper);
         rule.descriptor_fallback = true;
         rule
+    }
+
+    /// Forward the given local-variable slots to the helper as `Object`
+    /// arguments (see [`Rule::forward_locals`]).
+    ///
+    /// The slots are the method's own locals: for an instance method
+    /// `foo(Ctx c, ByteBuf b, List out)` slot 0 is `this`, 1 the context and 2
+    /// the buffer — exactly the shape `PacketDecoder.decode` /
+    /// `PacketEncoder.encode` have.
+    pub fn forwarding(mut self, locals: &[u8]) -> Self {
+        self.forward_locals = locals.to_vec();
+        self
     }
 }
 
@@ -584,7 +601,7 @@ fn rule_matches_method(rule: &Rule, m: &Member) -> bool {
 /// Inject one rule's helper into one matched method.
 fn inject_into(class: &ClassFile<'_>, rule: &Rule, m: &Member, plan: &mut Plan) -> Result<(), String> {
     match &rule.injection {
-        Injection::MethodEntry => plan_method_entry(class, m, &rule.helper, plan),
+        Injection::MethodEntry => plan_method_entry(class, rule, m, plan),
         Injection::BeforeCall(target) => plan_before_call(class, m, target, &rule.helper, plan),
     }
 }
@@ -1201,8 +1218,36 @@ fn cp_methodref(class: &ClassFile<'_>, plan: &mut Plan, class_idx: u16, nat_idx:
 /// Resolve (appending if needed) the `invokestatic` target for `helper`,
 /// returning its constant-pool index. The helper must be a static method
 /// with descriptor `()V`.
+/// Descriptor for a helper that receives `n` forwarded `Object` arguments.
+fn forwarded_descriptor(n: usize) -> String {
+    let mut d = String::with_capacity(3 + n * 18);
+    d.push('(');
+    for _ in 0..n {
+        d.push_str("Ljava/lang/Object;");
+    }
+    d.push_str(")V");
+    d
+}
+
 fn helper_methodref(class: &ClassFile<'_>, plan: &mut Plan, helper: &str) -> Result<u16, String> {
-    if let Some(&i) = plan.helpers.get(helper) {
+    helper_methodref_desc(class, plan, helper, "()V")
+}
+
+/// [`helper_methodref`] with an explicit descriptor (argument forwarding). The
+/// cache key includes the descriptor: the same helper name may be injected both
+/// as a `()V` probe and as an argument-carrying call.
+fn helper_methodref_desc(
+    class: &ClassFile<'_>,
+    plan: &mut Plan,
+    helper: &str,
+    desc: &str,
+) -> Result<u16, String> {
+    let key = if desc == "()V" {
+        helper.to_string()
+    } else {
+        format!("{helper}{desc}")
+    };
+    if let Some(&i) = plan.helpers.get(&key) {
         return Ok(i);
     }
     let (owner, name) = helper
@@ -1214,11 +1259,11 @@ fn helper_methodref(class: &ClassFile<'_>, plan: &mut Plan, helper: &str) -> Res
     let owner = owner.replace('.', "/");
     let c = cp_utf8(class, plan, &owner)?;
     let n = cp_utf8(class, plan, name)?;
-    let d = cp_utf8(class, plan, "()V")?;
+    let d = cp_utf8(class, plan, desc)?;
     let cc = cp_class(class, plan, c)?;
     let nt = cp_name_and_type(class, plan, n, d)?;
     let mr = cp_methodref(class, plan, cc, nt)?;
-    plan.helpers.insert(helper.to_string(), mr);
+    plan.helpers.insert(key, mr);
     Ok(mr)
 }
 
@@ -1274,17 +1319,48 @@ fn align_payload_for_switches(
     Ok(payload)
 }
 
-fn plan_method_entry(class: &ClassFile<'_>, m: &Member, helper: &str, plan: &mut Plan) -> Result<(), String> {
+fn plan_method_entry(
+    class: &ClassFile<'_>,
+    rule: &Rule,
+    m: &Member,
+    plan: &mut Plan,
+) -> Result<(), String> {
+    let helper = rule.helper.as_str();
     let code = match &m.code {
         Some(c) => c,
         // abstract/native methods have no Code attribute — nothing to inject
         None => return Ok(()),
     };
-    let mr = helper_methodref(class, plan, helper)?;
-    if code_at_invokes_helper(class, code, 0, mr) {
+    let forwarded = rule.forward_locals.len();
+    let desc = forwarded_descriptor(forwarded);
+    let mr = helper_methodref_desc(class, plan, helper, &desc)?;
+    // Idempotency (retransform): with forwarding the probe is preceded by the
+    // `aload`s, so the invokestatic sits at +locals, not at 0.
+    if code_at_invokes_helper(class, code, forwarded, mr) {
         return Ok(());
     }
-    let payload = align_payload_for_switches(class, code, invokestatic_bytes(mr).to_vec())?;
+    let mut payload = Vec::with_capacity(forwarded + 3);
+    for slot in &rule.forward_locals {
+        // aload_0..aload_3 are the one-byte forms; everything else needs the
+        // wide-ish opcode with a u1 index.
+        if *slot < 4 {
+            payload.push(0x2A + slot);
+        } else {
+            payload.push(0x19);
+            payload.push(*slot);
+        }
+    }
+    payload.extend_from_slice(&invokestatic_bytes(mr));
+    if forwarded > 0 {
+        // Pushing `forwarded` references needs that much stack headroom; the
+        // method's own max_stack may be smaller (a codec can start at 0).
+        let max_stack_off = code.attr_len_off + 4;
+        let current = u16_at(class.data, max_stack_off, "max_stack")? as usize;
+        if forwarded > current {
+            plan.edits.push(Edit::SetU2(max_stack_off, forwarded as u16));
+        }
+    }
+    let payload = align_payload_for_switches(class, code, payload)?;
     let ins_len = payload.len() as i32;
     plan.edits.push(Edit::Insert(code.code_off, payload.into()));
     plan.bump_u4(code.code_len_off, code.code_len as u32, ins_len as i64);
@@ -1679,8 +1755,14 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
             }
             255 => {
                 let locals = u16_at(payload, pos + 3, &ctx("number_of_locals"))? as usize;
-                let mut size = 7usize;
-                let mut p = pos + 7;
+                // Header before the locals: frame_type(1) + offset_delta(2) +
+                // number_of_locals(2) = 5 bytes. The trailing
+                // number_of_stack_items is counted separately below (`size +=
+                // 2` next to its read), so the base here is 5, not 7: using 7
+                // double-counted it and every full_frame looked two bytes
+                // longer than it is ("entry extends past end of attribute").
+                let mut size = 5usize;
+                let mut p = pos + 5;
                 for _ in 0..locals {
                     let v = vti_size(payload, p, end, &ctx("full_frame local"))?;
                     if std::env::var_os("CRUSSTY_TRACE_SMT").is_some() {
@@ -1933,6 +2015,66 @@ fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stackmap_full_frame_reads_locals_from_pos_plus_five() {
+        // Regression for the Forge 1.20.1 abort: PacketDecoder and
+        // RegionFileStorage run untransformed because a full_frame with
+        // non-empty locals desynchronised the parser ("unknown
+        // verification_type_info tag 45"). The frame is
+        //   full_frame -> 1 + 2 + 2 = 5 bytes before the locals,
+        // and the attribute must survive a method-entry injection untouched
+        // except for the frame delta that crosses the insertion point.
+        let (mut c, cl_t, cl_o) = basic_cb();
+        let run = c.utf8("run");
+        let v = c.utf8("()V");
+        let code_n = c.utf8("Code");
+        let smt = c.utf8("StackMapTable");
+        let code = vec![0xA7, 0x00, 0x04, 0x03, 0xB1]; // goto 4; iconst_0; return
+        let mut smt_payload = vec![0x00, 0x02]; // number_of_entries = 2
+        // append_frame (0xFC -> 1 local), delta 0, one Integer local
+        smt_payload.extend_from_slice(&[0xFC, 0x00, 0x00, 0x01]);
+        // full_frame, delta 3, 2 locals (Object, Integer), 0 stack items
+        smt_payload.extend_from_slice(&[0xFF, 0x00, 0x03, 0x00, 0x02]);
+        smt_payload.extend_from_slice(&[0x07, 0x00, 0x01]); // Object cp#1
+        smt_payload.push(0x01); // Integer
+        smt_payload.extend_from_slice(&[0x00, 0x00]); // number_of_stack_items
+        let bytes = c.fin(
+            cl_t,
+            cl_o,
+            vec![method_b(
+                run,
+                v,
+                Some(CodeB {
+                    code_attr_name: code_n,
+                    max_stack: 1,
+                    max_locals: 0,
+                    code,
+                    exc: vec![],
+                    sub: vec![(smt, smt_payload)],
+                }),
+            )],
+        );
+        let e = TransformEngine::new();
+        e.register(hook());
+        let out = e
+            .apply("Test", &bytes)
+            .expect("full_frame must parse")
+            .expect("rule matches the class")
+            .bytes;
+        let cf = parse_class(&out).unwrap();
+        let code = code_of(&cf, 0);
+        let smt_sub = code.sub.iter().find(|s| s.name == "StackMapTable").unwrap();
+        let parsed = &out[smt_sub.off..smt_sub.off + smt_sub.len];
+        // Everything identical except the frame delta that moved by 3 bytes.
+        assert_eq!(parsed[0..2], [0x00, 0x02]);
+        assert_eq!(parsed[2..6], [0xFC, 0x00, 0x00, 0x01], "append frame untouched");
+        assert_eq!(
+            parsed[6..10],
+            [0xFF, 0x00, 0x06, 0x00],
+            "full_frame delta 3 -> 6, locals count untouched"
+        );
+    }
+
     #[test]
     fn switch_bearing_methods_get_four_byte_aligned_payloads() {
         // The invariant the switch fix enforces: in a method that contains a
@@ -2811,7 +2953,7 @@ mod bench_hotpath {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
                     Injection::MethodEntry => {
-                        plan_method_entry(&class, m, &rule.helper, &mut plan)?;
+                        plan_method_entry(&class, &rule, m, &mut plan)?;
                     }
                     Injection::BeforeCall(target) => {
                         plan_before_call(&class, m, target, &rule.helper, &mut plan)?;
@@ -3026,7 +3168,7 @@ mod bench_hotpath {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
                     Injection::MethodEntry => {
-                        plan_method_entry(&class, m, &rule.helper, &mut plan).expect("plan ok");
+                        plan_method_entry(&class, &rule, m, &mut plan).expect("plan ok");
                     }
                     Injection::BeforeCall(target) => {
                         plan_before_call(&class, m, target, &rule.helper, &mut plan).expect("plan ok");
