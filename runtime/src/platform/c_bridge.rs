@@ -2479,7 +2479,7 @@ mod tests {
         let empty = CString::new("{}").unwrap();
         let strv = CString::new("{\"name\":\"crussty\",\"on\":true}").unwrap();
 
-        let mut pub_in = |pj: &CString, inputs: &mut Vec<&'static str>| {
+        let pub_in = |pj: &CString, inputs: &mut Vec<&'static str>| {
             // SAFETY: n_events_publish is the C entry under test; the
             // payload pointers outlive each call.
             let n = unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) };

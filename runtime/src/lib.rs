@@ -552,7 +552,11 @@ impl Agent for CrusstyRuntime {
             let bytes = unsafe { std::slice::from_raw_parts(current, current_len) };
             match platform::transform::global_engine().apply(&name, bytes) {
                 Ok(Some(t)) => {
-                    pending = Some(t.bytes);
+                    // TASK-224: the engine's output buffer moves out (the
+                    // struct keeps no Drop); it is recycled into the
+                    // engine's TLS output pool at the end of this hook,
+                    // after the JVM has been handed its own allocation.
+                    pending = Some(t.into_bytes());
                     current = pending.as_ref().map_or(current, Vec::as_ptr);
                     current_len = pending.as_ref().map_or(current_len, Vec::len);
                 }
@@ -663,6 +667,16 @@ impl Agent for CrusstyRuntime {
                     }
                 }
             }
+        }
+
+        // TASK-224: the final replacement buffer has served every reader
+        // (the JVM got its own JVMTI allocation above; plugin hooks read
+        // it during the chain, before this point) — recycle it into the
+        // transform engine's TLS output pool. A plugin-replaced buffer
+        // (engine output displaced mid-chain) was dropped in the loop and
+        // is simply not recycled — the pool refills from the next load.
+        if let Some(p) = pending.take() {
+            platform::transform::recycle_class_buffer(p);
         }
     }
 }

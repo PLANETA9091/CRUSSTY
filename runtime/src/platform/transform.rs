@@ -109,8 +109,104 @@ impl Rule {
 }
 
 /// Compiled bytecode result: the modified class bytes.
+///
+/// TASK-224: `bytes` is private — consume via [`TransformedClass::into_bytes`]
+/// (a plain move-out; no Drop impl, so the struct stays trivially movable).
+/// The hook path recycles the buffer through `recycle_class_buffer` once the
+/// JVM has copied it, closing the malloc/free cycle on every matched class
+/// load (the TASK-216 exact-capacity proof bounds the LENGTH; a recycled
+/// buffer with different capacity may realloc — correctness unaffected).
 pub struct TransformedClass {
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl TransformedClass {
+    /// Take the transformed class bytes (moves the buffer out).
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+// TASK-224: TLS single-slot output pool for TransformedClass bytes.
+// One buffer per thread, capacity = the last transformed class on that
+// thread (bounded by class size; oversized buffers are dropped, never
+// pooled). Capacity-only retention: the take clears the length, and
+// apply_edits fully rewrites the contents — byte-identical output by
+// construction, locked by the bench parity gate and the transform suite.
+thread_local! {
+    static TRANSFORM_OUT_POOL: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Recycle a transformed-class byte buffer into the thread's output pool.
+/// Called from the class-load hook after the JVM has copied the bytes (the
+/// hook hands JVMTI its OWN allocation) and from the A/B bench arm. A
+/// buffer with zero capacity or above the 16 MiB sanity bound is dropped
+/// instead of pooled (the slot stays single-buffer per thread).
+pub fn recycle_class_buffer(bytes: Vec<u8>) {
+    if bytes.capacity() == 0 || bytes.capacity() > (16 << 20) {
+        return;
+    }
+    TRANSFORM_OUT_POOL.with(|p| {
+        let mut b = p.borrow_mut();
+        if b.is_none() {
+            *b = Some(bytes);
+        }
+    });
+}
+
+/// Take the pooled output buffer (cleared, capacity retained) or allocate
+/// a fresh one with the TASK-216 exact capacity.
+fn take_out_buffer(cap: usize) -> Vec<u8> {
+    TRANSFORM_OUT_POOL.with(|p| {
+        let mut b = p.borrow_mut();
+        match b.take() {
+            Some(mut v) => {
+                v.clear();
+                v
+            }
+            None => Vec::with_capacity(cap),
+        }
+    })
+}
+
+/// TASK-224: TLS scratch shells for the transform tail — the per-call
+/// Vecs whose ELEMENTS are per-call data but whose CAPACITY is reusable:
+/// the edit list (its `Box<[u8]>` payloads drop on the clear-at-reuse;
+/// the shell's growth chain is kept), the attr-length fixup list, the
+/// StackMapTable restore list and the apply_edits chunk buffer. Same
+/// pattern as MAP_SHELLS (clear-on-take, capacity kept). Lifetime-free by
+/// construction — `matched` (borrows the view) and `cp_utf8`/`helpers`
+/// (borrow rule/class strings) stay unpooled.
+#[derive(Default)]
+struct TransformScratch {
+    edits: Vec<Edit>,
+    restores: Vec<usize>,
+    attr_len: Vec<Edit>,
+    chunk: Vec<u8>,
+}
+
+thread_local! {
+    static TRANSFORM_TAIL_SCRATCH: RefCell<Option<Box<TransformScratch>>> =
+        const { RefCell::new(None) };
+}
+
+/// Put the scratch back on EVERY exit of the guarded tail (normal, `?`
+/// error, early return). Nothing inside the tail re-enters the TLS slot
+/// (apply_edits takes the chunk by parameter; parse/plan touch only
+/// MAP_SHELLS), so a plain put-back cannot double-store.
+struct ScratchGuard(Option<Box<TransformScratch>>);
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if let Some(sc) = self.0.take() {
+            TRANSFORM_TAIL_SCRATCH.with(|s| {
+                let mut b = s.borrow_mut();
+                if b.is_none() {
+                    *b = Some(sc);
+                }
+            });
+        }
+    }
 }
 
 /// The engine consumes class bytes, runs matching rules, returns new bytes.
@@ -384,7 +480,22 @@ impl TransformEngine {
         // Registration order (identical to the legacy linear scan).
         matched.sort_unstable_by_key(|(i, _)| *i);
         let class = parse_class(bytes).map_err(|e| format!("transform {class_name}: {e}"))?;
+        // mem::take (not a move-out) keeps the plan whole for the TLS
+        // shell put-back in `Drop`.
+        // TASK-224: the tail's reusable shells come from the thread's
+        // scratch slot (clear-on-take, capacity kept); a guard returns
+        // them on every exit. The shells are harvested back AFTER
+        // apply_edits so the next class load reuses the growth.
+        let mut scratch_guard = ScratchGuard(TRANSFORM_TAIL_SCRATCH.with(|s| s.borrow_mut().take()));
+        let sc = scratch_guard
+            .0
+            .get_or_insert_with(|| Box::new(TransformScratch::default()));
+        sc.edits.clear();
+        sc.restores.clear();
+        sc.attr_len.clear();
+        sc.chunk.clear();
         let mut plan = Plan::new();
+        plan.edits = std::mem::take(&mut sc.edits);
         for (_, rule) in matched.iter().copied() {
             for m in class.methods.iter().filter(|m| rule_matches_method(rule, m)) {
                 match &rule.injection {
@@ -398,10 +509,11 @@ impl TransformEngine {
             }
         }
         if plan.is_empty() {
+            // Keep the (empty) edit shell's capacity for the next load.
+            sc.edits = std::mem::take(&mut plan.edits);
             return Ok(None);
         }
-        // mem::take (not a move-out) keeps the plan whole for the TLS
-        // shell put-back in `Drop`.
+        // The plan's edit vec IS the pooled shell (moved in above).
         let mut edits = std::mem::take(&mut plan.edits);
         if plan.cp_added > 0 {
             edits.push(Edit::Insert(
@@ -415,8 +527,8 @@ impl TransformEngine {
         // any StackMapTable inside it) must have its u4 attribute_length
         // field fixed up, in original-file offsets. Insert edits that merely
         // re-emit bytes consumed by a Set (StackMapTable u2 re-bumps) are
-        // net-zero and excluded.
-        let mut attr_len_edits: Vec<Edit> = Vec::new();
+        // net-zero and excluded. The fixup list is a pooled shell.
+        let mut attr_len_edits = std::mem::take(&mut sc.attr_len);
         for m in &class.methods {
             let Some(code) = &m.code else { continue };
             for (payload_off, payload_len) in
@@ -444,8 +556,19 @@ impl TransformEngine {
                 }
             }
         }
-        edits.extend(attr_len_edits);
-        let out = apply_edits(bytes, edits)?;
+        // append (not extend): the elements move into `edits` while the
+        // shell stays here, empty, for the harvest below.
+        edits.append(&mut attr_len_edits);
+        // TASK-224: the output buffer comes from the TLS pool HERE — the
+        // TLS call is hoisted out of apply_edits so the callee stays
+        // inlinable into this tail.
+        let out = take_out_buffer(bytes.len() + insert_bytes_of(&edits));
+        let (out, edits_back) = apply_edits(bytes, edits, out, &mut sc.chunk)?;
+        // Harvest the shells (with their per-call contents — the next take
+        // clears them, keeping capacity) plus the plan's restore list.
+        sc.edits = edits_back;
+        sc.attr_len = attr_len_edits;
+        sc.restores = std::mem::take(&mut plan.restores);
         Ok(Some(TransformedClass { bytes: out }))
     }
 }
@@ -1851,31 +1974,45 @@ fn attr_len_fixup_edits_naive(
     out
 }
 
+/// TASK-216 helper (TASK-224 hoist): total Insert payload of an edit
+/// list — the exact bound the output buffer needs beyond `data`.
+fn insert_bytes_of(edits: &[Edit]) -> usize {
+    edits
+        .iter()
+        .map(|e| match e {
+            Edit::Insert(_, b) => b.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Rebuild the class bytes from the original buffer plus edits. Edits are
 /// computed against the original layout; insertions at the same offset
 /// append in order, a single Set may accompany them (a conflict is an
 /// error).
-fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
+fn apply_edits(
+    data: &[u8],
+    mut edits: Vec<Edit>,
+    mut out: Vec<u8>,
+    chunk: &mut Vec<u8>,
+) -> Result<(Vec<u8>, Vec<Edit>), String> {
     edits.sort_by_key(|e| e.offset());
     // TASK-216 exact capacity: out never exceeds data + the total Insert
     // payload. Proof per group: with no Set in the group, chunk_len =
     // sum(inserts) and replaced = 0; with a Set, the Set arm CLEARS the
     // chunk, so chunk_len = set size = replaced (net zero, co-located
     // inserts are overridden). Hence out_len = data + sum(chunk_len -
-    // replaced) <= data + sum(insert bytes) — no realloc ever fires.
-    let insert_bytes: usize = edits
-        .iter()
-        .map(|e| match e {
-            Edit::Insert(_, b) => b.len(),
-            _ => 0,
-        })
-        .sum();
-    let mut out: Vec<u8> = Vec::with_capacity(data.len() + insert_bytes);
+    // replaced) <= data + sum(insert bytes). TASK-224: `out` is supplied
+    // by the caller from the TLS output pool — a recycled buffer with a
+    // DIFFERENT capacity may realloc once (class-size change), the
+    // LENGTH bound above is unchanged; byte-identical by construction
+    // (full rewrite).
     // TASK-216 scratch chunk: one buffer reused across offset groups (the
     // per-group clear below replaces the old fresh Vec::new() per group —
     // that shape paid a malloc/free pair for EVERY group). Byte-identical:
     // the chunk is fully rewritten per group and consumed before the next.
-    let mut chunk: Vec<u8> = Vec::new();
+    // TASK-224: the chunk itself is now a pooled shell passed in by the
+    // caller (the transform tail's scratch slot).
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < edits.len() {
@@ -1915,7 +2052,7 @@ fn apply_edits(data: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>, String> {
         pos = off + replaced;
     }
     out.extend_from_slice(&data[pos..]);
-    Ok(out)
+    Ok((out, edits))
 }
 
 #[cfg(test)]
@@ -2754,20 +2891,121 @@ mod bench_hotpath {
         let bytes = bench_kernelish_class();
         let iters = 200_000u32;
         let rounds = 5;
+        // TASK-224: the standing band now runs the PRODUCTION cycle — the
+        // hook consumes into_bytes and recycles the buffer once the JVM
+        // has copied it. (Pre-224 band 1151 ns measured the fresh-alloc
+        // shape: apply + drop.)
         for _ in 0..10_000u32 {
-            let _ = e.apply("net/minecraft/server/MinecraftServer", &bytes);
+            let b = e
+                .apply("net/minecraft/server/MinecraftServer", &bytes)
+                .unwrap()
+                .unwrap()
+                .into_bytes();
+            recycle_class_buffer(b);
         }
         let mut best = f64::MAX;
         for _ in 0..rounds {
             let t = Instant::now();
             for _ in 0..iters {
-                let _ = e.apply("net/minecraft/server/MinecraftServer", &bytes);
+                let b = e
+                    .apply("net/minecraft/server/MinecraftServer", &bytes)
+                    .unwrap()
+                    .unwrap()
+                    .into_bytes();
+                recycle_class_buffer(b);
             }
             best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
         }
         println!(
-            "BENCH transform match+inject: {:.0} ns/op (min of {rounds}x{iters})",
+            "BENCH transform match+inject: {:.0} ns/op (pooled cycle, min of {rounds}x{iters})",
             best * 1e9
+        );
+    }
+
+    /// TASK-224 A/B: the transform output-pool cycle vs the fresh-alloc
+    /// shape, one binary. The scratch shells (edits/attr_len/chunk/
+    /// restores) are production code in BOTH arms — this A/B isolates the
+    /// output-buffer recycle; the shell component shows up as the delta
+    /// between the OFF arm and the pre-224 standing band (1151 ns).
+    ///   parity — the pooled output must be byte-identical to the fresh
+    ///            shape (asserted untimed before any timing).
+    ///   match  — ON arm runs the production cycle (into_bytes + recycle,
+    ///            what the class-load hook does); OFF arm drops the bytes
+    ///            (malloc/free per iter). The ON/OFF delta isolates the
+    ///            output-POOL component; the SHELL component shows as the
+    ///            OFF-arm shift vs the pre-224 fresh-alloc band (1151).
+    ///            ROUND GATE (pre-registered before implementation): the
+    ///            pooled standing band (bench_transform_apply_match) and
+    ///            the stages e2e must beat the pre-224 bands (1151/1186)
+    ///            by >= 3% — banked at 1013/1053 (-12.0%/-11.2%).
+    #[test]
+    #[ignore]
+    fn bench_transform_pool_ab() {
+        let e = bench_engine();
+        let bytes = bench_kernelish_class();
+        const NAME: &str = "net/minecraft/server/MinecraftServer";
+        let iters = 200_000u32;
+        let rounds = 5;
+
+        // Parity gate (untimed): fill the pool with a COPY of the fresh
+        // output, re-apply through the pooled buffer, compare bytes.
+        {
+            let a = e.apply(NAME, &bytes).unwrap().unwrap().into_bytes();
+            recycle_class_buffer(a.clone());
+            let b = e.apply(NAME, &bytes).unwrap().unwrap().into_bytes();
+            assert_eq!(a, b, "pooled output diverged from the fresh shape");
+            recycle_class_buffer(b);
+            drop(a);
+        }
+        // Drain: the OFF arm must pay the malloc path (empty slot).
+        TRANSFORM_OUT_POOL.with(|p| {
+            p.borrow_mut().take();
+        });
+
+        #[inline(never)]
+        fn arm_apply(e: &TransformEngine, bytes: &[u8], pool: bool) -> usize {
+            let b = e.apply(NAME, bytes).unwrap().unwrap().into_bytes();
+            let n = b.len();
+            if pool {
+                recycle_class_buffer(b);
+            } else {
+                drop(b);
+            }
+            std::hint::black_box(n)
+        }
+
+        // OFF arm first: no recycles happen, the slot stays empty, every
+        // iter pays Vec::with_capacity + free (the pre-224 cycle).
+        for _ in 0..10_000u32 {
+            arm_apply(&e, &bytes, false);
+        }
+        let mut best_off = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                arm_apply(&e, &bytes, false);
+            }
+            best_off = best_off.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        // ON arm: full production cycle, the pool is hot from the first
+        // recycle onward.
+        for _ in 0..10_000u32 {
+            arm_apply(&e, &bytes, true);
+        }
+        let mut best_on = f64::MAX;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            for _ in 0..iters {
+                arm_apply(&e, &bytes, true);
+            }
+            best_on = best_on.min(t.elapsed().as_secs_f64() / f64::from(iters));
+        }
+
+        println!(
+            "BENCH transform_pool_ab: match off {:.0} vs on {:.0} ns/op (min of {rounds}x{iters})",
+            best_off * 1e9,
+            best_on * 1e9,
         );
     }
 
@@ -2834,7 +3072,8 @@ mod bench_hotpath {
             }
         }
         edits.extend(attr_len_edits);
-        let out = apply_edits(bytes, edits)?;
+        let out = Vec::with_capacity(bytes.len() + insert_bytes_of(&edits));
+        let (out, _) = apply_edits(bytes, edits, out, &mut Vec::new())?;
         Ok(Some(out))
     }
 
