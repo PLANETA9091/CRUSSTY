@@ -136,9 +136,14 @@ pub const C_PUBLISH_SHELLBACK: bool = true;
 /// reassembly on unchanged C buffers (c_fill). Costs on a tape miss: two
 /// compares + one short memcmp + a byte copy snapped DURING the publishing
 /// call (never re-read after dispatch, so a handler that rewrites the
-/// buffer mid-dispatch cannot poison the association). Every flat publish
-/// re-records (self-healing across shape changes); sequence tokens guard
-/// nested publishes; evictions and displaced putbacks invalidate. `false`
+/// buffer mid-dispatch cannot poison the association). TASK-226: the tag
+/// is TWO records, one per shell slot — alternating flat shapes hit on
+/// every publish exactly the way the two-slot shell warms on every
+/// publish (a 1-deep tape structurally can never hit there). The record
+/// write moved to the Drop put-back: the payload carries its byte snap,/// and record p is written exactly when the map lands in slot p — no
+/// pending-record window, no sequence-token cross-checks; displaced and
+/// evicted putbacks invalidate; a hit-arm map returning home needs no
+/// write at all. `false`
 /// = the post-220 shellbacked shape verbatim (no tag reads or writes).
 /// Semantics are identical in both states: the delivered Value equals
 /// serde's parse of the payload in every case — parity locked by
@@ -453,9 +458,13 @@ thread_local! {
 }
 
 /// TASK-223: the tape identity tag (see C_PUBLISH_TAPE). `bytes_len == 0`
-/// or `slot == CPUB_TAPE_NONE` = no usable record; `seq` is a monotone
-/// token that detects nested-publish overwrites of a pending record.
-/// Held in a Cell (Copy) so the hit-path tag read needs no RefCell boot.
+/// or `slot == CPUB_TAPE_NONE` = no usable record; `seq` is a per-record
+/// monotone counter (observability only — the slot-indexed invariant
+/// needs no cross-checks). TASK-226: held as TWO records, one per shell
+/// slot — record i describes the payload bytes whose map lives in shell
+/// slot i — so alternating flat shapes hit every publish. Each record
+/// stays a Cell (Copy): the hit path reads record 0 first and record 1
+/// only on a miss.
 #[derive(Clone, Copy)]
 struct CpubTape {
     ptr: usize,
@@ -466,20 +475,37 @@ struct CpubTape {
     bytes: [u8; CPUB_TAPE_CAP],
 }
 
+impl CpubTape {
+    const EMPTY: Self = Self {
+        ptr: 0,
+        len: 0,
+        bytes_len: 0,
+        slot: CPUB_TAPE_NONE,
+        seq: 0,
+        bytes: [0; CPUB_TAPE_CAP],
+    };
+}
+
 const CPUB_TAPE_CAP: usize = 64;
 const CPUB_TAPE_NONE: i8 = -1;
 
 thread_local! {
-    static CPUB_PUBLISH_TAPE: Cell<CpubTape> = const {
-        Cell::new(CpubTape {
-            ptr: 0,
-            len: 0,
-            bytes_len: 0,
-            slot: CPUB_TAPE_NONE,
-            seq: 0,
-            bytes: [0; CPUB_TAPE_CAP],
-        })
+    static CPUB_PUBLISH_TAPE: [Cell<CpubTape>; 2] = const {
+        [Cell::new(CpubTape::EMPTY), Cell::new(CpubTape::EMPTY)]
     };
+}
+
+/// TASK-226: the Drop-time record content — the byte snap the scan path
+/// took of the payload (ptr + len + a full byte copy when within cap).
+/// Carried by the payload so record `p` is written exactly when the map
+/// lands in slot `p`: no pending-record window for a nested publish to
+/// clobber, hence no sequence-token cross-checks.
+#[derive(Clone, Copy)]
+struct CpubSnap {
+    ptr: usize,
+    len: u32,
+    bytes_len: u32,
+    bytes: [u8; CPUB_TAPE_CAP],
 }
 
 /// A parsed C-publish payload that knows how to go back where it came
@@ -490,30 +516,28 @@ thread_local! {
 /// only borrow the &Value for the dispatch duration, and the async queue
 /// deep-clones inside publish, so a recycled map can never alias live
 /// state after publish returns.
-struct CpubPayload {
+struct CpubPayload<const TAPE: bool> {
     val: Option<Value>,
     shell: bool,
     /// TASK-223: the shell slot this map came from (255 = cold/unknown);
     /// put-back is positional so the tape's bytes<->slot binding survives
     /// nested publishes (a nested seed must not steal the home slot).
     home: u8,
-    /// TASK-223: this publish recorded its bytes into the tape (every
-    /// flat success except the tape-hit arm itself).
-    recorded: bool,
-    /// TASK-223: the tape seq at record time (0 = none); the Drop
-    /// finalize runs only if the tag still carries THIS record.
-    seq: u32,
+    /// TASK-226: the scan-path byte snap (Some = this publish recorded;
+    /// Drop writes it into record p on put-back). None = the tape-hit
+    /// arm (the record is already in place) or a non-tape shape.
+    snap: Option<CpubSnap>,
 }
 
 const CPUB_HOME_NONE: u8 = 255;
 
-impl CpubPayload {
+impl<const TAPE: bool> CpubPayload<TAPE> {
     fn value(&self) -> &Value {
         self.val.as_ref().expect("payload value present until drop")
     }
 }
 
-impl Drop for CpubPayload {
+impl<const TAPE: bool> Drop for CpubPayload<TAPE> {
     fn drop(&mut self) {
         if self.shell {
             if let Some(Value::Object(map)) = self.val.take() {
@@ -535,26 +559,42 @@ impl Drop for CpubPayload {
                     slots[p] = Some(map);
                     (p, evicted)
                 });
-                // Tape finalize / invalidate (Cell, outside the slots
-                // borrow). Finalize wins: a recorded map OWNS the tag it
-                // just recorded. Invalidate only when a foreign put-back
-                // displaced the tagged slot's map.
-                CPUB_PUBLISH_TAPE.with(|cell| {
-                    let mut t = cell.get();
-                    if self.recorded && self.seq != 0 && t.seq == self.seq {
-                        t.slot = p as i8;
-                        cell.set(t);
-                    } else if evicted && t.slot == p as i8 {
-                        // p holds a foreign map now; if the tagged map
-                        // lived at p it was displaced by THIS put-back.
-                        // (The finalize arm above already re-bound the tag
-                        // when this publish recorded, so this arm only
-                        // fires for foreign displacements.)
-                        t.bytes_len = 0;
-                        t.slot = CPUB_TAPE_NONE;
-                        cell.set(t);
+                // TASK-226 slot-indexed tape maintenance (Cell, outside
+                // the slots borrow). The invariant: record i describes
+                // the map in slot i (or is inert). Every put-back makes
+                // it true again — a recorded (scan-path) map landing at
+                // p writes its snap into record p (over-cap snaps write
+                // inert records that still kill stale state); a hit-arm
+                // map returning to its free home slot needs NO write
+                // (its record survived the lend-out untouched); any
+                // other hit-arm landing (a nested seed stole the home
+                // slot, or the put-back evicted a foreign map)
+                // invalidates record p — the map it described is gone
+                // from p, and a displaced live payload re-records itself
+                // from its own carried snap when its Drop comes.
+                if TAPE {
+                    if let Some(s) = self.snap.take() {
+                        CPUB_PUBLISH_TAPE.with(|cells| {
+                            let mut t = cells[p].get();
+                            t.ptr = s.ptr;
+                            t.len = s.len;
+                            t.bytes_len = s.bytes_len;
+                            t.slot = p as i8;
+                            t.seq = if t.seq == u32::MAX { 1 } else { t.seq + 1 };
+                            t.bytes = s.bytes;
+                            cells[p].set(t);
+                        });
+                    } else if self.home != CPUB_HOME_NONE
+                        && (p != self.home as usize || evicted)
+                    {
+                        CPUB_PUBLISH_TAPE.with(|cells| {
+                            let mut t = cells[p].get();
+                            t.bytes_len = 0;
+                            t.slot = CPUB_TAPE_NONE;
+                            cells[p].set(t);
+                        });
                     }
-                });
+                }
             }
         }
     }
@@ -569,14 +609,14 @@ const CPUB_INLINE: usize = 8;
 /// take the warm/cold shell protocol; every other shape (non-object,
 /// wide objects, anything the flat scanner rejects) is the verbatim
 /// pre-220 c_publish_parse route with `shell = false`.
-fn c_publish_value(s: &str) -> CpubPayload {
+fn c_publish_value(s: &str) -> CpubPayload<C_PUBLISH_TAPE> {
     c_publish_value_inner::<C_PUBLISH_TAPE>(s)
 }
 
 /// Const-generic body so the A/B bench can compile BOTH tape states into
 /// one binary (c_publish_value_inner::<false> = the post-220 shape
 /// verbatim; ::<true> = the production shape when C_PUBLISH_TAPE).
-fn c_publish_value_inner<const TAPE: bool>(s: &str) -> CpubPayload {
+fn c_publish_value_inner<const TAPE: bool>(s: &str) -> CpubPayload<TAPE> {
     if C_PUBLISH_SHELLBACK && C_PUBLISH_FASTPARSE && s.as_bytes().first() == Some(&b'{') {
         if let Some(pl) = c_publish_value_flat::<TAPE>(s) {
             return pl;
@@ -585,12 +625,11 @@ fn c_publish_value_inner<const TAPE: bool>(s: &str) -> CpubPayload {
         // contract, unchanged); the pre-220 route below re-walks the
         // same bytes and lands on the same answer
     }
-    CpubPayload {
+    CpubPayload::<TAPE> {
         val: Some(c_publish_parse(s)),
         shell: false,
         home: CPUB_HOME_NONE,
-        recorded: false,
-        seq: 0,
+        snap: None,
     }
 }
 
@@ -600,7 +639,7 @@ fn c_publish_value_inner<const TAPE: bool>(s: &str) -> CpubPayload {
 /// verbatim owned map from the already-scanned spans (cold). Returns
 /// None only for shapes the pre-220 route must decide (serde fallback
 /// or scan_flat_object's owned path).
-fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
+fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload<TAPE>> {
     let b = s.as_bytes();
     if b.len() < 2 || b[b.len() - 1] != b'}' {
         return None;
@@ -612,26 +651,41 @@ fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
     // memcmp replace the whole scan-probe-write leg. A nested dispatch
     // finds the slot empty and falls through to the scan below.
     if TAPE {
-        let t = CPUB_PUBLISH_TAPE.get();
-        if t.bytes_len > 0
-            && t.slot >= 0
-            && s.len() == t.len as usize
-            && s.as_ptr() as usize == t.ptr
-            && t.bytes[..t.bytes_len as usize] == b[..t.bytes_len as usize]
-        {
-            let hit = CPUB_SHELL.with(|slots| {
-                let mut slots = slots.borrow_mut();
-                slots[t.slot as usize].take()
-            });
-            if let Some(map) = hit {
-                return Some(CpubPayload {
-                    val: Some(Value::Object(map)),
-                    shell: true,
-                    home: t.slot as u8,
-                    recorded: false,
-                    seq: 0,
-                });
+        // TASK-226: two records, one per shell slot — record 0 first
+        // (the primary shape), record 1 only on a miss. Alternating
+        // shapes pay one inert probe on the second publish of each pair
+        // and then hit on BOTH records — the same regime the two-slot
+        // shell warms. A byte-identity match hands the recorded map out
+        // untouched (identity implies parse-identity); a nested dispatch
+        // finds the slot empty (take -> None) and falls through to the
+        // scan below.
+        let taken = CPUB_PUBLISH_TAPE.with(|cells| {
+            for (idx, cell) in cells.iter().enumerate() {
+                let t = cell.get();
+                if t.bytes_len > 0
+                    && t.slot == idx as i8
+                    && s.len() == t.len as usize
+                    && s.as_ptr() as usize == t.ptr
+                    && t.bytes[..t.bytes_len as usize] == b[..t.bytes_len as usize]
+                {
+                    if let Some(map) =
+                        CPUB_SHELL.with(|slots| slots.borrow_mut()[idx].take())
+                    {
+                        return Some((map, idx));
+                    }
+                    // slot empty (a nested publish lent it out) -> try
+                    // the next record
+                }
             }
+            None
+        });
+        if let Some((map, idx)) = taken {
+            return Some(CpubPayload::<TAPE> {
+                val: Some(Value::Object(map)),
+                shell: true,
+                home: idx as u8,
+                snap: None,
+            });
         }
     }
     let mut pairs: [Option<(&str, Value)>; CPUB_INLINE] = Default::default();
@@ -668,30 +722,26 @@ fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
             }
         }
     }
-    // TASK-223: record the tape identity from the bytes AS SCANNED — the
-    // copy is snapped during the publishing call and bound to the slot on
-    // Drop (seq token). Over-cap payloads record bytes_len = 0 (the
-    // identity never matches; the slot bind stays inert). The tape-hit
-    // arm above returns before this point — a hit needs no re-record.
-    let (tseq, recorded) = if TAPE {
-        CPUB_PUBLISH_TAPE.with(|cell| {
-            let mut t = cell.get();
-            t.ptr = s.as_ptr() as usize;
-            t.len = s.len() as u32;
-            t.slot = CPUB_TAPE_NONE;
-            t.seq = if t.seq == u32::MAX { 1 } else { t.seq + 1 };
-            if s.len() <= CPUB_TAPE_CAP {
-                t.bytes[..s.len()].copy_from_slice(b);
-                t.bytes_len = s.len() as u32;
-            } else {
-                t.bytes_len = 0;
-            }
-            let seq = t.seq;
-            cell.set(t);
-            (seq, true)
-        })
+    // TASK-226: snap the payload bytes for the Drop-time record — the
+    // copy rides with the payload and lands in record p exactly when the
+    // map lands in slot p (no pending-record window). Over-cap payloads
+    // snap bytes_len = 0 (the identity never matches; the Drop write
+    // still kills whatever stale record sat at p). The tape-hit arm
+    // above returns before this point — a hit needs no re-record.
+    let snap = if TAPE {
+        let mut sb = CpubSnap {
+            ptr: s.as_ptr() as usize,
+            len: s.len() as u32,
+            bytes_len: 0,
+            bytes: [0; CPUB_TAPE_CAP],
+        };
+        if s.len() <= CPUB_TAPE_CAP {
+            sb.bytes[..s.len()].copy_from_slice(b);
+            sb.bytes_len = s.len() as u32;
+        }
+        Some(sb)
     } else {
-        (0, false)
+        None
     };
     // Warm commit needs the WHOLE key set proven BEFORE any mutation —
     // a partial fill that then bails would corrupt the shell (the R49
@@ -717,12 +767,11 @@ fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
         None
     });
     if let Some((si, map)) = hit {
-        return Some(CpubPayload {
+        return Some(CpubPayload::<TAPE> {
             val: Some(Value::Object(map)),
             shell: true,
             home: si as u8,
-            recorded,
-            seq: tseq,
+            snap,
         });
     }
     // Cold: the pre-220 owned construct from the already-scanned spans —
@@ -735,12 +784,11 @@ fn c_publish_value_flat<const TAPE: bool>(s: &str) -> Option<CpubPayload> {
         let (key, v) = p.take().expect("pair filled");
         map.insert(key.to_string(), v);
     }
-    Some(CpubPayload {
+    Some(CpubPayload::<TAPE> {
         val: Some(Value::Object(map)),
         shell: true,
         home: CPUB_HOME_NONE,
-        recorded,
-        seq: tseq,
+        snap,
     })
 }
 
@@ -780,7 +828,7 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
         // the async queue's deep-clone are complete — the &Value borrow
         // contract keeps the payload unobservable past this point.
         let payload = if payload_json.is_null() {
-            CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
+            CpubPayload::<C_PUBLISH_TAPE> { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, snap: None }
         } else {
             c_publish_value(cstr(payload_json))
         };
@@ -808,7 +856,7 @@ unsafe extern "C" fn n_events_publish(event: *const c_char, payload_json: *const
     // TASK-220: shellbacked payload — see the gate-first arm above for
     // the contract; identical semantics in both entry shapes.
     let payload = if payload_json.is_null() {
-        CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
+        CpubPayload::<C_PUBLISH_TAPE> { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, snap: None }
     } else {
         c_publish_value(cstr(payload_json))
     };
@@ -2584,6 +2632,64 @@ mod tests {
         }
     }
 
+    /// TASK-226 dual-record contract: alternating flat shapes must hit
+    /// the tape on EVERY publish (one record per shell slot — the regime
+    /// the 1-deep tape structurally could never serve), the pair must
+    /// self-heal after a third shape rotates through (2-slot LRU
+    /// eviction rebinds a record), over-cap (> 64 B) alternation stays
+    /// correct via inert records, and the small-shape alternation
+    /// survives the over-cap storm. Every delivery equals serde's parse.
+    #[test]
+    fn c_publish_tape_dual_record() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let sub = events::global().subscribe("c.t226.dual", Arc::new(move |_, v| {
+            seen2.lock().unwrap().push(v.clone());
+        }));
+        let ev = CString::new("c.t226.dual").unwrap();
+        let x = CString::new("{\"tick\":1,\"drained\":0}").unwrap();
+        let y = CString::new("{\"tick\":2,\"drained\":5}").unwrap();
+        let z = CString::new("{\"tick\":3,\"drained\":7,\"extra\":1}").unwrap();
+        let big1 = CString::new(format!("{{\"a\":{},\"b\":1}}", "1".repeat(60))).unwrap();
+        let big2 = CString::new(format!("{{\"a\":{},\"b\":2}}", "2".repeat(60))).unwrap();
+        let mut inputs: Vec<String> = Vec::new();
+        let pub_in = |pj: &CString, inputs: &mut Vec<String>| {
+            let n = unsafe { n_events_publish(ev.as_ptr(), pj.as_ptr()) };
+            assert_eq!(n, 1, "one sync subscriber must be invoked");
+            inputs.push(pj.to_str().unwrap().to_string());
+        };
+        // 1. alternation: X,Y x4 — both records warm after one cycle;
+        //    every publish of every pair must deliver serde's parse
+        //    (the both-records-hit regime).
+        for _ in 0..4 {
+            pub_in(&x, &mut inputs);
+            pub_in(&y, &mut inputs);
+        }
+        // 2. third shape rotation: Z (3 keys) routes cold and evicts a
+        //    slot; the survivor record stays correct, the evicted shape
+        //    re-warms, parity throughout.
+        for pj in [&x, &y, &z, &x, &y, &z, &x, &y] {
+            pub_in(pj, &mut inputs);
+        }
+        // 3. over-cap (> 64 B) alternation: inert records (bytes_len 0),
+        //    the shell still serves both shapes warm.
+        for pj in [&big1, &big2, &big1, &big2] {
+            pub_in(pj, &mut inputs);
+        }
+        // 4. the small-shape alternation survives the over-cap storm.
+        for pj in [&x, &y, &x, &y] {
+            pub_in(pj, &mut inputs);
+        }
+        let _ = events::global().unsubscribe("c.t226.dual", &sub);
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), inputs.len(), "capture/publish misalignment");
+        for (v, s) in got.iter().zip(inputs.iter()) {
+            let want: Value = serde_json::from_str(s).unwrap_or(Value::Null);
+            assert_eq!(v, &want, "dual-record parity diverged on {}", s);
+        }
+    }
+
     /// TASK-223 A/B: tape identity vs the post-220 shellbacked shape.
     /// Arms compile BOTH tape states into one binary via the const-generic
     /// inner (c_publish_value_inner::<false> / ::<true>); the full entry
@@ -2617,7 +2723,7 @@ mod tests {
                 return 0;
             }
             let payload = if pj.is_null() {
-                CpubPayload { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, recorded: false, seq: 0 }
+                CpubPayload::<TAPE> { val: Some(Value::Null), shell: false, home: CPUB_HOME_NONE, snap: None }
             } else {
                 c_publish_value_inner::<TAPE>(cstr(pj))
             };
