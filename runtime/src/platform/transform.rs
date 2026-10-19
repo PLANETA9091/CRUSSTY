@@ -1398,9 +1398,21 @@ fn plan_method_entry<'p>(
     if code_at_invokes_helper(class, code, 0, mr) {
         return Ok(());
     }
-    plan.edits.push(Edit::Insert(code.code_off, invokestatic_bytes(mr).into()));
-    plan.bump_u4(code.code_len_off, code.code_len as u32, 3);
-    plan_code_fixups(class, code, 0, 3, plan)
+    // METHOD-ENTRY INSERTION IS ALWAYS 4 BYTES: invokestatic + nop.
+    // tableswitch/lookupswitch padding is aligned against the code-array
+    // start (offset % 4). An insert whose length is a multiple of 4 keeps
+    // every switch's address residue — and therefore its padding — VALID,
+    // so no switch re-padding machinery is ever needed. A 3-byte insert
+    // (bare invokestatic) shifts switches onto a different residue and the
+    // verifier rejects the class: VerifyError "Bad instruction" at the
+    // switch (observed on ServerHandshakePacketListenerImpl.handleIntention —
+    // every client handshake failed with the kernel attached).
+    let mut ins = Vec::with_capacity(4);
+    ins.extend_from_slice(&invokestatic_bytes(mr));
+    ins.push(0x00); // nop — pad the insert to 4 bytes
+    plan.edits.push(Edit::Insert(code.code_off, ins.into()));
+    plan.bump_u4(code.code_len_off, code.code_len as u32, 4);
+    plan_code_fixups(class, code, 0, 4, plan)
 }
 
 fn plan_before_call<'p>(
@@ -2326,18 +2338,71 @@ mod tests {
         let cf = parse_class(&out).unwrap();
         assert_eq!(class_name(&cf, cf.this_class).unwrap(), "Test");
         let code = code_of(&cf, 0);
-        assert_eq!(code.code_len, 5);
-        assert_eq!(code_bytes(&cf, 0).len(), 5);
+        // 4-byte insert: invokestatic(3) + nop(1) — see plan_method_entry
+        assert_eq!(code.code_len, 6);
+        assert_eq!(code_bytes(&cf, 0).len(), 6);
         assert_eq!(code_bytes(&cf, 0)[0], OP_INVOKESTATIC);
-        assert_eq!(&code_bytes(&cf, 0)[3..], &[0x03, 0xAC]);
+        assert_eq!(code_bytes(&cf, 0)[3], 0x00); // nop
+        assert_eq!(&code_bytes(&cf, 0)[4..], &[0x03, 0xAC]);
         let mr = u16::from_be_bytes([code_bytes(&cf, 0)[1], code_bytes(&cf, 0)[2]]);
         assert_eq!(
             resolve_methodref(&cf, mr).unwrap(),
             ("dev/crussty/hooks/TickHook".to_string(), "onEntry".to_string(), "()V".to_string())
         );
-        // LineNumberTable: (0,1) unchanged, (1,2) -> (4,2)
+        // LineNumberTable: (0,1) unchanged, (1,2) -> (5,2) (4-byte hook)
         let lnt_sub = &code.sub.iter().find(|s| s.name == "LineNumberTable").unwrap();
-        assert_eq!(&out[lnt_sub.off..lnt_sub.off + lnt_sub.len], &[0, 2, 0, 0, 0, 1, 0, 4, 0, 2]);
+        assert_eq!(&out[lnt_sub.off..lnt_sub.off + lnt_sub.len], &[0, 2, 0, 0, 0, 1, 0, 5, 0, 2]);
+    }
+
+    #[test]
+    fn method_entry_keeps_switch_padding_valid() {
+        // Regression: a 3-byte entry insert shifted a following tableswitch
+        // onto a different 4-byte residue; the switch padding (aligned
+        // against the code-array start) no longer matched its address and
+        // the verifier rejected the whole class ("Bad instruction").
+        // The 4-byte insert (invokestatic + nop) preserves every switch's
+        // residue, so padding stays valid. Assert exactly that on a method
+        // whose switch sits at an odd residue.
+        let (mut c, cl_t, cl_o) = basic_cb();
+        let run = c.utf8("run");
+        let v = c.utf8("()V");
+        let code_n = c.utf8("Code");
+        // code: iconst_0 @0, tableswitch @1, ..., return
+        // switch @1: (1+1)%4=2 -> pad=2; after a 4-byte insert -> @5:
+        // (5+1)%4=2 -> pad=2 (unchanged). A 3-byte insert would place it
+        // @4: (4+1)%4=1 -> pad=3 (INVALID without re-padding).
+        let rel_ret: i32 = 23; // return sits 23 bytes past the switch opcode (2 pad + 12 + 2*4 + 1 body)
+        let mut code = vec![0x03]; // iconst_0
+        code.push(0xAA); // tableswitch @1
+        code.extend_from_slice(&[0x00, 0x00]); // pad=2 (operands start @4: 4%4==0)
+        code.extend_from_slice(&rel_ret.to_be_bytes()); // default
+        code.extend_from_slice(&0i32.to_be_bytes()); // low
+        code.extend_from_slice(&1i32.to_be_bytes()); // high
+        code.extend_from_slice(&rel_ret.to_be_bytes()); // target[0]
+        code.extend_from_slice(&rel_ret.to_be_bytes()); // target[1]
+        code.extend_from_slice(&[0xB1]); // return @24
+        assert_eq!(code.len(), 25);
+        let bytes = c.fin(cl_t, cl_o, vec![method_b(run, v, Some(code_b(code_n, code)))]);
+        let e = TransformEngine::new();
+        e.register(hook());
+        let out = e.apply("Test", &bytes).unwrap().unwrap().bytes;
+        let cf = parse_class(&out).unwrap();
+        let cb = code_bytes(&cf, 0);
+        // hook at 0..4 (invokestatic+nop), iconst_0 @4, switch @5
+        assert_eq!(&cb[0..4], &[OP_INVOKESTATIC, cb[1], cb[2], 0x00]);
+        assert_eq!(cb[4], 0x03);
+        assert_eq!(cb[5], 0xAA);
+        // operands must start at the next multiple of 4 after the opcode:
+        // 5+1=6 -> pad to 8 -> cb[6], cb[7] are padding zeros
+        assert_eq!(cb[6], 0x00);
+        assert_eq!(cb[7], 0x00);
+        // default operand reads from @8, relative to the switch opcode @5:
+        // the return moved 24 -> 29, rel stays 23
+        let default_rel = i32::from_be_bytes([cb[8], cb[9], cb[10], cb[11]]);
+        assert_eq!(default_rel, 23);
+        // the return instruction lands exactly at 5 + 23 = 28
+        // (operand block: 2 pad + 12 + 2*4 = 22 bytes after the opcode byte)
+        assert_eq!(cb[28], 0xB1);
     }
 
     #[test]
@@ -2484,7 +2549,7 @@ mod tests {
         let v = c.utf8("()V");
         let code_n = c.utf8("Code");
         let smt = c.utf8("StackMapTable");
-        // goto 4 (frame at 4); frame delta 4 must become 7
+        // goto 4 (frame at 4); frame delta 4 must become 8 (4-byte hook)
         let code = vec![0xA7, 0x00, 0x04, 0x03, 0xB1];
         let smt_payload = vec![0, 1, 4];
         let bytes = c.fin(
@@ -2508,11 +2573,11 @@ mod tests {
         let out = e.apply("Test", &bytes).unwrap().unwrap().bytes;
         let cf = parse_class(&out).unwrap();
         let code = code_of(&cf, 0);
-        assert_eq!(code.code_len, 8);
-        // goto still targets the iconst_0 (now at 7): operand stays 4
-        assert_eq!(&code_bytes(&cf, 0)[3..6], &[0xA7, 0x00, 0x04]);
+        assert_eq!(code.code_len, 9);
+        // goto still targets the iconst_0 (now at 8): operand stays 4
+        assert_eq!(&code_bytes(&cf, 0)[4..7], &[0xA7, 0x00, 0x04]);
         let smt_sub = code.sub.iter().find(|s| s.name == "StackMapTable").unwrap();
-        assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &[0, 1, 7]);
+        assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &[0, 1, 8]);
     }
 
     #[test]
@@ -2522,7 +2587,7 @@ mod tests {
         let v = c.utf8("()V");
         let code_n = c.utf8("Code");
         let smt = c.utf8("StackMapTable");
-        // goto 62; iconst_0 at 62; frame at 62 (delta 62). +3 -> 65 -> extended.
+        // goto 62; iconst_0 at 62; frame at 62 (delta 62). +4 -> 66 -> extended.
         let mut code = vec![0xA7, 0x00, 0x3E];
         code.extend(std::iter::repeat_n(0x00, 59)); // nops at 3..62
         code.extend_from_slice(&[0x03, 0xB1]);
@@ -2548,12 +2613,12 @@ mod tests {
         let out = e.apply("Test", &bytes).unwrap().unwrap().bytes;
         let cf = parse_class(&out).unwrap();
         let code = code_of(&cf, 0);
-        // 64-byte body + 3-byte hook
-        assert_eq!(code.code_len, 67);
+        // 64-byte body + 4-byte hook
+        assert_eq!(code.code_len, 68);
         let smt_sub = code.sub.iter().find(|s| s.name == "StackMapTable").unwrap();
-        // same_frame_extended (251) + u2 65; attribute payload grew 3 -> 5
+        // same_frame_extended (251) + u2 66; attribute payload grew 3 -> 5
         assert_eq!(smt_sub.len, 5);
-        assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &[0, 1, 251, 0, 65]);
+        assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &[0, 1, 251, 0, 66]);
     }
 
     #[test]
@@ -2583,11 +2648,11 @@ mod tests {
         let out = e.apply("Test", &bytes).unwrap().unwrap().bytes;
         let cf = parse_class(&out).unwrap();
         let code = code_of(&cf, 0);
-        // start_pc 1 -> 4, end_pc 2 -> 5 (== new code_length), handler_pc 1 -> 4
+        // start_pc 1 -> 5, end_pc 2 -> 6 (== new code_length), handler_pc 1 -> 5
         let (s_off, e_off, h_off) = code.exc[0];
-        assert_eq!(u16_at(&out, s_off, "t").unwrap(), 4);
-        assert_eq!(u16_at(&out, e_off, "t").unwrap(), 5);
-        assert_eq!(u16_at(&out, h_off, "t").unwrap(), 4);
+        assert_eq!(u16_at(&out, s_off, "t").unwrap(), 5);
+        assert_eq!(u16_at(&out, e_off, "t").unwrap(), 6);
+        assert_eq!(u16_at(&out, h_off, "t").unwrap(), 5);
     }
 
     #[test]
