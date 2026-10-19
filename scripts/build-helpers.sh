@@ -38,6 +38,16 @@ javac "${JAVAC_FLAGS[@]}" -d runtime/build/hooks \
   runtime/hook-src/dev/crussty/hooks/TickHook.java \
   runtime/hook-src/dev/crussty/hooks/StorageHooks.java
 
+echo "== launcher single-jar Boot (launcher/build/) =="
+# Committed and embedded byte-for-byte by the CLI (`crussty build`, see
+# cli/src/build.rs include_bytes!) so packaging needs no Java toolchain.
+# Boot.java must stay Java-8 compatible: it is compiled --release 8 and runs
+# on whatever JVM the kernel targets, not just Java 21+.
+rm -rf launcher/build
+mkdir -p launcher/build
+javac "${JAVAC_FLAGS[@]}" -d launcher/build \
+  launcher/src/main/java/dev/dist/launcher/Boot.java
+
 echo
 echo "Generated artifacts:"
-find cplug-sdk/asm-build runtime/build/hooks -name "*.class" | sort
+find cplug-sdk/asm-build runtime/build/hooks launcher/build -name "*.class" | sort

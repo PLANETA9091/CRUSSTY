@@ -85,6 +85,22 @@ crussty disable <name>   # park it (or --disabled to disable)
 crussty reload    # hot-reload all modules (no server restart)
 ```
 
+### One jar for everything: `crussty build`
+
+Instead of carrying the launcher + the kernel + `modules/` around, pack
+the whole server into a single bootable jar and drop it anywhere a JVM
+exists:
+
+```bash
+cd my-server && crussty build
+java -Xmx2G -jar dist/crussty-<your-kernel>.jar --nogui
+```
+
+The jar carries the kernel unmodified, the native runtime and every
+installed module; on first boot it unpacks `./crussty/` and starts the
+kernel. Works with Paper, Purpur, Fabric and vanilla kernels (Forge boots
+from its libraries and cannot be packed).
+
 ### The TUI
 
 `crussty tui` opens a full-screen menu: new module, build,
@@ -120,7 +136,9 @@ cp runtime/target/debug/libcrussty_runtime.so libcrussty_runtime.so
 
 Requires `versions/purpur-1.21.10.jar` (not committed) — the single-jar boot
 loads the kernel from there, so it must be in place **before** running
-`build-single-jar.sh` or booting `server.jar`.
+`build-single-jar.sh` or booting `server.jar`. The user-facing variant is
+`crussty build` (any kernel from `versions/`, modules from the server's own
+`modules/` — see `book/src/cli.md`).
 
 ```bash
 # run the built single-jar

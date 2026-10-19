@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Build a self-contained kernel jar: drop it in place of server.jar and run.
 #   java -Xmx2G -jar crussty-1.21.10.jar --nogui
-# The jar bundles: paperclip kernel (unmodified), the native runtime
+# The jar bundles: purpur kernel (unmodified), the native runtime
 # (libcrussty_runtime.so), and every published module bundle from the catalog
 # (module.json + lib*.so + native deps) — extracted to ./crussty/ on first
 # boot by dev.dist.launcher.Boot, which then loads the runtime via JNI_OnLoad
 # (no -agentpath needed) and starts the kernel.
+#
+# This is the legacy catalog-driven variant (always purpur, every catalog
+# module). The user-facing generalization is `crussty build` (cli/src/
+# build.rs): any kernel from versions/, only the modules actually installed
+# in modules/, no catalog access needed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +21,12 @@ OUT=dist/crussty-$V.jar
 [ -f "$KERNEL" ] || { echo "kernel not found: $KERNEL" >&2; exit 1; }
 
 mkdir -p dist launcher/out
-javac -cp "$KERNEL" -d launcher/out launcher/src/main/java/dev/dist/launcher/Boot.java
+# Boot is reflection-only since the generic `crussty build` lands: no kernel
+# on the compile classpath, --release 8 like the committed artifact
+# (scripts/build-helpers.sh). Compiling fresh keeps this script honest when
+# Boot.java changes without a helper rebuild.
+javac -encoding UTF-8 --release 8 -g -nowarn -d launcher/out \
+  launcher/src/main/java/dev/dist/launcher/Boot.java
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT

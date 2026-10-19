@@ -20,6 +20,7 @@ crussty ls                     # list modules: active / parked / disabled
 crussty enable <name>          # activate a parked/disabled module
 crussty disable <name>         # park (append .x) or --disabled (append .disabled)
 crussty reload                 # hot-reload all modules (SIGUSR1 to the running JVM)
+crussty build [--out PATH]     # pack launcher + runtime + modules + kernel into ONE jar
 ```
 
 ## `crussty init` — the kernel
@@ -60,6 +61,48 @@ crussty: no kernel downloaded — put the Minecraft server .jar you want to
     [server]
     kernel = "kernel.jar"
 ```
+
+## `crussty build` — the whole server in one jar
+
+Normally a Crussty server is two artifacts: the crussty launcher (which
+attaches the native runtime to the kernel) and the kernel jar itself.
+`crussty build` merges everything into a single file you can drop anywhere
+a matching JVM exists — no launcher, no `libcrussty_runtime.so`, no
+`modules/` directory to carry around:
+
+```bash
+cd my-server
+crussty build
+
+#  dist/crussty-purpur-1.21.10.jar
+java -Xmx2G -jar crussty-purpur-1.21.10.jar --nogui
+```
+
+The jar contains the kernel **unmodified** (every entry copied), the
+`Boot` single-jar entry point, the native runtime and every **installed**
+module (`modules/`, recursively — `module.json`, the entry library and any
+bundled native dependencies). Parked (`*.x`) and disabled (`*.disabled`)
+modules are skipped — the runtime would not load them anyway.
+
+On first boot the jar unpacks `./crussty/` (runtime + modules) into the
+working directory, loads the runtime via `JNI_OnLoad` and then starts the
+kernel's main class. Any bootable jar kernel works — Paper, Purpur, Fabric,
+vanilla: the kernel's original `Main-Class` is preserved in the manifest
+(`Crussty-Kernel-Main`) and Boot invokes it. The one exception is Forge:
+it boots from `versions/libraries/` through an installer-generated args
+file, so it cannot be packed into one jar and `build` refuses it with a
+clear message.
+
+`--out` moves the result somewhere else:
+
+```bash
+crussty build --out /opt/servers/server.jar
+```
+
+Note the split: `eula.txt`, `server.properties`, worlds and logs stay next
+to the jar (created in the working directory on first boot, like any
+server), while the runtime and modules live inside the jar. Re-run
+`crussty build` after installing modules to bake them in.
 
 ## Module commands
 

@@ -9,6 +9,10 @@
 #                            "hello from native c-plugin"
 #                            (optional) "[crussty-module] native surface live"
 #  5. stop the server cleanly; exit 0 on success, 1 on any failure.
+#  7. single-jar boot:       build-single-jar.sh (catalog modules), java -jar,
+#                            no -agentpath; SKIPPED when the catalog is private
+#  8. crussty build:         CLI packs launcher + runtime + installed modules
+#                            + kernel into one jar; structure check (no boot)
 #
 # Requirements: java 21+ (javac/jar), cargo, curl, python3, setsid (util-linux).
 # Env overrides: PURPUR_VERSION (1.21.10), SERVER_PORT (25566),
@@ -339,6 +343,45 @@ log "single-jar hot-reload ok: reloaded=$found_sj_reload hook-purge=$found_sj_pu
 kill -TERM -- "$SJ_PID" 2>/dev/null || true
 fi # SJ_SKIPPED == 0 (stage 7 body)
 
+# ------------------------------------------ 8. crussty build (CLI single-jar)
+stage "8. crussty build: launcher + runtime + installed modules + kernel -> one jar"
+# The user-facing single-jar path (cli/src/build.rs): same Boot logic as
+# stage 7 but no catalog access — modules come from the server's own
+# modules/. Structure check only (stage 7 already boots the Boot path).
+cargo build --manifest-path cli/Cargo.toml || fail "cargo build cli"
+CB_DIR="$SERIAL_DIR/cbuild-server"
+mkdir -p "$CB_DIR/versions"
+printf '[server]\nkernel = "purpur-%s.jar"\nmemory = "2G"\n' "$PURPUR_VERSION" > "$CB_DIR/crussty.toml"
+ln -sf "$REPO/versions/purpur-$PURPUR_VERSION.jar" "$CB_DIR/versions/"
+ln -sf "$REPO/libcrussty_runtime.so" "$CB_DIR/"
+ln -sf "$REPO/modules" "$CB_DIR/modules"
+( cd "$CB_DIR" && "$REPO/cli/target/debug/crussty" build ) || fail "crussty build"
+CB_JAR="$CB_DIR/dist/crussty-purpur-$PURPUR_VERSION.jar"
+[ -f "$CB_JAR" ] || fail "crussty build produced no jar: $CB_JAR"
+python3 - "$CB_JAR" <<'EOF' || fail "crussty build jar structure check"
+import sys, zipfile
+jar = zipfile.ZipFile(sys.argv[1])
+names = set(jar.namelist())
+def need(n):
+    assert n in names, f"missing entry: {n}"
+need("META-INF/MANIFEST.MF")
+need("dev/dist/launcher/Boot.class")
+need("libcrussty_runtime.so")
+need("io/papermc/paperclip/Main.class")   # kernel merged unmodified
+mf = jar.read("META-INF/MANIFEST.MF").decode()
+for attr in (
+    "Main-Class: dev.dist.launcher.Boot",
+    "Crussty-Kernel-Main: io.papermc.paperclip.Main",
+    "Enable-Native-Access: ALL-UNNAMED",
+):
+    assert attr in mf, f"manifest missing: {attr}"
+mods = [n for n in names if n.startswith("modules/") and n.endswith("/module.json")]
+assert mods, "no embedded modules found"
+assert not any(n.endswith((".SF", ".RSA", ".DSA")) for n in names), "signature files leaked"
+print(f"[e2e] crussty build structure ok: {len(names)} entries, {len(mods)} module manifest(s)")
+EOF
+log "crussty build ok: $CB_JAR ($(du -h "$CB_JAR" | cut -f1))"
+
 echo
 echo "================ E2E PASS ================"
 echo "  kernel:    purpur-$PURPUR_VERSION"
@@ -347,5 +390,6 @@ echo "  pipeline:  ready"
 echo "  hello:     from native c-plugin"
 echo "  crussty:   $([ "$found_native" -eq 1 ] && echo "native surface live" || echo "NOT verified (check modules/crussty/native/)")"
 echo "  single-jar: $([ "$SJ_SKIPPED" -eq 1 ] && echo "SKIPPED (catalog unreachable; add CATALOG_TOKEN secret)" || echo "boot + hot-reload ok")"
+echo "  crussty build: ok (structure checked)"
 echo "  boot time: $((SECONDS - START))s"
 exit 0

@@ -45,6 +45,7 @@ server.properties
 !modules/crussty/native/*.so
 
 # generated helper build dirs (only specific .class artifacts tracked)
+!launcher/build/dev/dist/launcher/Boot.class
 !modules/crussty/area-map/build/
 !modules/crussty/area-map/build/ca/spottedleaf/moonrise/common/misc/SingleUserAreaMapOps*.class
 !modules/crussty/noise/build/

@@ -16,5 +16,6 @@ ureq = { version = "3", features = ["_tls"] }
 flate2 = "1"
 sha2 = "0.10"
 tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 crossterm = "0.28"
 ratatui = "0.29"

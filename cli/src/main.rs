@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+mod build;
 mod catalog;
 mod init;
 mod kernel;
@@ -29,6 +30,9 @@ enum Command {
     Init(init::InitArgs),
     /// Launch the server; stdin is forwarded to the server console.
     Run,
+    /// Pack launcher + runtime + installed modules + kernel into ONE
+    /// bootable jar (java -jar, no crussty launcher needed).
+    Build(build::BuildArgs),
     /// Stop the running server.
     Stop,
     /// Tail the console log.
@@ -89,6 +93,7 @@ fn main() -> ExitCode {
                 0
             }
             Command::Init(args) => init::run(args),
+            Command::Build(args) => build::run(args),
             Command::Run => server::run(),
             Command::Stop => server::stop(),
             Command::Log { follow } => server::log(follow),

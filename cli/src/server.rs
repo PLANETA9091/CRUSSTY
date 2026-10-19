@@ -4,12 +4,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-fn read_config(server: &PathBuf) -> Option<serde_json::Value> {
+pub(crate) fn read_config(server: &PathBuf) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(server.join("crussty.toml")).ok()?;
     Some(parse_tomlish(&text))
 }
 
-fn parse_tomlish(text: &str) -> serde_json::Value {
+pub(crate) fn parse_tomlish(text: &str) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     let mut section = String::new();
     for line in text.lines() {
@@ -85,7 +85,7 @@ mod tests {
     }
 }
 
-fn cfg_str(cfg: &serde_json::Value, section: &str, key: &str, fallback: &str) -> String {
+pub(crate) fn cfg_str(cfg: &serde_json::Value, section: &str, key: &str, fallback: &str) -> String {
     cfg.get(section)
         .and_then(|s| s.get(key))
         .and_then(|v| v.as_str())

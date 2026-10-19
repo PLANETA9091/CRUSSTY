@@ -30,6 +30,7 @@ crussty module new my-module
 | --- | --- |
 | `init` | Scaffold a Crussty server directory; interactively pick a kernel (Paper / Purpur / Fabric / Forge → version → auto-download), or use `--jar <path>`, `--platform <p> --version <mc>`, `--no-kernel` |
 | `run` | Launch the server; stdin is forwarded to the server console |
+| `build` | Pack launcher + runtime + installed modules + kernel into ONE bootable jar (`java -jar`, no launcher needed; any jar kernel except Forge) |
 | `stop` | Stop the running server |
 | `log --follow` | Tail the server log |
 | `reload` | Hot-reload c-plugins (SIGUSR1) |
