@@ -1,15 +1,18 @@
 # CRUSSTY — inject native code into your server jar
 
 CRUSSTY is a **jar injector**: it drops a native runtime into any
-Paper-compatible server jar and runs modules written in Rust, C, C++,
-Python or JavaScript — hooking the server at the bytecode level. No plugin
-API locks, no JNI boilerplate, no `-agentpath`.
+Minecraft server jar — Paper, Purpur, Fabric, Forge, vanilla, any `.jar` —
+and runs modules written in Rust, C, C++, Python or JavaScript — hooking
+the server at the bytecode level. No plugin API locks, no JNI boilerplate,
+no `-agentpath`.
 
 > **Documentation:** [planeta9091.github.io/CRUSSTY](https://planeta9091.github.io/CRUSSTY/)
 > — quickstart, module API, SDK reference, other languages, troubleshooting.
 >
 > **Downloads:** the `crussty` CLI on
-> [npm](https://www.npmjs.com/package/crussty) (Linux, macOS, Windows),
+> [npm](https://www.npmjs.com/package/crussty) (Linux, macOS, Windows) —
+> it republishes automatically on every push that touches the CLI, so
+> `npm i -g crussty` / `npm update -g crussty` always gets the latest build —
 > plus `launcher.jar`, `libcrussty_runtime.so` and run scripts in
 > [Releases](https://github.com/PLANETA9091/CRUSSTY/releases).
 
@@ -22,11 +25,36 @@ You only need the `crussty` CLI from npm and a Java 21+ runtime:
 ```bash
 npm i -g crussty
 
-# 1. scaffold a server directory (downloads the kernel, runtime and launcher)
+# 1. scaffold a server directory (runtime + launcher, plus a kernel of
+#    your choice — Paper, Purpur, Fabric or Forge)
 crussty init --dir my-server
 
 # 2. start the server (console is forwarded to your terminal)
 cd my-server && crussty run
+```
+
+In an interactive terminal `init` asks what to inject into:
+
+```text
+crussty: choose the kernel to inject into:
+  1. Paper — pick a version and download
+  2. Purpur — pick a version and download
+  3. Fabric — pick a version and download
+  4. Forge — pick a version and download
+  5. Skip — I'll place my own server jar
+```
+
+Pick a platform and it fetches the live version list from the platform's
+own API; pick a version and it downloads automatically. Forge additionally
+runs its installer (`--installServer`) for you.
+
+No kernel is downloaded without your choice — non-interactive runs just
+print where to drop the jar. Alternative ways to provide the kernel:
+
+```bash
+crussty init --jar /path/to/server.jar              # use any existing .jar
+crussty init --platform purpur --version 1.21.10    # fully non-interactive
+crussty init --no-kernel                            # instructions only
 ```
 
 That's it — the runtime boots with the kernel and loads whatever is in
@@ -37,7 +65,7 @@ What's in your server directory:
 ```
 my-server/
 ├── crussty.toml          # kernel + memory + module catalog settings
-├── versions/purpur-1.21.10.jar
+├── versions/<kernel>.jar # any Minecraft server jar (your injection target)
 ├── launcher/launcher.jar # spawns the kernel with the JVMTI runtime
 ├── libcrussty_runtime.so # the runtime itself
 ├── modules/              # drop a module here to load it

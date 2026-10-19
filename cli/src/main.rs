@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 mod catalog;
 mod init;
+mod kernel;
 mod lib;
 mod modules;
 mod pack;
@@ -23,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold a Crussty server directory.
+    /// Scaffold a Crussty server directory (runtime + launcher; the kernel is
+    /// picked interactively, via --jar/--platform, or placed by hand).
     Init(init::InitArgs),
     /// Launch the server; stdin is forwarded to the server console.
     Run,

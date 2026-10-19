@@ -7,7 +7,7 @@
   <img class="glide-banner-logo" src="./assets/crussty-logo.png" alt="Crussty logo" />
   <div class="glide-banner-text">
     <h1 class="glide-banner-title">Crussty Platform</h1>
-    <p class="glide-banner-subtitle">Native injection platform for Paper-family Minecraft kernels</p>
+    <p class="glide-banner-subtitle">Native injection platform for Minecraft server jars — Paper, Purpur, Fabric, Forge, vanilla</p>
     <div class="glide-banner-actions">
       <a class="glide-btn glide-btn-primary" href="./quickstart.html">Get started</a>
       <a class="glide-btn" href="./architecture.html">Architecture</a>
@@ -25,11 +25,12 @@
 
 # Introduction
 
-Crussty is a **native injection platform** for Paper-family Minecraft kernels
-(Purpur, Paper, etc.). It attaches a JVMTI runtime to the kernel JVM and uses
-it to load **Rust modules** — shared libraries written entirely in Rust —
-directly into the server process, where they can intercept class loading,
-patch kernel bytecode, and replace hot paths with native code.
+Crussty is a **native injection platform** for Minecraft server jars —
+Paper, Purpur, Fabric, Forge, vanilla: any server `.jar`. It attaches a
+JVMTI runtime to the kernel JVM and uses it to load **Rust modules** —
+shared libraries written entirely in Rust — directly into the server
+process, where they can intercept class loading, patch kernel bytecode,
+and replace hot paths with native code.
 
 Call it what you like: an injector, a hot-patch engine, a native module platform
 platform. The distinguishing property is that Crussty does not fork the
@@ -51,7 +52,7 @@ The `crussty` CLI (Linux, macOS, Windows) downloads the correct binary for
 your platform automatically. From then on it handles the whole lifecycle:
 
 ```bash
-crussty init --dir my-server   # scaffold a server: kernel, runtime, launcher
+crussty init --dir my-server   # scaffold a server: kernel of your choice, runtime, launcher
 crussty tui                    # full-screen menu: modules, search, build, pack
 crussty search <query>         # find modules on GitHub
 crussty install <id>           # install a module from the catalog

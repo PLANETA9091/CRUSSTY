@@ -99,12 +99,15 @@ pub fn run() -> i32 {
         eprintln!("crussty: no crussty.toml here — run 'crussty init' first");
         return 1;
     };
-    let kernel = cfg_str(&cfg, "server", "kernel", "purpur-1.21.10.jar");
+    let kernel = cfg_str(&cfg, "server", "kernel", "kernel.jar");
     let memory = cfg_str(&cfg, "server", "memory", "2G");
 
     let jar = server.join("versions").join(&kernel);
     if !jar.exists() {
-        eprintln!("crussty: kernel jar not found at {}", jar.display());
+        eprintln!(
+            "crussty: kernel jar not found at {}\n  put your Minecraft server .jar into versions/ and set kernel = \"<file>\" in crussty.toml\n  (any Paper, Purpur, Fabric, Forge or vanilla jar works),\n  or run `crussty init` to pick and download one",
+            jar.display()
+        );
         return 1;
     }
     if !lib::jvm_pids(&server).is_empty() {

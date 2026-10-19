@@ -10,7 +10,8 @@ npm i -g crussty
 ```
 
 The correct binary for your platform (Linux, macOS, Windows) is installed
-automatically.
+automatically. The npm package is republished automatically on every CLI
+change, so a plain `npm update -g crussty` always gets the latest build.
 
 ## 2. Scaffold a server
 
@@ -19,13 +20,50 @@ crussty init --dir my-server
 cd my-server
 ```
 
-`init` downloads the Purpur kernel, the native runtime and the launcher
-into your server directory — no manual fetching:
+`init` downloads the native runtime and the launcher, then asks what to
+inject into:
+
+```text
+crussty: choose the kernel to inject into:
+  1. Paper — pick a version and download
+  2. Purpur — pick a version and download
+  3. Fabric — pick a version and download
+  4. Forge — pick a version and download
+  5. Skip — I'll place my own server jar
+```
+
+Choose a platform and `init` fetches the live version list from the
+platform's own API; choose a version and the download starts
+automatically (Forge additionally runs its own `--installServer`).
+
+Prefer to bring your own jar? Any Minecraft server `.jar` works —
+Paper, Purpur, Fabric, Forge, vanilla:
+
+```bash
+crussty init --dir my-server --jar /path/to/server.jar   # copy an existing jar
+crussty init --dir my-server --no-kernel                 # instructions only
+```
+
+Without a kernel you are simply told where to place it:
+
+```text
+crussty: no kernel downloaded — put the Minecraft server .jar you want to
+  inject into yourself at:
+
+    my-server/versions/kernel.jar
+
+  and set it in crussty.toml:
+
+    [server]
+    kernel = "kernel.jar"
+```
+
+After scaffolding the directory looks like this:
 
 ```text
 my-server/
 ├── crussty.toml          # kernel + memory + catalog settings
-├── versions/purpur-1.21.10.jar
+├── versions/<kernel>.jar # your server jar — the injection target
 ├── launcher/launcher.jar
 ├── libcrussty_runtime.so
 ├── modules/              # drop modules here

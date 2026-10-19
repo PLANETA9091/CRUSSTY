@@ -1,6 +1,6 @@
 # Crussty CLI
 
-CLI for Crussty servers and c-plugins: scaffold, run and manage your Crussty server, build and package c-plugins.
+CLI for Crussty servers and c-plugins: scaffold, run and manage your Crussty server, build and package c-plugins. Works with **any Minecraft server `.jar`** — Paper, Purpur, Fabric, Forge, vanilla.
 
 ## Install
 
@@ -8,13 +8,14 @@ CLI for Crussty servers and c-plugins: scaffold, run and manage your Crussty ser
 npm i -g crussty
 ```
 
-No install scripts, no runtime dependencies — the binary for your platform is pulled in automatically as an optional dependency.
+No install scripts, no runtime dependencies — the binary for your platform is pulled in automatically as an optional dependency. The package republishes automatically on every CLI change, so `npm update -g crussty` always gets the latest build.
 
 ## Quick start
 
 ```bash
-# scaffold a new server
-crussty init my-server
+# scaffold a new server (asks which kernel to download:
+# Paper / Purpur / Fabric / Forge — or bring your own .jar)
+crussty init --dir my-server
 
 # launch it
 cd my-server && crussty run
@@ -27,7 +28,7 @@ crussty module new my-module
 
 | Command | Description |
 | --- | --- |
-| `init` | Scaffold a Crussty server directory (downloads kernel) |
+| `init` | Scaffold a Crussty server directory; interactively pick a kernel (Paper / Purpur / Fabric / Forge → version → auto-download), or use `--jar <path>`, `--platform <p> --version <mc>`, `--no-kernel` |
 | `run` | Launch the server; stdin is forwarded to the server console |
 | `stop` | Stop the running server |
 | `log --follow` | Tail the server log |

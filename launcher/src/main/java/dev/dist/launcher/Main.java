@@ -13,7 +13,8 @@ import java.util.stream.Stream;
 
 /**
  * v2 launcher (the artifact users download). Jobs:
- *  1. find the kernel jar in versions/ (any Paper-family jar);
+ *  1. find the kernel jar in versions/ (any Minecraft server .jar — Paper,
+ *     Purpur, Fabric, Forge, vanilla, …);
  *  2. spawn a child JVM with our native agent (-agentpath:libcrussty_runtime.so),
  *     so Rust modules load BEFORE the kernel boots (JVMTI ClassFileLoadHook
  *     window, full capabilities — OnLoad-only hooks are available);
@@ -32,13 +33,16 @@ public final class Main {
         Path modules = root.resolve("modules");
         Path logs = root.resolve("logs");
 
-        Path kernel = findKernel(versions);
+        Kernel kernel = findKernel(versions);
         Path agent = findAgent(root);
 
         Files.createDirectories(logs);
+        String kernelName = kernel.argsFile != null
+                ? kernel.argsFile.getParent().getFileName().toString()
+                : kernel.jar.getFileName().toString();
         String opts = "modules=" + modules.toAbsolutePath()
                 + ";versions=" + versions.toAbsolutePath()
-                + ";kernel=" + kernel.getFileName();
+                + ";kernel=" + kernelName;
 
         List<String> cmd = new ArrayList<>();
         cmd.add(javaBin());
@@ -47,17 +51,27 @@ public final class Main {
         // The child JVM must see the same dist root the launcher resolved
         // (else modules/kernel resolution differs when launched from elsewhere).
         cmd.add("-Ddist.root=" + root.toAbsolutePath());
-        cmd.add("-jar");
-        cmd.add(kernel.toAbsolutePath().toString());
+        if (kernel.argsFile != null) {
+            // Forge (1.17+): boot through the installer-generated args file.
+            // Relative paths inside the file resolve against versions/ — the
+            // child JVM's working directory is set to versions/ below.
+            cmd.add("@" + kernel.argsFile.toAbsolutePath());
+        } else {
+            cmd.add("-jar");
+            cmd.add(kernel.jar.toAbsolutePath().toString());
+        }
         cmd.add("--nogui");
         cmd.addAll(List.of(args));
 
-        System.out.println("[launcher] kernel:  " + kernel);
+        System.out.println("[launcher] kernel:  " + (kernel.argsFile != null
+                ? kernel.argsFile + " (forge args-file boot)"
+                : kernel.jar));
         System.out.println("[launcher] agent:   " + agent);
         System.out.println("[launcher] modules: " + modules + " (recursive)");
         System.out.println("[launcher] exec: " + String.join(" ", cmd));
 
-        ProcessBuilder pb = new ProcessBuilder(cmd).directory(root.toFile());
+        ProcessBuilder pb = new ProcessBuilder(cmd).directory(
+                kernel.argsFile != null ? versions.toFile() : root.toFile());
         Process server = pb.start();
 
         // console: launcher stdin -> server stdin; server stdout+stderr -> logs + console
@@ -73,20 +87,63 @@ public final class Main {
         System.exit(code);
     }
 
-    /** Pick the newest kernel jar in versions/ (deterministic, user-friendly). */
-    static Path findKernel(Path versions) throws IOException {
+    /** Bootable kernel: a plain jar (-jar) or a Forge args file (@file). */
+    static final class Kernel {
+        final Path jar;
+        final Path argsFile;
+        Kernel(Path jar, Path argsFile) {
+            this.jar = jar;
+            this.argsFile = argsFile;
+        }
+    }
+
+    /** Pick the newest kernel jar in versions/ (deterministic, user-friendly).
+     *  Installer jars (forge-…-installer.jar) are skipped — they are not
+     *  bootable; a completed Forge install is booted via its args file. */
+    static Kernel findKernel(Path versions) throws IOException {
         Files.createDirectories(versions);
+        Path forgeArgs = findForgeArgs(versions);
+        if (forgeArgs != null) {
+            return new Kernel(null, forgeArgs);
+        }
         try (Stream<Path> s = Files.list(versions)) {
             List<Path> jars = s
                     .filter(p -> p.getFileName().toString().endsWith(".jar"))
+                    .filter(p -> !p.getFileName().toString().contains("installer"))
                     .sorted(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed())
                     .toList();
             if (jars.isEmpty()) {
-                System.err.println("[launcher] no kernel jar in versions/ — drop e.g. purpur-1.21.10.jar there");
+                System.err.println("[launcher] no kernel in versions/ — drop any Minecraft server .jar there"
+                        + " (paper/purpur/fabric/forge/vanilla), e.g. purpur-1.21.10.jar");
                 System.exit(2);
             }
-            return jars.get(0);
+            return new Kernel(jars.get(0), null);
         }
+    }
+
+    /** Newest Forge install under versions/libraries/net/minecraftforge/forge/
+     *  &lt;mc&gt;-&lt;build&gt;/{unix,win}_args.txt, or null when Forge is not installed. */
+    static Path findForgeArgs(Path versions) {
+        Path base = versions.resolve("libraries/net/minecraftforge/forge");
+        if (!Files.isDirectory(base)) {
+            return null;
+        }
+        String argsName = System.getProperty("os.name", "").toLowerCase().contains("win")
+                ? "win_args.txt" : "unix_args.txt";
+        try (Stream<Path> s = Files.list(base)) {
+            List<Path> dirs = s
+                    .filter(Files::isDirectory)
+                    .sorted(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed())
+                    .toList();
+            for (Path dir : dirs) {
+                Path args = dir.resolve(argsName);
+                if (Files.exists(args)) {
+                    return args;
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
     }
 
     static Path findAgent(Path root) {

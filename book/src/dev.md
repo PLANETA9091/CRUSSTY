@@ -51,7 +51,7 @@ For a launcher-style run, point `run.sh` at the built artifacts:
 
 ```bash
 mkdir -p versions
-cp /path/to/purpur-1.21.10.jar versions/
+cp /path/to/your-server.jar versions/   # any Paper/Purpur/Fabric/Forge/vanilla jar
 # accept the EULA on first boot
 echo "eula=true" > eula.txt
 

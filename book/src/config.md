@@ -6,7 +6,7 @@ memory to give the JVM, and which catalog to install modules from:
 
 ```toml
 [server]
-kernel = "purpur-1.21.10.jar"
+kernel = "paper-1.21.10.jar"   # or purpur-/fabric-/forge-, or any server .jar
 memory = "2G"
 
 [catalog]
@@ -17,7 +17,7 @@ repo = "PLANETA9091/crussty-catalog"
 
 | Section | Key | Default | Meaning |
 |---------|-----|---------|---------|
-| `server` | `kernel` | `purpur-1.21.10.jar` | Kernel jar file name inside `versions/` |
+| `server` | `kernel` | set by `init` | Bootable artifact inside `versions/` — usually a server jar file name; for Forge the installer-generated `libraries/net/minecraftforge/forge/<mc>-<build>/{unix,win}_args.txt` |
 | `server` | `memory` | `2G` | Heap size, passed as `-Xms`/`-Xmx` to the JVM |
 | `catalog` | `repo` | `PLANETA9091/crussty-catalog` | Catalog repo (`owner/name`) used by `crussty install <id>` |
 
@@ -32,7 +32,8 @@ own options from the launcher command line (see
 
 ## Editing
 
-- **Switch kernel version**: download another jar into `versions/` and
+- **Switch kernel version**: download another jar into `versions/` (or re-run
+  `crussty init --platform <p> --version <mc>` in a fresh directory) and
   change `kernel`.
 - **Give the server more memory**: `memory = "4G"` (or `"2048M"`).
 - **Use a different catalog**: point `repo` at any GitHub repo containing a

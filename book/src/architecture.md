@@ -26,7 +26,7 @@ something, start at [Quick Start](./quickstart.md) instead.
 └───────┬──────────────────────────┬─────────────────┘
         │ dlopen (RTLD_LOCAL)      │ CLASS_FILE_LOAD_HOOK
 ┌───────▼──────────┐      ┌────────▼─────────────────────────┐
-│ modules/*.so     │      │ kernel JVM (Purpur/Paper)        │
+│ modules/*.so     │      │ kernel JVM (any server .jar)     │
 │ (cplug-abi only) │◄────►│  every class load, pre-JIT        │
 └──────────────────┘      └──────────────────────────────────┘
 ```
