@@ -26,11 +26,15 @@ const HELPER_CLASS: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper.c
 const HELPER_CLASS_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$1.class");
 const HELPER_CLASS_1_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$1$1.class");
 const HELPER_CLASS_2: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$2.class");
+const HELPER_CLASS_3: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$3.class");
+const HELPER_CLASS_3_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$3$1.class");
 
 const ORIG_BASE: &str = "dev/dist/SdkAsmHelper";
 const ORIG_1: &str = "dev/dist/SdkAsmHelper$1";
 const ORIG_1_1: &str = "dev/dist/SdkAsmHelper$1$1";
 const ORIG_2: &str = "dev/dist/SdkAsmHelper$2";
+const ORIG_3: &str = "dev/dist/SdkAsmHelper$3";
+const ORIG_3_1: &str = "dev/dist/SdkAsmHelper$3$1";
 
 /// Unique base name for THIS module's copy of the helper (and its synthetic
 /// companion classes `$1`, `$1$1`, `$2`). The address of our own static
@@ -57,7 +61,14 @@ fn u16at(b: &[u8], p: usize) -> u16 {
 /// original names. All CP references are by index (not offset), so the
 /// attribute/method section is copied verbatim and stays consistent — the
 /// rewrite never moves code bytes.
-type Renamed = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+type Renamed = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
 fn rename_helper_classes(name: &str) -> Renamed {
     let map = HashMap::from([
@@ -65,12 +76,16 @@ fn rename_helper_classes(name: &str) -> Renamed {
         (ORIG_1, format!("{name}$1")),
         (ORIG_1_1, format!("{name}$1$1")),
         (ORIG_2, format!("{name}$2")),
+        (ORIG_3, format!("{name}$3")),
+        (ORIG_3_1, format!("{name}$3$1")),
     ]);
     (
         rename_class(HELPER_CLASS, &map),
         rename_class(HELPER_CLASS_1, &map),
         rename_class(HELPER_CLASS_1_1, &map),
         rename_class(HELPER_CLASS_2, &map),
+        rename_class(HELPER_CLASS_3, &map),
+        rename_class(HELPER_CLASS_3_1, &map),
     )
 }
 
@@ -185,8 +200,8 @@ pub fn ensure_defined(env: &JniEnv, loader: jni::jobject) -> Option<jni::jclass>
         return Some(*addr as jni::jclass);
     }
     let name = unique_base_name().to_string();
-    let (b, b1, b11, b2) = rename_helper_classes(&name);
-    let (Some(b), Some(b1), Some(b11), Some(b2)) = (b, b1, b11, b2) else {
+    let (b, b1, b11, b2, b3, b31) = rename_helper_classes(&name);
+    let (Some(b), Some(b1), Some(b11), Some(b2), Some(b3), Some(b31)) = (b, b1, b11, b2, b3, b31) else {
         eprintln!("[cplug-sdk] asm: embedded helper class corrupt (rename failed)");
         return None;
     };
@@ -195,8 +210,10 @@ pub fn ensure_defined(env: &JniEnv, loader: jni::jobject) -> Option<jni::jclass>
         &format!("{name}$1"),
         &format!("{name}$1$1"),
         &format!("{name}$2"),
+        &format!("{name}$3"),
+        &format!("{name}$3$1"),
     ];
-    let bytes = [&b[..], &b1[..], &b11[..], &b2[..]];
+    let bytes = [&b[..], &b1[..], &b11[..], &b2[..], &b3[..], &b31[..]];
     let mut outer: Option<jni::jclass> = None; // null until first define
     for (n, by) in names.iter().zip(bytes.iter()) {
         match env.define_class(n, loader, by) {
@@ -305,6 +322,117 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// Spec for the SKIP-GUARD rewrite (op 3): prepend a conditional guard to a
+/// method that either runs the original body (check returns false) or jumps
+/// to a bytecode offset INSIDE the original body (check returns true) — used
+/// by c-entities L2a to skip ItemEntity.tick's physics for resting items
+/// while the vanilla tail (merge gate, age/despawn events) still runs.
+///
+/// `target` is an offset in the ORIGINAL bytecode; the Java helper re-derives
+/// all frames with COMPUTE_FRAMES, but the caller MUST guarantee the skip
+/// path's local/stack types match the original flow at `target` (init_local
+/// sets one local from a no-arg virtual on `this`; end_push pushes one
+/// constant onto the operand stack).
+pub struct SkipGuard<'a> {
+    pub method_name: &'a str,
+    pub method_desc: &'a str,
+    pub check_class: &'a str,
+    pub check_name: &'a str,
+    pub check_desc: &'a str,
+    /// Bytecode offset in the ORIGINAL method the skip path jumps to.
+    pub target: u16,
+    /// (slot, method name, method desc): before jumping, `slot` is set from
+    /// `this.<name>()` (a no-arg virtual returning a reference type). Needed
+    /// when the original flow has a live local of a reference type at the
+    /// target that the skip path would otherwise leave untyped (TOP) — the
+    /// merged frame must stay verifiable.
+    pub init_local: Option<(u8, &'a str, &'a str)>,
+    /// Opcode pushed onto the operand stack before the jump (e.g. 0x04
+    /// iconst_0) when the target instruction consumes a value.
+    pub end_push: Option<u8>,
+}
+
+fn serialize_guard(spec: &SkipGuard) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    out.push(1); // version
+    out.push(3); // op SKIP_GUARD
+    push_str(&mut out, spec.method_name);
+    push_str(&mut out, spec.method_desc);
+    push_str(&mut out, spec.check_class);
+    push_str(&mut out, spec.check_name);
+    push_str(&mut out, spec.check_desc);
+    out.extend_from_slice(&spec.target.to_be_bytes());
+    match spec.init_local {
+        Some((slot, n, d)) => {
+            out.push(1);
+            out.push(slot);
+            push_str(&mut out, n);
+            push_str(&mut out, d);
+        }
+        None => out.push(0),
+    }
+    match spec.end_push {
+        Some(op) => {
+            out.push(1);
+            out.push(op);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// Apply a SKIP-GUARD rewrite through the Java helper (see [`SkipGuard`]).
+pub fn insert_skip_guard(
+    env: &JniEnv,
+    loader: jni::jobject,
+    class_bytes: &[u8],
+    spec: &SkipGuard,
+) -> Option<Vec<u8>> {
+    let cls = ensure_defined(env, loader)?;
+    let mid = env.get_static_method_id(cls, "rewrite", "([B[B)[B")?;
+    let spec_bytes = serialize_guard(spec);
+    let src_arr = env.new_byte_array(class_bytes.len() as i32)?;
+    let src_signed: Vec<i8> = class_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(src_arr, 0, class_bytes.len() as i32, &src_signed);
+    let spec_arr = env.new_byte_array(spec_bytes.len() as i32)?;
+    let spec_signed: Vec<i8> = spec_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(spec_arr, 0, spec_bytes.len() as i32, &spec_signed);
+    let res = env.call_static_object_method(
+        cls,
+        mid,
+        &[
+            jni::jvalue { l: src_arr },
+            jni::jvalue { l: spec_arr },
+        ],
+    );
+    let had_exc = clear_exception(env);
+    env.delete_local_ref(spec_arr);
+    env.delete_local_ref(src_arr);
+    if res.is_null() {
+        if !had_exc {
+            let _ = with_attached(|env| {
+                if let Some(e) = env.get_static_method_id(cls, "lastError", "()Ljava/lang/String;") {
+                    let err = env.call_static_object_method(cls, e, &[]);
+                    if !err.is_null() {
+                        if let Some(msg) = env.get_string_utf(err as jni::jstring) {
+                            eprintln!("[cplug-sdk] asm::insert_skip_guard failed: {msg}");
+                        }
+                        env.delete_local_ref(err);
+                    }
+                }
+                Some(())
+            });
+        }
+        return None;
+    }
+    let arr = res as jni::jbyteArray;
+    let len = env.get_array_length(arr as jni::jarray);
+    let mut signed = vec![0i8; len as usize];
+    env.get_byte_array_region(arr, 0, len, &mut signed);
+    env.delete_local_ref(arr);
+    Some(signed.iter().map(|&b| b as u8).collect())
+}
+
 fn serialize(spec: &ReplaceBody) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + 8 * spec.args.len());
     out.push(1); // version
@@ -395,9 +523,12 @@ mod tests {
     #[test]
     fn rename_preserves_structure_and_changes_this_class() {
         let name = format!("{ORIG_BASE}abc123");
-        let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) =
+            rename_helper_classes(&name);
+        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = match (
+            renamed, renamed1, renamed11, renamed2, renamed3, renamed31,
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
             _ => panic!("rename failed"),
         };
         assert!(
@@ -405,6 +536,8 @@ mod tests {
                 && !renamed1.is_empty()
                 && !renamed11.is_empty()
                 && !renamed2.is_empty()
+                && !renamed3.is_empty()
+                && !renamed31.is_empty()
         );
 
         // this_class name must now be the unique name; CP count unchanged.
@@ -413,6 +546,8 @@ mod tests {
             (HELPER_CLASS_1, &renamed1),
             (HELPER_CLASS_1_1, &renamed11),
             (HELPER_CLASS_2, &renamed2),
+            (HELPER_CLASS_3, &renamed3),
+            (HELPER_CLASS_3_1, &renamed31),
         ] {
             assert_eq!(u16at(orig, 8), u16at(re, 8), "cp_count changed");
             // after the CP come access_flags(2) then this_class (a CP index)
@@ -437,14 +572,16 @@ mod tests {
         // renamed as well: the JVM resolves them to class loads at verify
         // time and would otherwise fail with NoClassDefFoundError.
         let name = format!("{ORIG_BASE}abc123");
-        let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = rename_helper_classes(&name);
+        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = match (
+            renamed, renamed1, renamed11, renamed2, renamed3, renamed31,
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
             _ => panic!("rename failed"),
         };
         // Every Utf8 in each renamed class: bare original names and
         // `L<orig>;` descriptor forms must be gone.
-        for b in [&renamed, &renamed1, &renamed11, &renamed2] {
+        for b in [&renamed, &renamed1, &renamed11, &renamed2, &renamed3, &renamed31] {
             let count = u16at(b, 8) as usize;
             let mut p = 10usize;
             let mut idx = 1usize;
@@ -456,7 +593,7 @@ mod tests {
                     p += 2;
                     let u = String::from_utf8_lossy(&b[p..p + l]).into_owned();
                     p += l;
-                    for orig in [ORIG_1, ORIG_1_1, ORIG_2] {
+                    for orig in [ORIG_1, ORIG_1_1, ORIG_2, ORIG_3, ORIG_3_1] {
                         assert!(
                             u != orig && !u.contains(&format!("L{orig};")),
                             "surviving original ref {orig} in `{u}`"
@@ -487,6 +624,8 @@ mod tests {
             ("$1", HELPER_CLASS_1),
             ("$1$1", HELPER_CLASS_1_1),
             ("$2", HELPER_CLASS_2),
+            ("$3", HELPER_CLASS_3),
+            ("$3$1", HELPER_CLASS_3_1),
         ] {
             assert!(
                 u32::from_be_bytes(b[0..4].try_into().unwrap()) == 0xCAFE_BABE,
