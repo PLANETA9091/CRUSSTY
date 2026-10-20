@@ -10,6 +10,7 @@
 //! on background threads.
 
 use crate::sdk_glob;
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, OnceLock};
 
 type Cb = Box<dyn Fn(&str) + Send + Sync>;
@@ -37,8 +38,41 @@ pub fn register(pattern: &str, cb: impl Fn(&str) + Send + Sync + 'static) {
         .push((pattern.to_string(), Box::new(cb)));
 }
 
+/// Reentrancy guard (DEADLOCK LAW, observed on Paper 1.21.8): a patch
+/// callback that triggers a class load of its own (ASM ClassWriter resolving
+/// bootstrap-method constants, helper classes, …) re-enters the JVMTI
+/// ClassFileLoadHook on the SAME thread. dispatch/dispatch_bytes hold the
+/// registry mutex across callbacks — a nested dispatch then self-deadlocks
+/// on a non-reentrant std::sync::Mutex and, transitively, every other
+/// thread's hook invocation blocks behind the frozen registry. Nested loads
+/// are helper/asm-internal classes — they must pass through UNPATCHED.
+thread_local! {
+    static IN_DISPATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII: sets the flag on create, ALWAYS clears on drop (panic-safe —
+/// a panicking hook body must not permanently disable the thread's hooks).
+struct DispatchGuard;
+impl DispatchGuard {
+    fn try_new() -> Option<Self> {
+        if IN_DISPATCH.with(Cell::get) {
+            return None; // nested load from inside a callback — pass through
+        }
+        IN_DISPATCH.with(|c| c.set(true));
+        Some(Self)
+    }
+}
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        IN_DISPATCH.with(|c| c.set(false));
+    }
+}
+
 /// Dispatch a class name to all matching hooks.
 pub fn dispatch(name: &str) {
+    let Some(_g) = DispatchGuard::try_new() else {
+        return; // nested load from inside a callback — pass through
+    };
     let hooks = registry().lock().unwrap();
     for (pat, cb) in hooks.iter() {
         if sdk_glob::matches(pat, name) {
@@ -64,6 +98,7 @@ pub fn register_bytes(
 /// Apply all byte hooks matching `name` to `data`; returns the final patched
 /// bytes, or None if no hook modified them.
 pub fn dispatch_bytes(name: &str, data: &[u8]) -> Option<Vec<u8>> {
+    let _g = DispatchGuard::try_new()?; // nested → None (unpatched)
     let hooks = byte_registry().lock().unwrap();
     let mut current: Option<Vec<u8>> = None;
     for (pat, cb) in hooks.iter() {
