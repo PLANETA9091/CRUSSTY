@@ -284,165 +284,195 @@ public final class SdkAsmHelper {
         boolean endPush = in.readBoolean();
         int endOpcode = endPush ? in.readUnsignedByte() : 0;
 
-        ClassReader cr = new ClassReader(cls);
-        ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES);
-        final String owner = cr.getClassName();
-        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
-            @Override
-            public MethodVisitor visitMethod(int access, String name, String desc,
-                    String signature, String[] exceptions) {
-                MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
-                if (!name.equals(methodName) || !desc.equals(methodDesc)) {
-                    return mv;
-                }
-                return new MethodVisitor(Opcodes.ASM9, mv) {
-                    private boolean started = false;
-                    private Label l0 = new Label();
-                    private Label lt = new Label();
-
-                    @Override
-                    public void visitCode() {
-                        mv.visitCode();
-                        // guard: if (!check(this)) goto L0 (run the original)
-                        mv.visitVarInsn(Opcodes.ALOAD, 0);
-                        mv.visitMethodInsn(Opcodes.INVOKESTATIC,
-                                checkClass, checkName, checkDesc, false);
-                        mv.visitJumpInsn(Opcodes.IFEQ, l0);
-                        // skip-path setup: initialize the local the original
-                        // flow expects at the target (types must match), push
-                        // the stack value the target consumes, jump.
-                        if (initLocal) {
-                            mv.visitVarInsn(Opcodes.ALOAD, 0);
-                            mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
-                                    owner, initName, initDesc, false);
-                            mv.visitVarInsn(Opcodes.ASTORE, localSlot);
-                        }
-                        if (endPush) {
-                            mv.visitInsn(endOpcode);
-                        }
-                        mv.visitJumpInsn(Opcodes.GOTO, lt);
-                        // original body entry
-                        mv.visitLabel(l0);
-                        started = true;
-                    }
-
-                    // The original body passes through unchanged; only the
-                    // FIRST frame (the implicit offset-0 one) must not be
-                    // re-emitted: the guard instructions precede it. ASM's
-                    // COMPUTE_FRAMES recomputes all frames anyway — we just
-                    // swallow the original frame events and let the writer
-                    // derive them.
-                    @Override
-                    public void visitFrame(int a, int b, Object[] c, int d, Object[] e) {
-                        mv.visitFrame(a, b, c, d, e);
-                    }
-
-                    @Override
-                    public void visitLabel(Label label) {
-                        mv.visitLabel(label);
-                    }
-
-                    // offset tracking to bind LT at the caller's original
-                    // bytecode offset: count instruction lengths as they pass.
-                    private int pos = 0;
-
-                    @Override
-                    public void visitInsn(int opcode) {
-                        bindIfTarget(opcode, 1);
-                        mv.visitInsn(opcode);
-                    }
-
-                    @Override
-                    public void visitIntInsn(int opcode, int operand) {
-                        bindIfTarget(opcode, opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH ? 2 : 1);
-                        mv.visitIntInsn(opcode, operand);
-                    }
-
-                    @Override
-                    public void visitVarInsn(int opcode, int var) {
-                        bindIfTarget(opcode, opcode == Opcodes.RET ? 2 : 1
-                                + ((opcode == Opcodes.LLOAD || opcode == Opcodes.DLOAD
-                                    || opcode == Opcodes.LSTORE || opcode == Opcodes.DSTORE) ? 1 : 0));
-                        mv.visitVarInsn(opcode, var);
-                    }
-
-                    @Override
-                    public void visitTypeInsn(int opcode, String type) {
-                        bindIfTarget(opcode, 3);
-                        mv.visitTypeInsn(opcode, type);
-                    }
-
-                    @Override
-                    public void visitFieldInsn(int opcode, String o, String n, String d) {
-                        bindIfTarget(opcode, 3);
-                        mv.visitFieldInsn(opcode, o, n, d);
-                    }
-
-                    @Override
-                    public void visitMethodInsn(int opcode, String o, String n, String d, boolean itf) {
-                        bindIfTarget(opcode, opcode == Opcodes.INVOKEINTERFACE ? 5 : 3);
-                        mv.visitMethodInsn(opcode, o, n, d, itf);
-                    }
-
-                    @Override
-                    public void visitInvokeDynamicInsn(String n, String d,
-                            org.objectweb.asm.Handle h, Object... bsmArgs) {
-                        bindIfTarget(Opcodes.INVOKEDYNAMIC, 5);
-                        mv.visitInvokeDynamicInsn(n, d, h, bsmArgs);
-                    }
-
-                    @Override
-                    public void visitJumpInsn(int opcode, Label label) {
-                        bindIfTarget(opcode, opcode == 0xc8 /* goto_w */ ? 5 : 3);
-                        mv.visitJumpInsn(opcode, label);
-                    }
-
-                    @Override
-                    public void visitLdcInsn(Object o) {
-                        // offset footprint: LDC = 2 (1 opcode + 1 cpool index),
-                        // LDC2_W (Long/Double) = 3
-                        int sz = (o instanceof Long || o instanceof Double) ? 3 : 2;
-                        bindIfTarget(Opcodes.LDC, sz);
-                        mv.visitLdcInsn(o);
-                    }
-
-                    @Override
-                    public void visitIincInsn(int var, int increment) {
-                        bindIfTarget(Opcodes.IINC, 3);
-                        mv.visitIincInsn(var, increment);
-                    }
-
-                    @Override
-                    public void visitTableSwitchInsn(int min, int max, Label dflt, Label... labels) {
-                        bindIfTarget(Opcodes.TABLESWITCH, 0); // refuse-by-offset: never hit
-                        mv.visitTableSwitchInsn(min, max, dflt, labels);
-                    }
-
-                    @Override
-                    public void visitLookupSwitchInsn(Label dflt, int[] keys, Label[] labels) {
-                        bindIfTarget(Opcodes.LOOKUPSWITCH, 0);
-                        mv.visitLookupSwitchInsn(dflt, keys, labels);
-                    }
-
-                    @Override
-                    public void visitMultiANewArrayInsn(String desc, int dims) {
-                        bindIfTarget(Opcodes.MULTIANEWARRAY, 4);
-                        mv.visitMultiANewArrayInsn(desc, dims);
-                    }
-
-                    private boolean bound = false;
-
-                    private void bindIfTarget(int opcode, int size) {
-                        if (!bound && pos == target) {
-                            mv.visitLabel(lt);
-                            bound = true;
-                        }
-                        pos += size;
-                    }
-                };
+        org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
+        new ClassReader(cls).accept(cn, 0);
+        boolean done = false;
+        for (Object mo : cn.methods) {
+            org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) mo;
+            if (!mn.name.equals(methodName) || !mn.desc.equals(methodDesc)) {
+                continue;
             }
-        }, 0);
+            // Target selection. Runtime class bytes differ from the shipped
+            // jar (Paper re-transforms classes at load), so a hard offset is
+            // fragile. target == 0 selects the built-in merge-interval
+            // pattern of ItemEntity.tick: the istore_2 of
+            //   iconst_0, istore_2, iload_2, ifeq, iconst_2, goto,
+            //   bipush 40, istore_3
+            // (the 2-or-40 merge interval; the skip path lands on the
+            // istore_2 with iconst_0 already pushed -> interval 40 = idle
+            // merge cadence, exactly what a resting item computes).
+            org.objectweb.asm.tree.AbstractInsnNode targetNode = null;
+            if (target == 0) {
+                for (org.objectweb.asm.tree.AbstractInsnNode n = mn.instructions.getFirst();
+                        n != null; n = n.getNext()) {
+                    if (!isIntStore(n, 2)) {
+                        continue;
+                    }
+                    // neighbors skip Label/Frame nodes (they carry no bytecode
+                    // but sit between real instructions in the tree)
+                    org.objectweb.asm.tree.AbstractInsnNode p1 = realPrev(n);
+                    org.objectweb.asm.tree.AbstractInsnNode p2 = realNext(n);
+                    org.objectweb.asm.tree.AbstractInsnNode p3 = realNext(p2);
+                    org.objectweb.asm.tree.AbstractInsnNode p4 = realNext(p3);
+                    org.objectweb.asm.tree.AbstractInsnNode p5 = realNext(p4);
+                    org.objectweb.asm.tree.AbstractInsnNode p6 = realNext(p5);
+                    org.objectweb.asm.tree.AbstractInsnNode p7 = realNext(p6);
+                    org.objectweb.asm.tree.AbstractInsnNode p8 = realNext(p7);
+                    if (p1 == null || p2 == null || p8 == null) {
+                        continue;
+                    }
+                    // the interval store/load may be the compact form
+                    // (istore_2/iload_2) OR the indexed form (istore 2 /
+                    // iload 2) — Paper's runtime transforms use the indexed
+                    // opcodes while javap prints them identically
+                    boolean ok = p1.getOpcode() == Opcodes.ICONST_0
+                            && isIntLoad(p2, 2)
+                            && p3.getOpcode() == Opcodes.IFEQ
+                            && p4.getOpcode() == Opcodes.ICONST_2
+                            && p5.getOpcode() == Opcodes.GOTO
+                            && p6.getOpcode() == Opcodes.BIPUSH
+                            && ((org.objectweb.asm.tree.IntInsnNode) p6).operand == 40
+                            && isIntStore(p7, 3)
+                            && (p8.getOpcode() == Opcodes.ALOAD || p8.getOpcode() == 0x2a /* aload_0 */);
+                    if (ok) {
+                        targetNode = n;
+                        break;
+                    }
+                }
+                if (targetNode == null) {
+                    LAST_ERROR = "skip-guard: merge-interval pattern not found";
+                    return null;
+                }
+            } else {
+                // fallback: hard offset in the original bytecode (size table
+                // walk; kept for non-item weaves where the bytes are stable)
+                int pos = 0;
+                for (org.objectweb.asm.tree.AbstractInsnNode n = mn.instructions.getFirst();
+                        n != null; n = n.getNext()) {
+                    if (pos == target) {
+                        targetNode = n;
+                        break;
+                    }
+                    pos += insnSize(n);
+                    if (pos > target) {
+                        LAST_ERROR = "skip-guard target " + target
+                                + " not on an instruction boundary (landed in " + pos + ")";
+                        return null;
+                    }
+                }
+                if (targetNode == null) {
+                    LAST_ERROR = "skip-guard target " + target + " past method end";
+                    return null;
+                }
+            }
+            org.objectweb.asm.tree.LabelNode lt = new org.objectweb.asm.tree.LabelNode();
+            mn.instructions.insertBefore(targetNode, lt);
+            org.objectweb.asm.tree.InsnList guard = new org.objectweb.asm.tree.InsnList();
+            guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            guard.add(new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKESTATIC,
+                    checkClass, checkName, checkDesc, false));
+            org.objectweb.asm.tree.LabelNode l0 = new org.objectweb.asm.tree.LabelNode();
+            guard.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IFEQ, l0));
+            if (initLocal) {
+                guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+                guard.add(new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                        cn.name, initName, initDesc, false));
+                guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ASTORE, localSlot));
+            }
+            if (endPush) {
+                guard.add(new org.objectweb.asm.tree.InsnNode(endOpcode));
+            }
+            guard.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.GOTO, lt));
+            guard.add(l0);
+            mn.instructions.insert(guard);
+            done = true;
+            break;
+        }
+        if (!done) {
+            LAST_ERROR = "skip-guard: method " + methodName + methodDesc + " not found";
+            return null;
+        }
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        cn.accept(cw);
         return cw.toByteArray();
+    }
+
+    private static boolean isIntStore(org.objectweb.asm.tree.AbstractInsnNode n, int var) {
+        if (n instanceof org.objectweb.asm.tree.VarInsnNode) {
+            org.objectweb.asm.tree.VarInsnNode v = (org.objectweb.asm.tree.VarInsnNode) n;
+            return (v.getOpcode() == 0x3d + var && var <= 3) || (v.getOpcode() == Opcodes.ISTORE && v.var == var);
+        }
+        return false;
+    }
+
+    private static boolean isIntLoad(org.objectweb.asm.tree.AbstractInsnNode n, int var) {
+        if (n instanceof org.objectweb.asm.tree.VarInsnNode) {
+            org.objectweb.asm.tree.VarInsnNode v = (org.objectweb.asm.tree.VarInsnNode) n;
+            return (v.getOpcode() == 0x1a + var && var <= 3) || (v.getOpcode() == Opcodes.ILOAD && v.var == var);
+        }
+        return false;
+    }
+
+    private static org.objectweb.asm.tree.AbstractInsnNode realPrev(
+            org.objectweb.asm.tree.AbstractInsnNode n) {
+        org.objectweb.asm.tree.AbstractInsnNode p = n == null ? null : n.getPrevious();
+        while (p != null && p.getOpcode() == -1) {
+            p = p.getPrevious();
+        }
+        return p;
+    }
+
+    private static org.objectweb.asm.tree.AbstractInsnNode realNext(
+            org.objectweb.asm.tree.AbstractInsnNode n) {
+        org.objectweb.asm.tree.AbstractInsnNode q = n == null ? null : n.getNext();
+        while (q != null && q.getOpcode() == -1) {
+            q = q.getNext();
+        }
+        return q;
+    }
+
+    /** Bytecode length of a tree instruction (JVMS 6.5; no tableswitch/JSR
+     *  handling — the guard target is never inside one for our weaves, and a
+     *  wrong total is caught by the boundary check above). */
+    private static int insnSize(org.objectweb.asm.tree.AbstractInsnNode n) {
+        int op = n.getOpcode();
+        if (op == -1) {
+            return 0; // labels / frames / line numbers carry no bytecode
+        }
+        switch (op) {
+            case Opcodes.BIPUSH:
+            case Opcodes.SIPUSH:
+            case Opcodes.LDC:
+            case Opcodes.ILOAD: case Opcodes.LLOAD: case Opcodes.FLOAD: case Opcodes.DLOAD:
+            case Opcodes.ALOAD:
+            case Opcodes.ISTORE: case Opcodes.LSTORE: case Opcodes.FSTORE: case Opcodes.DSTORE:
+            case Opcodes.ASTORE:
+            case Opcodes.RET:
+                return 2; // opcode + index (wide forms are refused by boundary check)
+            case Opcodes.IFEQ: case Opcodes.IFNE: case Opcodes.IFLT: case Opcodes.IFGE:
+            case Opcodes.IFGT: case Opcodes.IFLE:
+            case Opcodes.IF_ICMPEQ: case Opcodes.IF_ICMPNE: case Opcodes.IF_ICMPLT:
+            case Opcodes.IF_ICMPGE: case Opcodes.IF_ICMPGT: case Opcodes.IF_ICMPLE:
+            case Opcodes.IF_ACMPEQ: case Opcodes.IF_ACMPNE:
+            case Opcodes.GOTO:
+            case Opcodes.GETSTATIC: case Opcodes.PUTSTATIC:
+            case Opcodes.GETFIELD: case Opcodes.PUTFIELD:
+            case Opcodes.INVOKEVIRTUAL: case Opcodes.INVOKESPECIAL: case Opcodes.INVOKESTATIC:
+            case Opcodes.NEW: case Opcodes.ANEWARRAY: case Opcodes.CHECKCAST: case Opcodes.INSTANCEOF:
+            case Opcodes.IINC:
+                return 3;
+            case 0x14: /* ldc2_w */
+            case Opcodes.INVOKEINTERFACE:
+            case Opcodes.INVOKEDYNAMIC:
+            case 0xc8: /* goto_w */
+                return 5;
+            case Opcodes.MULTIANEWARRAY:
+                return 4;
+            case Opcodes.NEWARRAY:
+                return 2; // opcode + atype
+            default:
+                return 1; // consts, stack ops, arithmetic, returns, xload_n/xstore_n...
+        }
     }
 
     private static int loadOpcode(char t) {

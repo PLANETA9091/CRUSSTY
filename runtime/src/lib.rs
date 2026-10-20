@@ -635,6 +635,12 @@ impl Agent for CrusstyRuntime {
                 }
             };
             drop(guard);
+            if std::env::var_os("CRUSSTY_TRACE_HOOKS").is_some() {
+                eprintln!(
+                    "[crussty-trace] '{name}' <- hook rc={rc} out_len={out_len} out_null={}",
+                    out.is_null()
+                );
+            }
             if rc == 0 && !out.is_null() {
                 let mut copy = Vec::with_capacity(out_len);
                 copy.extend_from_slice(unsafe { std::slice::from_raw_parts(out, out_len) });
@@ -1045,14 +1051,23 @@ unsafe extern "C" fn api_retransform_class(name: *const c_char) -> i32 {
         }
     };
     let mut target = None;
+    let mut matches = 0usize;
     for cls in classes {
-        if let Ok((n, _)) = env.get_class_signature(cls) {
-            if n == sig {
-                target = Some(cls);
-                break;
+        if let Ok((n, ref loader)) = env.get_class_signature(cls) {
+            if &n == &sig {
+                matches += 1;
+                let lid = loader.as_ref().map(|l| format!("{:p}", l)).unwrap_or_default();
+                eprintln!(
+                    "[crussty-runtime] retransform {nm}: match #{matches} cls={:p} loader={lid}",
+                    cls
+                );
+                if target.is_none() {
+                    target = Some(cls);
+                }
             }
         }
     }
+    eprintln!("[crussty-runtime] retransform {nm}: total matches={matches}");
     let Some(cls) = target else {
         return -1;
     };

@@ -26,15 +26,11 @@ const HELPER_CLASS: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper.c
 const HELPER_CLASS_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$1.class");
 const HELPER_CLASS_1_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$1$1.class");
 const HELPER_CLASS_2: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$2.class");
-const HELPER_CLASS_3: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$3.class");
-const HELPER_CLASS_3_1: &[u8] = include_bytes!("../asm-build/dev/dist/SdkAsmHelper$3$1.class");
 
 const ORIG_BASE: &str = "dev/dist/SdkAsmHelper";
 const ORIG_1: &str = "dev/dist/SdkAsmHelper$1";
 const ORIG_1_1: &str = "dev/dist/SdkAsmHelper$1$1";
 const ORIG_2: &str = "dev/dist/SdkAsmHelper$2";
-const ORIG_3: &str = "dev/dist/SdkAsmHelper$3";
-const ORIG_3_1: &str = "dev/dist/SdkAsmHelper$3$1";
 
 /// Unique base name for THIS module's copy of the helper (and its synthetic
 /// companion classes `$1`, `$1$1`, `$2`). The address of our own static
@@ -61,14 +57,7 @@ fn u16at(b: &[u8], p: usize) -> u16 {
 /// original names. All CP references are by index (not offset), so the
 /// attribute/method section is copied verbatim and stays consistent — the
 /// rewrite never moves code bytes.
-type Renamed = (
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-);
+type Renamed = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 fn rename_helper_classes(name: &str) -> Renamed {
     let map = HashMap::from([
@@ -76,16 +65,12 @@ fn rename_helper_classes(name: &str) -> Renamed {
         (ORIG_1, format!("{name}$1")),
         (ORIG_1_1, format!("{name}$1$1")),
         (ORIG_2, format!("{name}$2")),
-        (ORIG_3, format!("{name}$3")),
-        (ORIG_3_1, format!("{name}$3$1")),
     ]);
     (
         rename_class(HELPER_CLASS, &map),
         rename_class(HELPER_CLASS_1, &map),
         rename_class(HELPER_CLASS_1_1, &map),
         rename_class(HELPER_CLASS_2, &map),
-        rename_class(HELPER_CLASS_3, &map),
-        rename_class(HELPER_CLASS_3_1, &map),
     )
 }
 
@@ -200,8 +185,8 @@ pub fn ensure_defined(env: &JniEnv, loader: jni::jobject) -> Option<jni::jclass>
         return Some(*addr as jni::jclass);
     }
     let name = unique_base_name().to_string();
-    let (b, b1, b11, b2, b3, b31) = rename_helper_classes(&name);
-    let (Some(b), Some(b1), Some(b11), Some(b2), Some(b3), Some(b31)) = (b, b1, b11, b2, b3, b31) else {
+    let (b, b1, b11, b2) = rename_helper_classes(&name);
+    let (Some(b), Some(b1), Some(b11), Some(b2)) = (b, b1, b11, b2) else {
         eprintln!("[cplug-sdk] asm: embedded helper class corrupt (rename failed)");
         return None;
     };
@@ -210,10 +195,8 @@ pub fn ensure_defined(env: &JniEnv, loader: jni::jobject) -> Option<jni::jclass>
         &format!("{name}$1"),
         &format!("{name}$1$1"),
         &format!("{name}$2"),
-        &format!("{name}$3"),
-        &format!("{name}$3$1"),
     ];
-    let bytes = [&b[..], &b1[..], &b11[..], &b2[..], &b3[..], &b31[..]];
+    let bytes = [&b[..], &b1[..], &b11[..], &b2[..]];
     let mut outer: Option<jni::jclass> = None; // null until first define
     for (n, by) in names.iter().zip(bytes.iter()) {
         match env.define_class(n, loader, by) {
@@ -523,12 +506,9 @@ mod tests {
     #[test]
     fn rename_preserves_structure_and_changes_this_class() {
         let name = format!("{ORIG_BASE}abc123");
-        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) =
-            rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = match (
-            renamed, renamed1, renamed11, renamed2, renamed3, renamed31,
-        ) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+        let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
+        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => panic!("rename failed"),
         };
         assert!(
@@ -536,8 +516,6 @@ mod tests {
                 && !renamed1.is_empty()
                 && !renamed11.is_empty()
                 && !renamed2.is_empty()
-                && !renamed3.is_empty()
-                && !renamed31.is_empty()
         );
 
         // this_class name must now be the unique name; CP count unchanged.
@@ -546,8 +524,6 @@ mod tests {
             (HELPER_CLASS_1, &renamed1),
             (HELPER_CLASS_1_1, &renamed11),
             (HELPER_CLASS_2, &renamed2),
-            (HELPER_CLASS_3, &renamed3),
-            (HELPER_CLASS_3_1, &renamed31),
         ] {
             assert_eq!(u16at(orig, 8), u16at(re, 8), "cp_count changed");
             // after the CP come access_flags(2) then this_class (a CP index)
@@ -572,16 +548,14 @@ mod tests {
         // renamed as well: the JVM resolves them to class loads at verify
         // time and would otherwise fail with NoClassDefFoundError.
         let name = format!("{ORIG_BASE}abc123");
-        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2, renamed3, renamed31) = match (
-            renamed, renamed1, renamed11, renamed2, renamed3, renamed31,
-        ) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+        let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
+        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => panic!("rename failed"),
         };
         // Every Utf8 in each renamed class: bare original names and
         // `L<orig>;` descriptor forms must be gone.
-        for b in [&renamed, &renamed1, &renamed11, &renamed2, &renamed3, &renamed31] {
+        for b in [&renamed, &renamed1, &renamed11, &renamed2] {
             let count = u16at(b, 8) as usize;
             let mut p = 10usize;
             let mut idx = 1usize;
@@ -593,7 +567,7 @@ mod tests {
                     p += 2;
                     let u = String::from_utf8_lossy(&b[p..p + l]).into_owned();
                     p += l;
-                    for orig in [ORIG_1, ORIG_1_1, ORIG_2, ORIG_3, ORIG_3_1] {
+                    for orig in [ORIG_1, ORIG_1_1, ORIG_2] {
                         assert!(
                             u != orig && !u.contains(&format!("L{orig};")),
                             "surviving original ref {orig} in `{u}`"
@@ -624,8 +598,6 @@ mod tests {
             ("$1", HELPER_CLASS_1),
             ("$1$1", HELPER_CLASS_1_1),
             ("$2", HELPER_CLASS_2),
-            ("$3", HELPER_CLASS_3),
-            ("$3$1", HELPER_CLASS_3_1),
         ] {
             assert!(
                 u32::from_be_bytes(b[0..4].try_into().unwrap()) == 0xCAFE_BABE,
