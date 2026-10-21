@@ -52,6 +52,14 @@ import org.objectweb.asm.Opcodes;
  *     u8   fieldCount
  *     String name x fieldCount   (field name, u16 len + UTF-8)
  *     String desc x fieldCount    (field descriptor)
+ *   op 3 SKIP_GUARD:
+ *     String methodName, String methodDesc, String checkClass,
+ *     String checkName, String checkDesc, u16 target, u8 hasInitLocal
+ *     [u8 localSlot, String initName, String initDesc], u8 hasEndPush
+ *     [u8 endOpcode]
+ *   op 4 EARLY_RETURN_GUARD:
+ *     String methodName, String methodDesc, String checkClass,
+ *     String checkName, String checkDesc
  */
 public final class SdkAsmHelper {
 
@@ -81,6 +89,8 @@ public final class SdkAsmHelper {
                     return makeFieldsPublic(cls, in);
                 case 3:
                     return insertSkipGuard(cls, in);
+                case 4:
+                    return insertEarlyReturnGuard(cls, in);
                 default:
                     LAST_ERROR = "unknown op " + op;
                     return null;
@@ -390,6 +400,60 @@ public final class SdkAsmHelper {
         }
         if (!done) {
             LAST_ERROR = "skip-guard: method " + methodName + methodDesc + " not found";
+            return null;
+        }
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        cn.accept(cw);
+        return cw.toByteArray();
+    }
+
+    // ------------------------------------------------------------------
+    // op 4: conditional early-return guard (c-entities L3, Rust merge
+    // broad-phase).
+    //
+    // Emits at the method start:
+    //   aload_0
+    //   invokestatic checkClass.checkName(checkDesc)   // (this-type)Z
+    //   ifeq L0                                        // false -> original body
+    //   <return opcode of the method's return type>    // true -> done
+    //   L0: <original body>
+    //
+    // Used for ItemEntity.mergeWithNeighbours()V: the fast path performs the
+    // whole neighbour merge through the Rust index and returns true; false
+    // falls through to the vanilla body (exact mirror).
+    // COMPUTE_FRAMES re-derives all frames; the guard consumes no locals and
+    // leaves the operand stack empty on both paths.
+    // ------------------------------------------------------------------
+    private static byte[] insertEarlyReturnGuard(byte[] cls, DataInputStream in) throws IOException {
+        String methodName = in.readUTF();
+        String methodDesc = in.readUTF();
+        String checkClass = in.readUTF();
+        String checkName = in.readUTF();
+        String checkDesc = in.readUTF();
+
+        org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
+        new ClassReader(cls).accept(cn, 0);
+        boolean done = false;
+        for (Object mo : cn.methods) {
+            org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) mo;
+            if (!mn.name.equals(methodName) || !mn.desc.equals(methodDesc)) {
+                continue;
+            }
+            org.objectweb.asm.tree.InsnList guard = new org.objectweb.asm.tree.InsnList();
+            guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            guard.add(new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKESTATIC,
+                    checkClass, checkName, checkDesc, false));
+            org.objectweb.asm.tree.LabelNode l0 = new org.objectweb.asm.tree.LabelNode();
+            guard.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IFEQ, l0));
+            guard.add(new org.objectweb.asm.tree.InsnNode(
+                    returnOpcode(methodDesc.charAt(methodDesc.length() - 1))));
+            guard.add(l0);
+            mn.instructions.insert(guard);
+            done = true;
+            break;
+        }
+        if (!done) {
+            LAST_ERROR = "early-return-guard: method " + methodName + methodDesc + " not found";
             return null;
         }
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);

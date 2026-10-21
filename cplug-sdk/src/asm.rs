@@ -495,9 +495,90 @@ pub fn replace_body(
     Some(signed.iter().map(|&b| b as u8).collect())
 }
 
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
+/// Spec for the EARLY-RETURN-GUARD rewrite (op 4): prepend a conditional
+/// guard to a VOID-or-value method that either returns immediately (check
+/// returns true — the fast path performed the method's whole job) or falls
+/// through to the original body (check returns false). Used by c-entities
+/// L3 for ItemEntity.mergeWithNeighbours: the Rust broad-phase resolves the
+/// whole neighbour merge and returns true; any uncertainty returns false and
+/// the vanilla body runs untouched.
+///
+/// The guard consumes only `this` and leaves the operand stack empty on both
+/// paths, so COMPUTE_FRAMES re-derives every frame with no caller contract
+/// beyond the check method's descriptor `(Lthis-type;)Z`.
+pub struct EarlyReturnGuard<'a> {
+    pub method_name: &'a str,
+    pub method_desc: &'a str,
+    pub check_class: &'a str,
+    pub check_name: &'a str,
+    pub check_desc: &'a str,
+}
+
+fn serialize_early_return(spec: &EarlyReturnGuard) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.push(1); // version
+    out.push(4); // op EARLY_RETURN_GUARD
+    push_str(&mut out, spec.method_name);
+    push_str(&mut out, spec.method_desc);
+    push_str(&mut out, spec.check_class);
+    push_str(&mut out, spec.check_name);
+    push_str(&mut out, spec.check_desc);
+    out
+}
+
+/// Apply an EARLY-RETURN-GUARD rewrite to `class_bytes` through the Java
+/// helper. Returns the rewritten class bytes, or None (lastError() printed
+/// on failure). The helper class must already be defined in `loader`.
+pub fn insert_early_return_guard(
+    env: &JniEnv,
+    loader: jni::jobject,
+    class_bytes: &[u8],
+    spec: &EarlyReturnGuard,
+) -> Option<Vec<u8>> {
+    let cls = ensure_defined(env, loader)?;
+    let mid = env.get_static_method_id(cls, "rewrite", "([B[B)[B")?;
+    let spec_bytes = serialize_early_return(spec);
+    let src_arr = env.new_byte_array(class_bytes.len() as i32)?;
+    let src_signed: Vec<i8> = class_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(src_arr, 0, class_bytes.len() as i32, &src_signed);
+    let spec_arr = env.new_byte_array(spec_bytes.len() as i32)?;
+    let spec_signed: Vec<i8> = spec_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(spec_arr, 0, spec_bytes.len() as i32, &spec_signed);
+    let res = env.call_static_object_method(
+        cls,
+        mid,
+        &[
+            jni::jvalue { l: src_arr },
+            jni::jvalue { l: spec_arr },
+        ],
+    );
+    let had_exc = clear_exception(env);
+    env.delete_local_ref(spec_arr);
+    env.delete_local_ref(src_arr);
+    if res.is_null() {
+        if !had_exc {
+            let _ = with_attached(|env| {
+                if let Some(e) = env.get_static_method_id(cls, "lastError", "()Ljava/lang/String;") {
+                    let err = env.call_static_object_method(cls, e, &[]);
+                    if !err.is_null() {
+                        if let Some(msg) = env.get_string_utf(err as jni::jstring) {
+                            eprintln!("[cplug-sdk] asm::insert_early_return_guard failed: {msg}");
+                        }
+                        env.delete_local_ref(err);
+                    }
+                }
+                Some(())
+            });
+        }
+        return None;
+    }
+    let arr = res as jni::jbyteArray;
+    let len = env.get_array_length(arr as jni::jarray);
+    let mut signed = vec![0i8; len as usize];
+    env.get_byte_array_region(arr, 0, len, &mut signed);
+    env.delete_local_ref(arr);
+    Some(signed.iter().map(|&b| b as u8).collect())
+}
 
 #[cfg(test)]
 mod tests {
