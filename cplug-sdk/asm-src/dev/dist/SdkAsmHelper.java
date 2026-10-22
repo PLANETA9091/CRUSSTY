@@ -409,14 +409,22 @@ public final class SdkAsmHelper {
 
     // ------------------------------------------------------------------
     // op 4: conditional early-return guard (c-entities L3, Rust merge
-    // broad-phase).
+    // broad-phase; L7 dispatch takeover).
     //
     // Emits at the method start:
-    //   aload_0
-    //   invokestatic checkClass.checkName(checkDesc)   // (this-type)Z
+    //   <receiver local>
+    //   invokestatic checkClass.checkName(checkDesc)   // (receiver-type)Z
     //   ifeq L0                                        // false -> original body
     //   <return opcode of the method's return type>    // true -> done
     //   L0: <original body>
+    //
+    // RECEIVER LOCAL SELECTION (L7): the guard predicate receives `this`
+    // (local 0) for methods with no reference parameters (e.g. the
+    // ItemEntity.tick()V guard). When the method's FIRST parameter is a
+    // reference type (L...; or [...), the predicate receives THAT argument
+    // (local 1) instead — the dispatch guard on
+    // ServerLevel.tickNonPassenger(Entity)V must see the ENTITY, not the
+    // level. Primitive-first-arg methods keep the old local-0 behavior.
     //
     // Used for ItemEntity.mergeWithNeighbours()V: the fast path performs the
     // whole neighbour merge through the Rust index and returns true; false
@@ -440,7 +448,12 @@ public final class SdkAsmHelper {
                 continue;
             }
             org.objectweb.asm.tree.InsnList guard = new org.objectweb.asm.tree.InsnList();
-            guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            String dsc = mn.desc;
+            int recvLocal = 0;
+            if (dsc.length() > 1 && (dsc.charAt(1) == 'L' || dsc.charAt(1) == '[')) {
+                recvLocal = 1;
+            }
+            guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, recvLocal));
             guard.add(new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKESTATIC,
                     checkClass, checkName, checkDesc, false));
             org.objectweb.asm.tree.LabelNode l0 = new org.objectweb.asm.tree.LabelNode();
