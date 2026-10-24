@@ -580,6 +580,85 @@ pub fn insert_early_return_guard(
     Some(signed.iter().map(|&b| b as u8).collect())
 }
 
+/// Op 5: the receiver+first-argument variant. The check receives
+/// `(receiver, firstArg)` — whatever the first argument's type — and must
+/// be a pure read; `true` skips the method body wholesale. COMPUTE_FRAMES
+/// rebuilds every StackMapTable frame (the branch merge at the original
+/// body start is always valid).
+pub struct EarlyReturnGuard2<'a> {
+    pub method_name: &'a str,
+    pub method_desc: &'a str,
+    pub check_class: &'a str,
+    pub check_name: &'a str,
+    pub check_desc: &'a str,
+}
+
+fn serialize_early_return2(spec: &EarlyReturnGuard2) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.push(1); // version
+    out.push(5); // op EARLY_RETURN_GUARD2
+    push_str(&mut out, spec.method_name);
+    push_str(&mut out, spec.method_desc);
+    push_str(&mut out, spec.check_class);
+    push_str(&mut out, spec.check_name);
+    push_str(&mut out, spec.check_desc);
+    out
+}
+
+/// Apply an EARLY-RETURN-GUARD2 rewrite through the Java helper. Same
+/// contract as insert_early_return_guard; the check signature must be
+/// `(Lreceiver;X)Z` with X = the method's first parameter type.
+pub fn insert_early_return_guard2(
+    env: &JniEnv,
+    loader: jni::jobject,
+    class_bytes: &[u8],
+    spec: &EarlyReturnGuard2,
+) -> Option<Vec<u8>> {
+    let cls = ensure_defined(env, loader)?;
+    let mid = env.get_static_method_id(cls, "rewrite", "([B[B)[B")?;
+    let spec_bytes = serialize_early_return2(spec);
+    let src_arr = env.new_byte_array(class_bytes.len() as i32)?;
+    let src_signed: Vec<i8> = class_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(src_arr, 0, class_bytes.len() as i32, &src_signed);
+    let spec_arr = env.new_byte_array(spec_bytes.len() as i32)?;
+    let spec_signed: Vec<i8> = spec_bytes.iter().map(|&b| b as i8).collect();
+    env.set_byte_array_region(spec_arr, 0, spec_bytes.len() as i32, &spec_signed);
+    let res = env.call_static_object_method(
+        cls,
+        mid,
+        &[
+            jni::jvalue { l: src_arr },
+            jni::jvalue { l: spec_arr },
+        ],
+    );
+    let had_exc = clear_exception(env);
+    env.delete_local_ref(spec_arr);
+    env.delete_local_ref(src_arr);
+    if res.is_null() {
+        if !had_exc {
+            let _ = with_attached(|env| {
+                if let Some(e) = env.get_static_method_id(cls, "lastError", "()Ljava/lang/String;") {
+                    let err = env.call_static_object_method(cls, e, &[]);
+                    if !err.is_null() {
+                        if let Some(msg) = env.get_string_utf(err as jni::jstring) {
+                            eprintln!("[cplug-sdk] asm::insert_early_return_guard2 failed: {msg}");
+                        }
+                        env.delete_local_ref(err);
+                    }
+                }
+                Some(())
+            });
+        }
+        return None;
+    }
+    let arr = res as jni::jbyteArray;
+    let len = env.get_array_length(arr as jni::jarray);
+    let mut signed = vec![0i8; len as usize];
+    env.get_byte_array_region(arr, 0, len, &mut signed);
+    env.delete_local_ref(arr);
+    Some(signed.iter().map(|&b| b as u8).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

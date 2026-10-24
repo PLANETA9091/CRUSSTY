@@ -60,6 +60,16 @@ import org.objectweb.asm.Opcodes;
  *   op 4 EARLY_RETURN_GUARD:
  *     String methodName, String methodDesc, String checkClass,
  *     String checkName, String checkDesc
+ *   op 5 EARLY_RETURN_GUARD2 (receiver + first argument):
+ *     String methodName, String methodDesc, String checkClass,
+ *     String checkName, String checkDesc
+ *     The check receives local 0 (receiver) AND the method's first
+ *     argument, whatever its type (ref aload, int-family iload, J/F/D
+ *     lload/fload/dload). Needed when the decision depends on BOTH the
+ *     receiver state and the argument (c-entities L15c:
+ *     TrackedEntity.moonrise$tick(chunk): chunk==null AND the tracker
+ *     already cleared). COMPUTE_FRAMES rebuilds every frame, so the
+ *     branch merge at the original body start is always valid.
  */
 public final class SdkAsmHelper {
 
@@ -91,6 +101,8 @@ public final class SdkAsmHelper {
                     return insertSkipGuard(cls, in);
                 case 4:
                     return insertEarlyReturnGuard(cls, in);
+                case 5:
+                    return insertEarlyReturnGuard2(cls, in);
                 default:
                     LAST_ERROR = "unknown op " + op;
                     return null;
@@ -467,6 +479,69 @@ public final class SdkAsmHelper {
         }
         if (!done) {
             LAST_ERROR = "early-return-guard: method " + methodName + methodDesc + " not found";
+            return null;
+        }
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        cn.accept(cw);
+        return cw.toByteArray();
+    }
+
+    // ------------------------------------------------------------------
+    // op 5: conditional early-return guard receiving the receiver AND the
+    // first argument (c-entities L15c). Same shape as op 4, but the check
+    // call loads local 0 first and then the first argument with the load
+    // opcode its descriptor char demands. COMPUTE_FRAMES re-derives every
+    // frame, so the merge at the original body start needs no manual
+    // StackMapTable work.
+    // ------------------------------------------------------------------
+    private static byte[] insertEarlyReturnGuard2(byte[] cls, DataInputStream in) throws IOException {
+        String methodName = in.readUTF();
+        String methodDesc = in.readUTF();
+        String checkClass = in.readUTF();
+        String checkName = in.readUTF();
+        String checkDesc = in.readUTF();
+
+        org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
+        new ClassReader(cls).accept(cn, 0);
+        boolean done = false;
+        for (Object mo : cn.methods) {
+            org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) mo;
+            if (!mn.name.equals(methodName) || !mn.desc.equals(methodDesc)) {
+                continue;
+            }
+            String dsc = mn.desc;
+            if (dsc.length() < 3) {
+                LAST_ERROR = "early-return-guard2: method has no arguments";
+                return null;
+            }
+            org.objectweb.asm.tree.InsnList guard = new org.objectweb.asm.tree.InsnList();
+            guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            char first = dsc.charAt(1);
+            int loadOp;
+            switch (first) {
+                case 'L': case '[': loadOp = Opcodes.ALOAD; break;
+                case 'I': case 'Z': case 'B': case 'C': case 'S': loadOp = Opcodes.ILOAD; break;
+                case 'J': loadOp = Opcodes.LLOAD; break;
+                case 'F': loadOp = Opcodes.FLOAD; break;
+                case 'D': loadOp = Opcodes.DLOAD; break;
+                default:
+                    LAST_ERROR = "early-return-guard2: bad first param " + first;
+                    return null;
+            }
+            guard.add(new org.objectweb.asm.tree.VarInsnNode(loadOp, 1));
+            guard.add(new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKESTATIC,
+                    checkClass, checkName, checkDesc, false));
+            org.objectweb.asm.tree.LabelNode l0 = new org.objectweb.asm.tree.LabelNode();
+            guard.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IFEQ, l0));
+            guard.add(new org.objectweb.asm.tree.InsnNode(
+                    returnOpcode(methodDesc.charAt(methodDesc.length() - 1))));
+            guard.add(l0);
+            mn.instructions.insert(guard);
+            done = true;
+            break;
+        }
+        if (!done) {
+            LAST_ERROR = "early-return-guard2: method " + methodName + methodDesc + " not found";
             return null;
         }
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
