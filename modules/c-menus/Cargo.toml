@@ -1,0 +1,22 @@
+[package]
+name = "cmenus"
+version = "0.1.0"
+edition = "2021"
+description = "c-menus: fully customizable animated menus for CRUSSTY (display entities + core shaders), Paper 26.3"
+
+[workspace]
+exclude = ["cplug-abi", "cplug-sdk"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cplug-abi = { path = "cplug-abi" }
+cplug-sdk = { path = "cplug-sdk" }
+jvmti-bindings = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1_smol = "1"
+
+[profile.release]
+opt-level = 2

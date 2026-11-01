@@ -1,0 +1,6 @@
+{
+  "id": "c-menus",
+  "version": "0.1.0",
+  "main": "libcmenus.so",
+  "description": "Fully customizable animated in-world menus (display entities + core shaders) for Paper 26.3"
+}

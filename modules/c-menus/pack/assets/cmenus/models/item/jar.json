@@ -1,0 +1,60 @@
+{
+  "credit": "c-menus cobalt powder jar",
+  "texture_size": [16, 16],
+  "textures": {
+    "glass": "cmenus:item/jar_glass",
+    "powder": "cmenus:item/jar_powder",
+    "lid": "cmenus:item/jar_lid",
+    "particle": "cmenus:item/jar_powder"
+  },
+  "elements": [
+    {
+      "name": "powder_fill",
+      "from": [3, 0.5, 3],
+      "to": [13, 6.5, 13],
+      "faces": {
+        "north": {"uv": [3, 9.5, 13, 15.5], "texture": "#powder"},
+        "south": {"uv": [3, 9.5, 13, 15.5], "texture": "#powder"},
+        "east":  {"uv": [3, 9.5, 13, 15.5], "texture": "#powder"},
+        "west":  {"uv": [3, 9.5, 13, 15.5], "texture": "#powder"},
+        "up":    {"uv": [3, 3, 13, 13], "texture": "#powder"},
+        "down":  {"uv": [3, 3, 13, 13], "texture": "#powder"}
+      }
+    },
+    {
+      "name": "glass_body",
+      "from": [2, 0, 2],
+      "to": [14, 12, 14],
+      "faces": {
+        "north": {"uv": [2, 4, 14, 16], "texture": "#glass"},
+        "south": {"uv": [2, 4, 14, 16], "texture": "#glass"},
+        "east":  {"uv": [2, 4, 14, 16], "texture": "#glass"},
+        "west":  {"uv": [2, 4, 14, 16], "texture": "#glass"},
+        "down":  {"uv": [2, 2, 14, 14], "texture": "#glass"}
+      }
+    },
+    {
+      "name": "lid",
+      "from": [1, 12, 1],
+      "to": [15, 15.5, 15],
+      "faces": {
+        "north": {"uv": [1, 0.5, 15, 4], "texture": "#lid"},
+        "south": {"uv": [1, 0.5, 15, 4], "texture": "#lid"},
+        "east":  {"uv": [1, 0.5, 15, 4], "texture": "#lid"},
+        "west":  {"uv": [1, 0.5, 15, 4], "texture": "#lid"},
+        "up":    {"uv": [1, 1, 15, 15], "texture": "#lid"},
+        "down":  {"uv": [1, 1, 15, 15], "texture": "#lid"}
+      }
+    }
+  ],
+  "display": {
+    "fixed": {
+      "translation": [0, -3, 0],
+      "scale": [1, 1, 1]
+    },
+    "gui": {
+      "translation": [0, 1, 0],
+      "scale": [1.1, 1.1, 1.1]
+    }
+  }
+}

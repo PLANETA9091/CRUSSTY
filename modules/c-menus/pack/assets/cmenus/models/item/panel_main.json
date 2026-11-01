@@ -1,0 +1,7 @@
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "cmenus:ui/panel_main",
+    "layer1": "cmenus:ui/panel_sheen"
+  }
+}

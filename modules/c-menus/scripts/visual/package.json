@@ -1,0 +1,15 @@
+{
+  "name": "c-menus-visual",
+  "private": true,
+  "type": "module",
+  "description": "c-menus visual harness: golden-frame tests in headless chromium",
+  "scripts": {
+    "test": "node visual_test.mjs",
+    "update-golden": "node visual_test.mjs --update-golden"
+  },
+  "dependencies": {
+    "pixelmatch": "^7.0.0",
+    "playwright-core": "^1.58.0",
+    "pngjs": "^7.0.0"
+  }
+}

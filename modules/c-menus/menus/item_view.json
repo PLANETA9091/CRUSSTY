@@ -1,0 +1,1272 @@
+{
+  "id": "item_view",
+  "anchor": {
+    "mode": "hud",
+    "distance": 3.8,
+    "height": -0.25,
+    "yaw_offset": 0
+  },
+  "pages": 0,
+  "on_open": [
+    {
+      "type": "sound",
+      "sound": "minecraft:block.note_block.chime",
+      "volume": 0.7,
+      "pitch": 1.3
+    }
+  ],
+  "on_close": [
+    {
+      "type": "sound",
+      "sound": "minecraft:block.note_block.hat",
+      "volume": 0.6,
+      "pitch": 0.8
+    }
+  ],
+  "elements": [
+    {
+      "id": "bg_main",
+      "type": "model",
+      "model": "panel_main",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.7,
+        2.3,
+        1.0
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 0,
+          "dur": 10,
+          "ease": "out_cubic",
+          "from": {
+            "scale": 0.9,
+            "rot_y": -4
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 8,
+          "ease": "in_cubic",
+          "to": {
+            "scale": 0.88,
+            "rot_y": 3
+          }
+        }
+      }
+    },
+    {
+      "id": "bg_right",
+      "type": "model",
+      "model": "panel_dark",
+      "pos": [
+        1.02,
+        0.0,
+        0.02
+      ],
+      "scale": [
+        1.62,
+        2.3,
+        1.0
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 2,
+          "dur": 10,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              0.4,
+              0,
+              0
+            ]
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 8,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0.5,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "title",
+      "type": "text",
+      "text": "&b&lКобальтовая пыль",
+      "bg": "",
+      "pos": [
+        -1.55,
+        0.78,
+        0.3
+      ],
+      "hit": [
+        1.7,
+        0.4,
+        0.4
+      ],
+      "line_width": 240,
+      "anim": {
+        "enter": {
+          "delay": 2,
+          "dur": 11,
+          "ease": "out_back",
+          "from": {
+            "offset": [
+              0,
+              -0.3,
+              0
+            ],
+            "scale": 0.7
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 6,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0,
+              0.2,
+              0
+            ]
+          }
+        }
+      },
+      "on_click": {
+        "right": [
+          {
+            "type": "sound",
+            "sound": "minecraft:ui.button.click",
+            "volume": 0.8,
+            "pitch": 1.4
+          },
+          {
+            "type": "msg",
+            "text": "&bКобальтовая пыль &7— красный камень нового поколения"
+          }
+        ]
+      },
+      "scale": [
+        1.45,
+        1.45,
+        1.0
+      ]
+    },
+    {
+      "id": "desc",
+      "type": "text",
+      "text": "&7Красная пыль, спечённая\n&7в кобальтовый концентрат.\n&8Красный камень вдоль стен\n&8и потолков шахт.",
+      "bg": "",
+      "pos": [
+        -1.55,
+        0.5,
+        0.3
+      ],
+      "hit": [
+        1.7,
+        0.5,
+        0.4
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 4,
+          "dur": 10,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              -0.25,
+              0,
+              0
+            ]
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 5,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              -0.2,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "hints",
+      "type": "text",
+      "text": "&eПКМ&7 — высыпать\n&eЛКМ&7 — подмести",
+      "bg": "#9A101418",
+      "pos": [
+        -1.55,
+        -0.82,
+        0.3
+      ],
+      "hit": [
+        1.2,
+        0.42,
+        0.4
+      ],
+      "line_width": 180,
+      "anim": {
+        "enter": {
+          "delay": 6,
+          "dur": 10,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              0,
+              0.2,
+              0
+            ],
+            "bg_alpha": 0
+          }
+        },
+        "hover": {
+          "dur": 4,
+          "ease": "out_quint",
+          "scale": 1.03,
+          "bg_alpha_add": 0.25
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 5,
+          "ease": "in_cubic",
+          "to": {
+            "bg_alpha": 0
+          }
+        }
+      },
+      "on_hover": [
+        {
+          "type": "sound",
+          "sound": "minecraft:block.note_block.hat",
+          "volume": 0.35,
+          "pitch": 1.8
+        }
+      ]
+    },
+    {
+      "id": "jar",
+      "type": "model",
+      "model": "jar",
+      "pos": [
+        -0.62,
+        -0.42,
+        0.5
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "hit": [
+        0.8,
+        1.0,
+        0.5
+      ],
+      "anim": {
+        "enter": {
+          "delay": 0,
+          "dur": 14,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.3,
+            "rot_y": -120
+          }
+        },
+        "idle": {
+          "spin": {
+            "period": 240
+          },
+          "float": {
+            "amp": 0.022,
+            "period": 85
+          }
+        },
+        "hover": {
+          "dur": 5,
+          "ease": "out_quint",
+          "scale": 1.07,
+          "lift": 0.02
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 9,
+          "ease": "in_cubic",
+          "to": {
+            "scale": 0.25,
+            "rot_y": 90
+          }
+        }
+      },
+      "on_hover": [
+        {
+          "type": "sound",
+          "sound": "minecraft:block.note_block.hat",
+          "volume": 0.35,
+          "pitch": 1.4
+        }
+      ],
+      "on_click": {
+        "right": [
+          {
+            "type": "sound",
+            "sound": "minecraft:block.note_block.pling",
+            "volume": 0.9,
+            "pitch": 0.7
+          },
+          {
+            "type": "event",
+            "event": "cmenus/pour",
+            "payload": {
+              "item": "cobalt_dust",
+              "amount": 1
+            }
+          },
+          {
+            "type": "msg",
+            "text": "&b✓ &7Кобальтовая пыль высыпана"
+          }
+        ],
+        "left": [
+          {
+            "type": "sound",
+            "sound": "minecraft:block.note_block.pling",
+            "volume": 0.8,
+            "pitch": 1.1
+          },
+          {
+            "type": "event",
+            "event": "cmenus/sweep",
+            "payload": {
+              "item": "cobalt_dust"
+            }
+          },
+          {
+            "type": "msg",
+            "text": "&7Пыль подметена &8(дурнинько)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stats_title",
+      "type": "text",
+      "text": "&f&lХАРАКТЕРИСТИКИ",
+      "bg": "",
+      "pos": [
+        0.42,
+        0.78,
+        0.3
+      ],
+      "hit": [
+        1.4,
+        0.24,
+        0.4
+      ],
+      "line_width": 200,
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 5,
+          "dur": 9,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              0.3,
+              0,
+              0
+            ]
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 5,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0.25,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "stats_rows",
+      "type": "text",
+      "text": "&7Количество:  &f1\n&7Прочность:   &f16/16\n&7В пачке:     &f1",
+      "bg": "",
+      "pos": [
+        0.42,
+        0.52,
+        0.3
+      ],
+      "hit": [
+        1.4,
+        0.6,
+        0.4
+      ],
+      "line_width": 200,
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 6,
+          "dur": 9,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              0.3,
+              0,
+              0
+            ]
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 5,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0.25,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "craft_title",
+      "type": "text",
+      "text": "&f&lКРАФТ",
+      "bg": "",
+      "pos": [
+        0.42,
+        0.1,
+        0.3
+      ],
+      "hit": [
+        1.4,
+        0.24,
+        0.4
+      ],
+      "line_width": 200,
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 7,
+          "dur": 9,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              0.3,
+              0,
+              0
+            ]
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 5,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0.25,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_0",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.44,
+        -0.18,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 8,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_1",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.72,
+        -0.18,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 9,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_2",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        1.0,
+        -0.18,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 10,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_3",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.44,
+        -0.46,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 9,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_4",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.72,
+        -0.46,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 10,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_5",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        1.0,
+        -0.46,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 11,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_6",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.44,
+        -0.74,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 10,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_7",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        0.72,
+        -0.74,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 11,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "cell_8",
+      "type": "model",
+      "model": "cell",
+      "pos": [
+        1.0,
+        -0.74,
+        0.35
+      ],
+      "scale": [
+        0.28,
+        0.28,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 12,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p1",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        0.44,
+        -0.18,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 10,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p2",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        0.72,
+        -0.18,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 11,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p3",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        1.0,
+        -0.18,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 12,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p4",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        0.44,
+        -0.46,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 11,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_ring",
+      "type": "model",
+      "model": "ring",
+      "pos": [
+        0.72,
+        -0.46,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hit": [
+        0.3,
+        0.3,
+        0.4
+      ],
+      "anim": {
+        "enter": {
+          "delay": 12,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": 180
+          }
+        },
+        "hover": {
+          "dur": 4,
+          "ease": "out_quint",
+          "scale": 1.15,
+          "lift": 0.015
+        }
+      },
+      "on_hover": [
+        {
+          "type": "sound",
+          "sound": "minecraft:block.note_block.hat",
+          "volume": 0.35,
+          "pitch": 2.0
+        }
+      ],
+      "on_click": {
+        "right": [
+          {
+            "type": "event",
+            "event": "cmenus/inspect",
+            "payload": {
+              "ingredient": "ring"
+            }
+          },
+          {
+            "type": "msg",
+            "text": "&6Кольцо литейщика&7 — не утрать"
+          }
+        ]
+      }
+    },
+    {
+      "id": "ing_p5",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        1.0,
+        -0.46,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 13,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p6",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        0.44,
+        -0.74,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 12,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p7",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        0.72,
+        -0.74,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 13,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "ing_p8",
+      "type": "model",
+      "model": "powder",
+      "pos": [
+        1.0,
+        -0.74,
+        0.42
+      ],
+      "scale": [
+        0.17,
+        0.17,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 14,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.1,
+            "rot_y": -90
+          }
+        }
+      }
+    },
+    {
+      "id": "arrow",
+      "type": "text",
+      "text": "&8➜",
+      "bg": "",
+      "pos": [
+        1.28,
+        -0.46,
+        0.36
+      ],
+      "hit": [
+        0.2,
+        0.2,
+        0.2
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 12,
+          "dur": 8,
+          "ease": "out_cubic",
+          "from": {
+            "offset": [
+              -0.15,
+              0,
+              0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "result_cell",
+      "type": "model",
+      "model": "cell_hover",
+      "pos": [
+        1.62,
+        -0.46,
+        0.35
+      ],
+      "scale": [
+        0.34,
+        0.34,
+        1
+      ],
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 13,
+          "dur": 8,
+          "ease": "out_back",
+          "from": {
+            "scale": 0.2
+          }
+        }
+      }
+    },
+    {
+      "id": "result_jar",
+      "type": "model",
+      "model": "jar",
+      "pos": [
+        1.62,
+        -0.46,
+        0.44
+      ],
+      "scale": [
+        0.15,
+        0.15,
+        0.15
+      ],
+      "hit": [
+        0.36,
+        0.36,
+        0.4
+      ],
+      "anim": {
+        "enter": {
+          "delay": 14,
+          "dur": 9,
+          "ease": "out_elastic",
+          "from": {
+            "scale": 0.05,
+            "rot_y": 270
+          }
+        },
+        "idle": {
+          "spin": {
+            "period": 320
+          }
+        },
+        "hover": {
+          "dur": 4,
+          "ease": "out_quint",
+          "scale": 1.18,
+          "lift": 0.015
+        }
+      },
+      "on_hover": [
+        {
+          "type": "sound",
+          "sound": "minecraft:block.note_block.hat",
+          "volume": 0.35,
+          "pitch": 1.6
+        }
+      ],
+      "on_click": {
+        "right": [
+          {
+            "type": "sound",
+            "sound": "minecraft:block.note_block.pling",
+            "volume": 1.0,
+            "pitch": 1.5
+          },
+          {
+            "type": "event",
+            "event": "cmenus/craft",
+            "payload": {
+              "result": "cobalt_dust_jar"
+            }
+          },
+          {
+            "type": "msg",
+            "text": "&aБанка кобальтовой пыли создана!"
+          }
+        ]
+      }
+    },
+    {
+      "id": "btn_back",
+      "type": "model",
+      "model": "button",
+      "pos": [
+        1.28,
+        -0.98,
+        0.36
+      ],
+      "scale": [
+        0.72,
+        0.18,
+        1
+      ],
+      "hit": [
+        0.76,
+        0.22,
+        0.4
+      ],
+      "hoverable": true,
+      "anim": {
+        "enter": {
+          "delay": 14,
+          "dur": 9,
+          "ease": "out_back",
+          "from": {
+            "offset": [
+              0,
+              -0.2,
+              0
+            ],
+            "scale": 0.5
+          }
+        },
+        "hover": {
+          "dur": 4,
+          "ease": "out_quint",
+          "scale": 1.06,
+          "lift": 0.012
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 6,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0,
+              -0.15,
+              0
+            ]
+          }
+        }
+      },
+      "on_hover": [
+        {
+          "type": "sound",
+          "sound": "minecraft:block.note_block.hat",
+          "volume": 0.35,
+          "pitch": 1.6
+        }
+      ],
+      "on_click": {
+        "left": [
+          {
+            "type": "sound",
+            "sound": "minecraft:ui.button.click",
+            "volume": 0.9,
+            "pitch": 1.0
+          },
+          {
+            "type": "close"
+          }
+        ],
+        "right": [
+          {
+            "type": "sound",
+            "sound": "minecraft:ui.button.click",
+            "volume": 0.9,
+            "pitch": 1.0
+          },
+          {
+            "type": "close"
+          }
+        ]
+      }
+    },
+    {
+      "id": "btn_back_label",
+      "type": "text",
+      "text": "&fВернуться &aF",
+      "bg": "",
+      "pos": [
+        1.28,
+        -0.98,
+        0.4
+      ],
+      "hit": [
+        0.72,
+        0.2,
+        0.4
+      ],
+      "align": "center",
+      "line_width": 160,
+      "hoverable": false,
+      "anim": {
+        "enter": {
+          "delay": 14,
+          "dur": 9,
+          "ease": "out_back",
+          "from": {
+            "offset": [
+              0,
+              -0.2,
+              0
+            ],
+            "scale": 0.5
+          }
+        },
+        "exit": {
+          "delay": 0,
+          "dur": 6,
+          "ease": "in_cubic",
+          "to": {
+            "offset": [
+              0,
+              -0.15,
+              0
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

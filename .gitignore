@@ -59,3 +59,11 @@ server.properties
 
 modules/*
 !modules/README.md
+
+# c-menus module lives in-repo (see modules/c-menus/README.md); unignore it
+# wholesale, then re-ignore its build outputs. The negation also re-includes
+# the committed bridge .class artifact and pack zip on purpose.
+!modules/c-menus
+!modules/c-menus/**
+modules/c-menus/target/
+modules/c-menus/scripts/visual/node_modules/

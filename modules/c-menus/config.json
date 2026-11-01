@@ -1,0 +1,16 @@
+{
+  "pack": {
+    "url": "https://raw.githubusercontent.com/PLANETA9091/CRUSSTY/master/modules/c-menus/pack/cmenus-pack.zip",
+    "sha1": "",
+    "force": true,
+    "send_on_join": true
+  },
+  "auto_open": {
+    "enabled": true,
+    "menu": "item_view",
+    "on": "pack_accepted",
+    "delay_ticks": 10
+  },
+  "command": "cmenus",
+  "reload_every_ticks": 100
+}

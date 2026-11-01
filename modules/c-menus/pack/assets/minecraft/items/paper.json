@@ -1,0 +1,19 @@
+{
+  "model": {
+    "type": "minecraft:range_dispatch",
+    "property": "minecraft:custom_model_data",
+    "entries": [
+      { "threshold": 1001, "model": { "type": "minecraft:model", "model": "cmenus:item/panel_main" } },
+      { "threshold": 1002, "model": { "type": "minecraft:model", "model": "cmenus:item/panel_dark" } },
+      { "threshold": 1003, "model": { "type": "minecraft:model", "model": "cmenus:item/panel_soft" } },
+      { "threshold": 1004, "model": { "type": "minecraft:model", "model": "cmenus:item/cell" } },
+      { "threshold": 1005, "model": { "type": "minecraft:model", "model": "cmenus:item/cell_hover" } },
+      { "threshold": 1006, "model": { "type": "minecraft:model", "model": "cmenus:item/button" } },
+      { "threshold": 1101, "model": { "type": "minecraft:model", "model": "cmenus:item/jar" } },
+      { "threshold": 1102, "model": { "type": "minecraft:model", "model": "cmenus:item/ring" } },
+      { "threshold": 1103, "model": { "type": "minecraft:model", "model": "cmenus:item/powder" } },
+      { "threshold": 1104, "model": { "type": "minecraft:model", "model": "cmenus:item/cobalt_dust" } }
+    ],
+    "fallback": { "type": "minecraft:model", "model": "minecraft:item/paper" }
+  }
+}

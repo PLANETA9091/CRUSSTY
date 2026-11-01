@@ -1,0 +1,125 @@
+name: c-menus
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - "modules/c-menus/**"
+      - ".github/workflows/cmenus.yml"
+  pull_request:
+    paths:
+      - "modules/c-menus/**"
+      - ".github/workflows/cmenus.yml"
+
+defaults:
+  run:
+    working-directory: modules/c-menus
+
+jobs:
+  build-test:
+    name: cargo build+test (c-menus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: modules/c-menus
+      - name: Cargo test
+        run: cargo test
+      - name: Cargo build (release cdylib)
+        run: cargo build --release
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-menus-module
+          path: |
+            modules/c-menus/target/release/libcmenus.so
+            modules/c-menus/module.json
+            modules/c-menus/menus/
+            modules/c-menus/pack/cmenus-pack.zip
+            modules/c-menus/config.json
+          if-no-files-found: error
+
+  artifacts-in-sync:
+    name: bridge + pack artifacts in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Rebuild Java bridge (stubs, offline)
+        run: bash scripts/build_bridge.sh
+      - name: Rebuild resource pack
+        run: |
+          python3 scripts/gen_textures.py
+          python3 scripts/build_pack.py
+      - name: Verify committed artifacts unchanged
+        run: |
+          cd ../..
+          if ! git diff --quiet --exit-code modules/c-menus/bridge-build modules/c-menus/pack; then
+            echo "::error::c-menus artifacts are out of sync with sources."
+            echo "::error::Run: bash modules/c-menus/scripts/build_bridge.sh && python3 modules/c-menus/scripts/gen_textures.py && python3 modules/c-menus/scripts/build_pack.py"
+            git diff --stat modules/c-menus/bridge-build modules/c-menus/pack
+            exit 1
+          fi
+          echo "OK: bridge .class and pack zip are up to date"
+
+  visual:
+    name: visual frames vs golden (chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install deps
+        working-directory: modules/c-menus/scripts/visual
+        run: npm ci || npm install
+      - name: Install chromium (playwright cache)
+        working-directory: modules/c-menus/scripts/visual
+        run: |
+          npx -y playwright@1.58.2 install --with-deps chromium
+          echo "CHROME_PATH=$(ls -d $HOME/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | head -1)" >> "$GITHUB_ENV"
+      - name: Run visual test
+        working-directory: modules/c-menus/scripts/visual
+        env:
+          CHROME_PATH: ${{ env.CHROME_PATH }}
+        run: node visual_test.mjs
+      - name: Upload frames on diff
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-menus-visual-diff
+          path: modules/c-menus/scripts/visual/golden/
+          if-no-files-found: ignore
+
+  e2e-paper263:
+    name: e2e boot (Paper 26.3 + runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            modules/c-menus
+            runtime
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: E2E (build runtime + launcher + module, boot Paper 26.3)
+        working-directory: modules/c-menus
+        run: bash scripts/e2e.sh
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-menus-e2e-logs
+          path: |
+            logs/
+            modules/c-menus/../../logs/
+          if-no-files-found: ignore
