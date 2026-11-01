@@ -18,16 +18,24 @@ cd "$REPO_ROOT"
 JAVAC_FLAGS=(-encoding UTF-8 --release 8 -g -nowarn)
 
 ASM_JAR="cplug-sdk/asm-lib/asm-9.7.1.jar"
+ASM_TREE_JAR="cplug-sdk/asm-lib/asm-tree-9.7.1.jar"
 if [[ ! -f "$ASM_JAR" ]]; then
     echo "== downloading ASM (SdkAsmHelper dependency) =="
     mkdir -p cplug-sdk/asm-lib
     curl -fsSL -o "$ASM_JAR" \
       https://repo1.maven.org/maven2/org/ow2/asm/asm/9.7.1/asm-9.7.1.jar
 fi
+# SdkAsmHelper also uses org.objectweb.asm.tree.* — that lives in asm-tree,
+# a separate artifact (fixed: the CI helpers job failed without it).
+if [[ ! -f "$ASM_TREE_JAR" ]]; then
+    mkdir -p cplug-sdk/asm-lib
+    curl -fsSL -o "$ASM_TREE_JAR" \
+      https://repo1.maven.org/maven2/org/ow2/asm/asm-tree/9.7.1/asm-tree-9.7.1.jar
+fi
 
 echo "== cplug-sdk SdkAsmHelper (asm-build/) =="
 mkdir -p cplug-sdk/asm-build
-javac "${JAVAC_FLAGS[@]}" -cp "$ASM_JAR" -d cplug-sdk/asm-build \
+javac "${JAVAC_FLAGS[@]}" -cp "$ASM_JAR:$ASM_TREE_JAR" -d cplug-sdk/asm-build \
   cplug-sdk/asm-src/dev/dist/SdkAsmHelper.java
 
 echo "== runtime transform hook classes (runtime/build/hooks/) =="

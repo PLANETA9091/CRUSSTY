@@ -10,4 +10,5 @@ public interface Player extends Entity {
     void setResourcePack(String url, byte[] hash);
     void sendMessage(String message);
     void playSound(Location loc, String sound, float volume, float pitch);
+    void updateInventory();
 }
