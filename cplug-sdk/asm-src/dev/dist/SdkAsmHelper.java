@@ -461,8 +461,16 @@ public final class SdkAsmHelper {
             }
             org.objectweb.asm.tree.InsnList guard = new org.objectweb.asm.tree.InsnList();
             String dsc = mn.desc;
+            // RECEIVER LOCAL SELECTION (static fix): the local-1 heuristic
+            // assumes an INSTANCE method (local 0 = this, local 1 = the
+            // first argument). A STATIC method has no `this` — its first
+            // parameter IS local 0 (c-entities N2-M1.8b: the activation
+            // gate on ActivationRange.checkIfActive(Entity)Z, a static
+            // method, verified FAILS_VERIFICATION with the local-1 load —
+            // the local does not exist in a static frame).
             int recvLocal = 0;
-            if (dsc.length() > 1 && (dsc.charAt(1) == 'L' || dsc.charAt(1) == '[')) {
+            boolean isStatic = (mn.access & org.objectweb.asm.Opcodes.ACC_STATIC) != 0;
+            if (!isStatic && dsc.length() > 1 && (dsc.charAt(1) == 'L' || dsc.charAt(1) == '[')) {
                 recvLocal = 1;
             }
             guard.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, recvLocal));
