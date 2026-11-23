@@ -1800,9 +1800,14 @@ fn plan_stackmap(class: &ClassFile<'_>, sub: &SubAttr, pc: usize, ins_len: i32, 
                 (u16_at(payload, pos + 1, &ctx("offset_delta"))?, size)
             }
             255 => {
+                // full_frame (JVMS 4.7.4): frame_type u1 @pos, offset_delta
+                // u2 @pos+1, number_of_locals u2 @pos+3, locals from pos+5.
+                // `size` counts the bytes consumed so far (frame_type,
+                // offset_delta, number_of_locals = 5); number_of_stack_items
+                // is added once, below.
                 let locals = u16_at(payload, pos + 3, &ctx("number_of_locals"))? as usize;
-                let mut size = 7usize;
-                let mut p = pos + 7;
+                let mut size = 5usize;
+                let mut p = pos + 5;
                 for _ in 0..locals {
                     let v = vti_size(payload, p, end, &ctx("full_frame local"))?;
                     if std::env::var_os("CRUSSTY_TRACE_SMT").is_some() {
@@ -2619,6 +2624,71 @@ mod tests {
         // same_frame_extended (251) + u2 66; attribute payload grew 3 -> 5
         assert_eq!(smt_sub.len, 5);
         assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &[0, 1, 251, 0, 66]);
+    }
+
+    /// Hand-assembled full_frame (JVMS 4.7.4 layout: frame_type u1,
+    /// offset_delta u2, number_of_locals u2, locals[], number_of_stack_items
+    /// u2, stack[]) with three locals (Object, Long, Integer) and one
+    /// Uninitialized stack item, followed by a same_frame_extended. The
+    /// planner must parse every verification_type_info, bump the first frame
+    /// past the hook (delta 5 -> 9) and the Uninitialized offset (3 -> 7),
+    /// and walk the trailing frame at the correct position.
+    #[test]
+    fn stackmap_full_frame_locals_parse_and_bump() {
+        let (mut c, cl_t, cl_o) = basic_cb();
+        let run = c.utf8("run");
+        let v = c.utf8("()V");
+        let code_n = c.utf8("Code");
+        let smt = c.utf8("StackMapTable");
+        let string_name = c.utf8("java/lang/String");
+        let string_cls = c.class(string_name);
+        // 8 nops, frame at 5 (delta 5), trailing frame at 8 (delta 8-5-1 = 2)
+        let mut code = vec![0x00; 8];
+        code.push(0xB1);
+        let mut smt_payload = vec![0, 2];
+        // full_frame at 5: 255, offset_delta 5, 3 locals, 1 stack item
+        smt_payload.push(255);
+        smt_payload.extend_from_slice(&5u16.to_be_bytes());
+        smt_payload.extend_from_slice(&3u16.to_be_bytes());
+        smt_payload.push(7); // Object_variable_info
+        smt_payload.extend_from_slice(&string_cls.to_be_bytes());
+        smt_payload.push(4); // Long_variable_info (one entry for two slots)
+        smt_payload.push(1); // Integer_variable_info
+        smt_payload.extend_from_slice(&1u16.to_be_bytes());
+        smt_payload.push(8); // Uninitialized_variable_info, offset 3
+        smt_payload.extend_from_slice(&3u16.to_be_bytes());
+        // same_frame_extended at 8: 251, offset_delta 2
+        smt_payload.push(251);
+        smt_payload.extend_from_slice(&2u16.to_be_bytes());
+        let bytes = c.fin(
+            cl_t,
+            cl_o,
+            vec![method_b(
+                run,
+                v,
+                Some(CodeB {
+                    code_attr_name: code_n,
+                    max_stack: 1,
+                    max_locals: 0,
+                    code,
+                    exc: vec![],
+                    sub: vec![(smt, smt_payload)],
+                }),
+            )],
+        );
+        let e = TransformEngine::new();
+        e.register(hook());
+        let out = e.apply("Test", &bytes).unwrap().unwrap().bytes;
+        let cf = parse_class(&out).unwrap();
+        let code = code_of(&cf, 0);
+        // 9-byte body + 4-byte hook
+        assert_eq!(code.code_len, 13);
+        let smt_sub = code.sub.iter().find(|s| s.name == "StackMapTable").unwrap();
+        let mut want = vec![0, 2, 255, 0, 9, 0, 3, 7];
+        want.extend_from_slice(&string_cls.to_be_bytes());
+        want.extend_from_slice(&[4, 1, 0, 1, 8, 0, 7]);
+        want.extend_from_slice(&[251, 0, 2]);
+        assert_eq!(&out[smt_sub.off..smt_sub.off + smt_sub.len], &want[..]);
     }
 
     #[test]
