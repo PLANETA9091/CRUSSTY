@@ -1388,9 +1388,10 @@ unsafe extern "C" fn n_side_table_named(name: *const c_char, out: *mut u64) -> i
 }
 
 /// Platform v2: register a payload-rewrite hook. The C callback is wrapped
-/// in a network-list entry; the list is not yet driven from the packet path
-/// (no write-back injection in this slice), so the callback does not run yet.
-/// After the callback returns, `out_payload` (if set) replaces the payload.
+/// in a network-list entry and runs on the outbound encode-exit path
+/// (`NetHooks.onEncodeExit`, slice 2), with the finished frame in `payload`.
+/// After the callback returns, `out_payload` (if set) replaces the whole frame;
+/// the length may change.
 unsafe extern "C" fn n_network_add_rewrite_hook(cb: PacketRewriteCb, ctx: *mut c_void) -> i32 {
     if fnull(cb) {
         return -1;

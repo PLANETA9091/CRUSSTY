@@ -15,11 +15,11 @@
 //! patched kernel classes will throw `NoClassDefFoundError` on first
 //! execution of a transformed method.
 
-use crate::platform::{scheduler, storage};
-use jni::objects::JClassLoader;
+use crate::platform::{network, scheduler, storage};
+use jni::objects::{JByteArray, JClassLoader};
 use jni::strings::JNIStr;
-use jni::sys::jclass;
-use jni::{Env, JavaVM, NativeMethod};
+use jni::sys::{jboolean, jbyteArray, jclass};
+use jni::{EnvUnowned, Env, JavaVM, NativeMethod};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -70,6 +70,51 @@ unsafe extern "C" fn n_on_block_ticks(_env: *mut jni::sys::JNIEnv, _class: jclas
 /// Called by the JVM as the JNI native of the `NetHooks`/`TickHook` probes;
 /// `env` and `class` are owned by the caller; the body is deliberately empty.
 unsafe extern "C" fn n_noop(_env: *mut jni::sys::JNIEnv, _class: jclass) {}
+
+// --- NetHooks outbound write-back (slice 2) -------------------------------
+
+/// `NetHooks.rewriteLive()Z`: true while a rewrite hook is registered. The
+/// Java probe checks this first, so the zero-hook path is one atomic load.
+///
+/// # Safety
+/// JNI native of `NetHooks.rewriteLive`; `env`/`class` are owned by the JVM
+/// and the body makes no JNI calls.
+unsafe extern "C" fn n_rewrite_live(_env: *mut jni::sys::JNIEnv, _class: jclass) -> jboolean {
+    network::rewrite_hook_count() > 0
+}
+
+/// `NetHooks.rewriteOutbound([B)[B`: runs the rewrite hooks over one outbound
+/// frame. Returns null when nothing changed (or on any failure), so the Java
+/// side leaves the buffer as the encoder wrote it.
+///
+/// # Safety
+/// JNI native of `NetHooks.rewriteOutbound`; `env` is valid for this call and
+/// `payload` is a local reference owned by the JVM for the call's duration.
+unsafe extern "C" fn n_rewrite_outbound(
+    env: *mut jni::sys::JNIEnv,
+    _class: jclass,
+    payload: jbyteArray,
+) -> jbyteArray {
+    if payload.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut unowned = unsafe { EnvUnowned::from_raw(env) };
+    let out = unowned.with_env(|env| -> jni::errors::Result<Option<jbyteArray>> {
+        let arr = unsafe { JByteArray::from_raw(env, payload) };
+        let bytes = env.convert_byte_array(&arr)?;
+        match network::rewrite_outbound_payload(&bytes) {
+            None => Ok(None),
+            Some(new_frame) => {
+                let out = env.byte_array_from_slice(&new_frame)?;
+                Ok(Some(out.into_raw()))
+            }
+        }
+    });
+    match out.into_outcome() {
+        jni::Outcome::Ok(Some(raw)) => raw,
+        jni::Outcome::Ok(None) | jni::Outcome::Err(_) | jni::Outcome::Panic(_) => std::ptr::null_mut(),
+    }
+}
 
 /// Define one hook class into the system class loader and register its
 /// natives. `env` must be attached and pinned for the whole call.
@@ -187,6 +232,14 @@ fn install_once() -> Result<(), String> {
                         (jni::jni_str!("onIntention"), jni::jni_str!("()V"), n_noop as *const c_void),
                         (jni::jni_str!("onProtocolSwap"), jni::jni_str!("()V"), n_noop as *const c_void),
                         (jni::jni_str!("onChannelInactive"), jni::jni_str!("()V"), n_noop as *const c_void),
+                        (
+                            jni::jni_str!("rewriteLive"), jni::jni_str!("()Z"),
+                            n_rewrite_live as *const c_void,
+                        ),
+                        (
+                            jni::jni_str!("rewriteOutbound"), jni::jni_str!("([B)[B"),
+                            n_rewrite_outbound as *const c_void,
+                        ),
                     ],
                 )?;
                 define_and_register(

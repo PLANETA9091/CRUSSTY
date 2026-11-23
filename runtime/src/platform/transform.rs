@@ -73,6 +73,12 @@ pub enum Injection {
     /// Before every call site whose resolved target
     /// (`owner.name:descriptor`, internal names) matches the pattern.
     BeforeCall(String),
+    /// Before every `xRETURN` of the target method (slice 2): emits
+    /// `aload ctx_slot; aload buf_slot; invokestatic helper(Object,Object)V; nop`
+    /// (8 bytes, so tableswitch padding stays valid). Both slots must be
+    /// reference parameters of the method; otherwise planning fails with Err
+    /// and the whole class transform is refused. `athrow` exits are not hooked.
+    MethodExit { ctx_slot: u8, buf_slot: u8 },
 }
 
 /// One transformation rule.
@@ -504,6 +510,9 @@ impl TransformEngine {
                     }
                     Injection::BeforeCall(target) => {
                         plan_before_call(&class, m, target, &rule.helper, &mut plan)?;
+                    }
+                    Injection::MethodExit { ctx_slot, buf_slot } => {
+                        plan_method_exit(&class, m, *ctx_slot, *buf_slot, &rule.helper, &mut plan)?;
                     }
                 }
             }
@@ -1093,7 +1102,7 @@ struct Plan<'p> {
     cp_nat: HashMap<(u16, u16), u16, FnvBuild>,
     cp_mref: HashMap<(u16, u16), u16, FnvBuild>,
     /// Helper -> resolved methodref (borrowed `rule.helper` keys).
-    helpers: Vec<(&'p str, u16)>,
+    helpers: Vec<(&'p str, &'static str, u16)>,
     /// Cumulative signed fixup delta per file offset, so several insertions
     /// that shift the same field sum up instead of overwriting (the last
     /// Set edit written carries the full cumulative value).
@@ -1155,8 +1164,8 @@ impl<'p> Plan<'p> {
     }
 
     /// Linear-scan lookup in the borrowed-helper map.
-    fn helper_get(&self, s: &str) -> Option<u16> {
-        self.helpers.iter().find(|(k, _)| *k == s).map(|(_, v)| *v)
+    fn helper_get(&self, s: &str, desc: &str) -> Option<u16> {
+        self.helpers.iter().find(|(k, d, _)| *k == s && *d == desc).map(|(_, _, v)| *v)
     }
 }
 
@@ -1347,8 +1356,9 @@ fn helper_methodref<'p>(
     class: &ClassFile<'_>,
     plan: &mut Plan<'p>,
     helper: &'p str,
+    desc: &'static str,
 ) -> Result<u16, String> {
-    if let Some(i) = plan.helper_get(helper) {
+    if let Some(i) = plan.helper_get(helper, desc) {
         return Ok(i);
     }
     let (owner, name) = helper
@@ -1363,11 +1373,11 @@ fn helper_methodref<'p>(
     // append path.
     let c = cp_utf8_owner(class, plan, owner)?;
     let n = cp_utf8(class, plan, name)?;
-    let d = cp_utf8(class, plan, "()V")?;
+    let d = cp_utf8(class, plan, desc)?;
     let cc = cp_class(class, plan, c)?;
     let nt = cp_name_and_type(class, plan, n, d)?;
     let mr = cp_methodref(class, plan, cc, nt)?;
-    plan.helpers.push((helper, mr));
+    plan.helpers.push((helper, desc, mr));
     Ok(mr)
 }
 
@@ -1394,7 +1404,7 @@ fn plan_method_entry<'p>(
         // abstract/native methods have no Code attribute — nothing to inject
         None => return Ok(()),
     };
-    let mr = helper_methodref(class, plan, helper)?;
+    let mr = helper_methodref(class, plan, helper, "()V")?;
     if code_at_invokes_helper(class, code, 0, mr) {
         return Ok(());
     }
@@ -1426,7 +1436,7 @@ fn plan_before_call<'p>(
         Some(c) => c,
         None => return Ok(()),
     };
-    let mr = helper_methodref(class, plan, helper)?;
+    let mr = helper_methodref(class, plan, helper, "()V")?;
     let code_bytes = &class.data[code.code_off..code.code_off + code.code_len];
     let instrs = instr_sizes(code_bytes)?;
     for &(o, _, op) in &instrs {
@@ -1444,6 +1454,133 @@ fn plan_before_call<'p>(
         plan.edits.push(Edit::Insert(code.code_off + o, invokestatic_bytes(mr).into()));
         plan.bump_u4(code.code_len_off, code.code_len as u32, 3);
         plan_code_fixups(class, code, o, 3, plan)?;
+    }
+    Ok(())
+}
+
+const OP_ALOAD: u8 = 0x19;
+/// Descriptor of the method-exit helper: `(Object ctx, Object buf)V`.
+const DESC_OBJ_OBJ_V: &str = "(Ljava/lang/Object;Ljava/lang/Object;)V";
+/// Bytes inserted before each return: aload ctx; aload buf; invokestatic; nop.
+const EXIT_INSERT_LEN: usize = 8;
+
+fn is_return_op(op: u8) -> bool {
+    (0xAC..=0xB1).contains(&op)
+}
+
+/// Local-variable slot and reference-ness of every parameter of a method
+/// descriptor (JVMS 4.3.3, 2-slot long/double). `this` occupies slot 0 for
+/// instance methods.
+fn param_slots(desc: &str, is_static: bool) -> Result<Vec<(u16, bool)>, String> {
+    let bad = || format!("malformed method descriptor '{desc}'");
+    let body = desc.strip_prefix('(').and_then(|d| d.split_once(')')).map(|(p, _)| p.as_bytes()).ok_or_else(bad)?;
+    let mut out = Vec::new();
+    let mut slot: u16 = if is_static { 0 } else { 1 };
+    let mut i = 0usize;
+    while i < body.len() {
+        let (is_ref, width) = match body[i] {
+            b'J' | b'D' => {
+                i += 1;
+                (false, 2)
+            }
+            b'B' | b'C' | b'F' | b'I' | b'S' | b'Z' => {
+                i += 1;
+                (false, 1)
+            }
+            b'L' | b'[' => {
+                while body.get(i) == Some(&b'[') {
+                    i += 1;
+                }
+                match body.get(i) {
+                    Some(b'L') => {
+                        let end = body[i..].iter().position(|&c| c == b';').ok_or_else(bad)?;
+                        i += end + 1;
+                    }
+                    Some(_) => i += 1,
+                    None => return Err(bad()),
+                }
+                (true, 1)
+            }
+            _ => return Err(bad()),
+        };
+        out.push((slot, is_ref));
+        slot = slot.checked_add(width).ok_or_else(bad)?;
+    }
+    Ok(out)
+}
+
+/// True if the 8-byte exit block already sits directly before the return at
+/// code-relative `o` (idempotency for retransformed classes).
+fn exit_block_present(code: &[u8], o: usize, ctx: u8, buf: u8, mr: u16) -> bool {
+    o >= EXIT_INSERT_LEN
+        && code[o - 8] == OP_ALOAD
+        && code[o - 7] == ctx
+        && code[o - 6] == OP_ALOAD
+        && code[o - 5] == buf
+        && code[o - 4..o - 1] == invokestatic_bytes(mr)
+        && code[o - 1] == 0x00
+}
+
+/// Method-exit injection: before every `xRETURN` of `m`, call the static
+/// helper `(Object, Object)V` on two reference parameters. Stack growth is
+/// handled by raising `max_stack` by 2 (the block pushes two references on
+/// top of the return value); StackMapTable frames and the other Code
+/// offsets are fixed by the same machinery as `BeforeCall`.
+fn plan_method_exit<'p>(
+    class: &ClassFile<'_>,
+    m: &Member,
+    ctx_slot: u8,
+    buf_slot: u8,
+    helper: &'p str,
+    plan: &mut Plan<'p>,
+) -> Result<(), String> {
+    let code = match &m.code {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let params = param_slots(&m.descriptor, m.access_flags & 0x0008 != 0)?;
+    for (what, slot) in [("ctx", ctx_slot), ("buf", buf_slot)] {
+        match params.iter().find(|(s, _)| *s == u16::from(slot)) {
+            Some((_, true)) => {}
+            _ => {
+                return Err(format!(
+                    "MethodExit {what} slot {slot} is not a reference parameter of {}{}",
+                    m.name, m.descriptor
+                ))
+            }
+        }
+    }
+    let code_bytes = &class.data[code.code_off..code.code_off + code.code_len];
+    let sites: Vec<usize> = instr_sizes(code_bytes)?
+        .into_iter()
+        .filter(|&(_, _, op)| is_return_op(op))
+        .map(|(o, _, _)| o)
+        .collect();
+    if sites.is_empty() {
+        return Ok(());
+    }
+    let mr = helper_methodref(class, plan, helper, DESC_OBJ_OBJ_V)?;
+    let todo: Vec<usize> = sites
+        .into_iter()
+        .filter(|&o| !exit_block_present(code_bytes, o, ctx_slot, buf_slot, mr))
+        .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
+    let max_stack_off = code.code_len_off - 4;
+    let max_stack = u16_at(class.data, max_stack_off, "Code max_stack")?;
+    plan.bump_u2(max_stack_off, max_stack, 2);
+    let mut block = [0u8; EXIT_INSERT_LEN];
+    block[0] = OP_ALOAD;
+    block[1] = ctx_slot;
+    block[2] = OP_ALOAD;
+    block[3] = buf_slot;
+    block[4..7].copy_from_slice(&invokestatic_bytes(mr));
+    block[7] = 0x00;
+    for o in todo {
+        plan.edits.push(Edit::Insert(code.code_off + o, block.as_slice().into()));
+        plan.bump_u4(code.code_len_off, code.code_len as u32, EXIT_INSERT_LEN as i64);
+        plan_code_fixups(class, code, o, EXIT_INSERT_LEN as i32, plan)?;
     }
     Ok(())
 }
@@ -2735,6 +2872,225 @@ mod tests {
 
     // --- real-world class from the kernel jar ------------------------------
 
+    // --- slice 2: method-exit injection (hand-assembled, no JDK) ------------
+
+    const DESC_EXIT_I: &str = "(Ljava/lang/Object;Ljava/lang/Object;I)Ljava/lang/Object;";
+    const EXIT_HELPER: &str = "dev.crussty.hooks.NetHooks.onEncodeExit";
+
+    /// Expected 8-byte exit block for ctx slot 0 and buf slot 1.
+    fn exit_block(ctx: u8, buf: u8, mr: u16) -> Vec<u8> {
+        vec![0x19, ctx, 0x19, buf, 0xB8, (mr >> 8) as u8, mr as u8, 0x00]
+    }
+
+    fn exit_rule(ctx: u8, buf: u8) -> Rule {
+        Rule::new("Test", "m", "*", Injection::MethodExit { ctx_slot: ctx, buf_slot: buf }, EXIT_HELPER)
+    }
+
+    /// One method `m` with the given access/descriptor/Code, in a class `Test`.
+    fn exit_class(access: u16, desc: &str, max_stack: u16, max_locals: u16, code: Vec<u8>, smt: Option<Vec<u8>>) -> Vec<u8> {
+        let mut c = Cb::new();
+        let t = c.utf8("Test");
+        let o = c.utf8("java/lang/Object");
+        let cl_t = c.class(t);
+        let cl_o = c.class(o);
+        let m = c.utf8("m");
+        let d = c.utf8(desc);
+        let code_n = c.utf8("Code");
+        let smt_n = c.utf8("StackMapTable");
+        let sub = smt.map(|p| vec![(smt_n, p)]).unwrap_or_default();
+        c.fin(
+            cl_t,
+            cl_o,
+            vec![MethodB {
+                access,
+                name: m,
+                desc: d,
+                code: Some(CodeB { code_attr_name: code_n, max_stack, max_locals, code, exc: vec![], sub }),
+            }],
+        )
+    }
+
+    /// Methodref index of the helper, read back from the first exit block at
+    /// code offset `at`, after checking that it resolves to the helper.
+    fn exit_mref(cf: &ClassFile<'_>, code: &[u8], at: usize) -> u16 {
+        assert_eq!(code[at], OP_ALOAD);
+        let mr = u16::from_be_bytes([code[at + 5], code[at + 6]]);
+        assert_eq!(
+            resolve_methodref(cf, mr).unwrap(),
+            (
+                "dev/crussty/hooks/NetHooks".to_string(),
+                "onEncodeExit".to_string(),
+                "(Ljava/lang/Object;Ljava/lang/Object;)V".to_string(),
+            )
+        );
+        mr
+    }
+
+    fn sub_payload<'a>(out: &'a [u8], cf: &ClassFile<'_>, name: &str) -> Vec<u8> {
+        let s = code_of(cf, 0).sub.iter().find(|s| s.name == name).expect("sub-attribute");
+        out[s.off..s.off + s.len].to_vec()
+    }
+
+    fn max_stack_of(out: &[u8], cf: &ClassFile<'_>) -> u16 {
+        u16_at(out, code_of(cf, 0).code_len_off - 4, "max_stack").unwrap()
+    }
+
+    #[test]
+    fn exit_every_return_opcode() {
+        // (descriptor, code without the return, return opcode, max_stack)
+        let cases: [(&str, Vec<u8>, u8, u16); 6] = [
+            ("(Ljava/lang/Object;Ljava/lang/Object;)I", vec![0x03], 0xAC, 1),
+            ("(Ljava/lang/Object;Ljava/lang/Object;)J", vec![0x09], 0xAD, 2),
+            ("(Ljava/lang/Object;Ljava/lang/Object;)F", vec![0x0B], 0xAE, 1),
+            ("(Ljava/lang/Object;Ljava/lang/Object;)D", vec![0x0E], 0xAF, 2),
+            ("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", vec![0x01], 0xB0, 1),
+            ("(Ljava/lang/Object;Ljava/lang/Object;)V", vec![], 0xB1, 0),
+        ];
+        for (desc, mut pre, ret, max) in cases {
+            let pre_len = pre.len();
+            let orig_pre = pre.clone();
+            pre.push(ret);
+            let bytes = exit_class(0x0009, desc, max, 2, pre, None);
+            let e = TransformEngine::new();
+            e.register(exit_rule(0, 1));
+            let out = e.apply("Test", &bytes).unwrap().expect("transformed").into_bytes();
+            let cf = parse_class(&out).unwrap();
+            let new = code_bytes(&cf, 0).to_vec();
+            let mr = exit_mref(&cf, &new, pre_len);
+            let mut want = orig_pre;
+            want.extend(exit_block(0, 1, mr));
+            want.push(ret);
+            assert_eq!(new, want, "descriptor {desc}");
+            assert_eq!(max_stack_of(&out, &cf), max + 2, "max_stack grows by 2 for {desc}");
+        }
+    }
+
+    #[test]
+    fn exit_three_returns_with_branches() {
+        // 0 iload_2 | 1 ifeq ->6 | 4 aload_0 | 5 areturn | 6 iload_2 (frame)
+        // 7 ifeq ->12 | 10 aload_0 | 11 areturn | 12 aload_1 (frame) | 13 areturn
+        let code = vec![
+            0x1A, 0x99, 0x00, 0x05, 0x2A, 0xB0, 0x1A, 0x99, 0x00, 0x05, 0x2A, 0xB0, 0x2B, 0xB0,
+        ];
+        let bytes = exit_class(0x0009, DESC_EXIT_I, 1, 3, code, Some(vec![0, 2, 6, 5]));
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        let out = e.apply("Test", &bytes).unwrap().expect("transformed").into_bytes();
+        let cf = parse_class(&out).unwrap();
+        let new = code_bytes(&cf, 0).to_vec();
+        let mr = exit_mref(&cf, &new, 5);
+        let b = exit_block(0, 1, mr);
+        // Branch operands and both frames move exactly by the inserted bytes:
+        // ifeq@1 -> 14 (operand 13), ifeq@15 -> 28 (operand 13),
+        // frames at 14 and 28 (delta 14, then 13).
+        let mut want = vec![0x1A, 0x99, 0x00, 0x0D, 0x2A];
+        want.extend(&b);
+        want.push(0xB0);
+        want.extend([0x1A, 0x99, 0x00, 0x0D, 0x2A]);
+        want.extend(&b);
+        want.push(0xB0);
+        want.push(0x2B);
+        want.extend(&b);
+        want.push(0xB0);
+        assert_eq!(new, want);
+        assert_eq!(sub_payload(&out, &cf, "StackMapTable"), vec![0, 2, 14, 13]);
+        assert_eq!(max_stack_of(&out, &cf), 3);
+    }
+
+    #[test]
+    fn exit_frame_on_return_site_stays_on_hook() {
+        // 0 aload_0 | 1 iload_2 | 2 ifeq ->10 | 5 aload_1 | 6 pop | 7 goto ->10
+        // 10 areturn: a branch target with a frame (stack [null]) on the return.
+        let code = vec![0x2A, 0x1A, 0x99, 0x00, 0x08, 0x2B, 0x57, 0xA7, 0x00, 0x03, 0xB0];
+        let smt = vec![0, 1, 74, 5];
+        let bytes = exit_class(0x0009, "(Ljava/lang/Object;Ljava/lang/Object;I)Ljava/lang/Object;", 2, 3, code.clone(), Some(smt.clone()));
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        let out = e.apply("Test", &bytes).unwrap().expect("transformed").into_bytes();
+        let cf = parse_class(&out).unwrap();
+        let new = code_bytes(&cf, 0).to_vec();
+        let mr = exit_mref(&cf, &new, 10);
+        // The frame and both branches keep pointing at the hook start (pc 10),
+        // so the hook runs on every path into the return and the frame is unchanged.
+        let mut want = code[..10].to_vec();
+        want.extend(exit_block(0, 1, mr));
+        want.push(0xB0);
+        assert_eq!(new, want);
+        assert_eq!(sub_payload(&out, &cf, "StackMapTable"), smt);
+        assert_eq!(max_stack_of(&out, &cf), 4);
+    }
+
+    #[test]
+    fn exit_keeps_tableswitch_aligned() {
+        // 0 iload_2 | 1 ireturn | 2 tableswitch (pad 1, one target) | 20 iconst_0 | 21 ireturn
+        let switch = [0xAA, 0x00, 0, 0, 0, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12];
+        let mut code = vec![0x1A, 0xAC];
+        code.extend(switch);
+        code.extend([0x03, 0xAC]);
+        assert_eq!(code.len(), 22);
+        let bytes = exit_class(0x0009, DESC_EXIT_I, 1, 3, code, None);
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        let out = e.apply("Test", &bytes).unwrap().expect("transformed").into_bytes();
+        let cf = parse_class(&out).unwrap();
+        let new = code_bytes(&cf, 0).to_vec();
+        let mr = exit_mref(&cf, &new, 1);
+        let b = exit_block(0, 1, mr);
+        // The 8-byte block keeps every later switch at the same residue mod 4,
+        // so its padding (and its relative targets) stay valid.
+        let mut want = vec![0x1A];
+        want.extend(&b);
+        want.push(0xAC);
+        want.extend(switch);
+        want.push(0x03);
+        want.extend(&b);
+        want.push(0xAC);
+        assert_eq!(new, want);
+        let sizes = instr_sizes(&new).unwrap();
+        assert!(sizes.contains(&(10, 18, 0xAA)));
+        assert_eq!(max_stack_of(&out, &cf), 3);
+    }
+
+    #[test]
+    fn exit_refuses_non_reference_or_missing_slots() {
+        // slot 1 is an int parameter, slot 5 does not exist
+        let int_slot = exit_class(0x0009, "(Ljava/lang/Object;I)V", 0, 2, vec![0xB1], None);
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        assert!(e.apply("Test", &int_slot).is_err());
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 5));
+        let obj_obj = exit_class(0x0009, "(Ljava/lang/Object;Ljava/lang/Object;)V", 0, 2, vec![0xB1], None);
+        assert!(e.apply("Test", &obj_obj).is_err());
+    }
+
+    #[test]
+    fn exit_instance_method_slots_start_after_this() {
+        // instance method: slot 0 is `this`, so ctx=1 and buf=2 are the params
+        let bytes = exit_class(0x0001, "(Ljava/lang/Object;Ljava/lang/Object;)V", 0, 3, vec![0xB1], None);
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        assert!(e.apply("Test", &bytes).is_err(), "slot 0 (this) is not a parameter");
+        let e = TransformEngine::new();
+        e.register(exit_rule(1, 2));
+        let out = e.apply("Test", &bytes).unwrap().expect("transformed").into_bytes();
+        let cf = parse_class(&out).unwrap();
+        let new = code_bytes(&cf, 0).to_vec();
+        assert_eq!(&new[..5], &[0x19, 0x01, 0x19, 0x02, 0xB8]);
+        assert_eq!(new[8], 0xB1);
+        let _ = exit_mref(&cf, &new, 0);
+    }
+
+    #[test]
+    fn exit_is_idempotent() {
+        let code = vec![0x1A, 0xAC];
+        let bytes = exit_class(0x0009, DESC_EXIT_I, 1, 3, code, None);
+        let e = TransformEngine::new();
+        e.register(exit_rule(0, 1));
+        let once = e.apply("Test", &bytes).unwrap().expect("first pass").into_bytes();
+        assert!(e.apply("Test", &once).unwrap().is_none(), "second pass must not double-inject");
+    }
+
     #[test]
     fn real_jar_class_roundtrip() {
         let jar_path = "/home/btw/crussty-dist/v2/versions/purpur-1.21.10.jar";
@@ -3094,6 +3450,9 @@ mod bench_hotpath {
                     Injection::BeforeCall(target) => {
                         plan_before_call(&class, m, target, &rule.helper, &mut plan)?;
                     }
+                    Injection::MethodExit { ctx_slot, buf_slot } => {
+                        plan_method_exit(&class, m, *ctx_slot, *buf_slot, &rule.helper, &mut plan)?;
+                    }
                 }
             }
         }
@@ -3396,6 +3755,9 @@ mod bench_hotpath {
                     }
                     Injection::BeforeCall(target) => {
                         plan_before_call(&class, m, target, &rule.helper, &mut plan).expect("plan ok");
+                    }
+                    Injection::MethodExit { ctx_slot, buf_slot } => {
+                        plan_method_exit(&class, m, *ctx_slot, *buf_slot, &rule.helper, &mut plan).expect("plan ok");
                     }
                 }
             }

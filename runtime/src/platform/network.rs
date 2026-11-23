@@ -39,6 +39,7 @@
 //! |---|---|
 //! | `net/minecraft/network/PacketDecoder.decode` | `NetHooks.onDecode()` |
 //! | `net/minecraft/network/PacketEncoder.encode` | `NetHooks.onEncode()` |
+//! | `net/minecraft/network/PacketEncoder.encode` (before every return) | `NetHooks.onEncodeExit(Object, Object)` (slice 2: outbound write-back) |
 //! | `net/minecraft/server/network/ServerHandshakePacketListenerImpl.handleIntention` | `NetHooks.onIntention()` |
 //! | `net/minecraft/network/Connection.setupInboundProtocol` | `NetHooks.onProtocolSwap()` |
 //! | `net/minecraft/network/Connection.channelInactive` | `NetHooks.onChannelInactive()` |
@@ -266,9 +267,34 @@ pub fn rewrite_hook_count() -> usize {
     REWRITE_HOOKS_LIVE.load(Ordering::Acquire)
 }
 
-/// Run every rewrite hook over `packet`, in registration order. Not called
-/// from the packet path yet (slice 2 wires the write-back); a no-op while
-/// the list is empty.
+/// Outbound write-back for the encode-exit probe (slice 2). `payload` is the
+/// finished frame from `PacketEncoder.encode` (packet id first, no compression
+/// or length prefix yet). Returns `Some(new_frame)` only when a rewrite hook
+/// changed it; `None` means the caller must leave the buffer untouched. An
+/// empty result is refused (`None`). The connection is unknown here (conn 0)
+/// and the protocol state is 255 (unknown), the same contract the C ABI uses.
+/// Zero-hook path: one atomic load and return.
+pub fn rewrite_outbound_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    if rewrite_hook_count() == 0 {
+        return None;
+    }
+    let mut pkt = Packet {
+        direction: Direction::Outbound,
+        state: 255,
+        payload: payload.to_vec(),
+        conn_id: 0,
+        disconnect_reason: None,
+    };
+    run_rewrite_hooks(&mut pkt);
+    if pkt.payload.is_empty() || pkt.payload == payload {
+        return None;
+    }
+    Some(pkt.payload)
+}
+
+/// Run every rewrite hook over `packet`, in registration order. Driven by
+/// [`rewrite_outbound_payload`] on the encode-exit path; a no-op while the
+/// list is empty.
 pub fn run_rewrite_hooks(packet: &mut Packet) {
     if REWRITE_HOOKS_LIVE.load(Ordering::Acquire) == 0 {
         return;
@@ -736,6 +762,16 @@ pub fn install_default_rules() {
             Injection::MethodEntry,
             format!("{HOOK_CLASS}.onEncode"),
         ));
+        // Outbound write-back (slice 2): before every return of encode, the
+        // Java adapter hands the finished frame (packet id included) to the
+        // rewrite hooks. Slots: 0 = this, 1 = ctx, 2 = packet, 3 = out buffer.
+        engine.register(Rule::new(
+            "net/minecraft/network/PacketEncoder",
+            "encode",
+            DESCR_ENCODE,
+            Injection::MethodExit { ctx_slot: 1, buf_slot: 3 },
+            format!("{HOOK_CLASS}.onEncodeExit"),
+        ));
         // Handshake handler: intention packet picks status/login.
         engine.register(Rule::new(
             "net/minecraft/server/network/ServerHandshakePacketListenerImpl",
@@ -825,6 +861,30 @@ mod tests {
         assert_eq!(p.payload, vec![9, 2, 3, 4]);
         reset_state();
         assert_eq!(rewrite_hook_count(), 0);
+    }
+
+    #[test]
+    fn rewrite_outbound_payload_reports_only_real_changes() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+        // zero hooks: untouched, no copy
+        assert_eq!(rewrite_outbound_payload(&[46, 1]), None);
+        // a no-op hook is not a change
+        add_rewrite_hook(Arc::new(|_: &mut Packet| {}));
+        assert_eq!(rewrite_outbound_payload(&[46, 1]), None);
+        reset_state();
+        // a length-changing rewrite is returned whole (the frame is rebuilt)
+        add_rewrite_hook(Arc::new(|p: &mut Packet| {
+            assert_eq!(p.direction, Direction::Outbound);
+            assert_eq!(p.state, 255);
+            p.payload = vec![46, 9, 9, 9];
+        }));
+        assert_eq!(rewrite_outbound_payload(&[46, 1]), Some(vec![46, 9, 9, 9]));
+        reset_state();
+        // an empty replacement is refused
+        add_rewrite_hook(Arc::new(|p: &mut Packet| p.payload.clear()));
+        assert_eq!(rewrite_outbound_payload(&[46, 1]), None);
+        reset_state();
     }
 
     #[test]
@@ -989,7 +1049,7 @@ mod tests {
         reset_state();
         // Other bricks register into the same global engine, so only count
         // the NetHooks rules this brick owns; the OnceLock guarantees exactly
-        // five are ever installed, even with repeat calls.
+        // six are ever installed, even with repeat calls.
         let nethooks = || {
             global_engine()
                 .rules()
@@ -999,13 +1059,14 @@ mod tests {
         };
         install_default_rules();
         install_default_rules();
-        assert_eq!(nethooks(), 5);
+        assert_eq!(nethooks(), 6);
         let expected = [
             "onDecode",
             "onEncode",
             "onIntention",
             "onProtocolSwap",
             "onChannelInactive",
+            "onEncodeExit",
         ];
         let helpers: Vec<String> = global_engine()
             .rules()
