@@ -238,6 +238,48 @@ pub fn add_hook(f: PacketHookFn) {
     PACKET_HOOKS_LIVE.store(live, Ordering::Release);
 }
 
+/// Payload-rewrite hook (platform v2). Unlike [`PacketHookFn`] it may edit
+/// `packet.payload` in place or replace it; it never returns a verdict.
+pub type RewriteHookFn = Arc<dyn Fn(&mut Packet) + Send + Sync>;
+
+/// Rewrite-hook list: same RCU-published snapshot shape as `HOOKS`.
+static REWRITE_HOOKS: LazyLock<super::rcu::ArcCell<[RewriteHookFn]>> =
+    LazyLock::new(super::rcu::ArcCell::new);
+
+/// Live rewrite-hook count; zero skips the snapshot read entirely.
+static REWRITE_HOOKS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Register a payload-rewrite hook (order = registration order).
+pub fn add_rewrite_hook(f: RewriteHookFn) {
+    let cell = &*REWRITE_HOOKS;
+    let cur = cell.load_arc().unwrap_or_else(|| Vec::new().into());
+    let mut v: Vec<RewriteHookFn> = Vec::with_capacity(cur.len() + 1);
+    v.extend(cur.iter().cloned());
+    v.push(f);
+    let live = v.len();
+    cell.store(v.into());
+    REWRITE_HOOKS_LIVE.store(live, Ordering::Release);
+}
+
+/// Number of registered rewrite hooks.
+pub fn rewrite_hook_count() -> usize {
+    REWRITE_HOOKS_LIVE.load(Ordering::Acquire)
+}
+
+/// Run every rewrite hook over `packet`, in registration order. Not called
+/// from the packet path yet (slice 2 wires the write-back); a no-op while
+/// the list is empty.
+pub fn run_rewrite_hooks(packet: &mut Packet) {
+    if REWRITE_HOOKS_LIVE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Some(hooks) = REWRITE_HOOKS.load_arc() {
+        for h in hooks.iter() {
+            h(packet);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection state machine
 // ---------------------------------------------------------------------------
@@ -753,6 +795,9 @@ mod tests {
         let empty: Arc<[PacketHookFn]> = Arc::new([]);
         HOOKS.store(empty);
         PACKET_HOOKS_LIVE.store(0, Ordering::Release);
+        let empty_rw: Arc<[RewriteHookFn]> = Arc::new([]);
+        REWRITE_HOOKS.store(empty_rw);
+        REWRITE_HOOKS_LIVE.store(0, Ordering::Release);
     }
 
     pub(super) fn packet(direction: Direction, conn_id: u64, state: u8, payload: &[u8]) -> Packet {
@@ -763,6 +808,23 @@ mod tests {
             conn_id,
             disconnect_reason: None,
         }
+    }
+
+    #[test]
+    fn rewrite_hooks_edit_in_place_and_are_ordered() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+        assert_eq!(rewrite_hook_count(), 0);
+        let mut p = packet(Direction::Inbound, 7, 3, &[1, 2, 3]);
+        run_rewrite_hooks(&mut p); // empty list: no-op
+        assert_eq!(p.payload, vec![1, 2, 3]);
+        add_rewrite_hook(Arc::new(|p: &mut Packet| p.payload[0] = 9));
+        add_rewrite_hook(Arc::new(|p: &mut Packet| p.payload.push(4)));
+        assert_eq!(rewrite_hook_count(), 2);
+        run_rewrite_hooks(&mut p);
+        assert_eq!(p.payload, vec![9, 2, 3, 4]);
+        reset_state();
+        assert_eq!(rewrite_hook_count(), 0);
     }
 
     #[test]

@@ -17,8 +17,9 @@ use crate::platform::{
     telemetry, threads, transform,
 };
 use cplug_abi::{
-    CPacket, CPlatformApi, EventCb, FaultCb, PacketHookCb, SaveCb, SchedulerTaskCb, StorageBeginSaveCb,
-    StorageEndSaveCb, StorageNameCb, StorageReadCb, StorageWriteCb,
+    CPacket, CPacketRewrite, CPlatformApi, EventCb, FaultCb, PacketHookCb, PacketRewriteCb,
+    SaveCb, SchedulerTaskCb, StorageBeginSaveCb, StorageEndSaveCb, StorageNameCb, StorageReadCb,
+    StorageWriteCb,
 };
 use serde_json::{Number, Value};
 use std::cell::{Cell, RefCell};
@@ -28,7 +29,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Table version. MUST match `CPB_VERSION` in cplug-abi.
-pub const CPB_VERSION: u32 = 1;
+pub const CPB_VERSION: u32 = 2;
 
 /// TASK-179 A/B toggle: gate the C-entry JSON parse behind the
 /// zero-subscriber check. `false` = pre-TASK-179 shape (the payload is
@@ -1386,6 +1387,42 @@ unsafe extern "C" fn n_side_table_named(name: *const c_char, out: *mut u64) -> i
     }
 }
 
+/// Platform v2: register a payload-rewrite hook. The C callback is wrapped
+/// in a network-list entry; the list is not yet driven from the packet path
+/// (no write-back injection in this slice), so the callback does not run yet.
+/// After the callback returns, `out_payload` (if set) replaces the payload.
+unsafe extern "C" fn n_network_add_rewrite_hook(cb: PacketRewriteCb, ctx: *mut c_void) -> i32 {
+    if fnull(cb) {
+        return -1;
+    }
+    let ctx = Ctx(ctx);
+    network::add_rewrite_hook(Arc::new(move |pkt: &mut network::Packet| {
+        // Whole-`Ctx` capture (edition 2021 would otherwise capture the raw
+        // pointer field alone, which is not Send/Sync).
+        let ctx = ctx;
+        let mut cpkt = CPacketRewrite {
+            direction: match pkt.direction {
+                network::Direction::Inbound => 0i32,
+                network::Direction::Outbound => 1i32,
+            },
+            state: pkt.state,
+            payload: pkt.payload.as_mut_ptr(),
+            payload_len: pkt.payload.len(),
+            conn_id: pkt.conn_id,
+            out_payload: std::ptr::null(),
+            out_len: 0,
+        };
+        unsafe {
+            cb(&mut cpkt as *mut CPacketRewrite, ctx.0);
+            if !cpkt.out_payload.is_null() {
+                let replacement = std::slice::from_raw_parts(cpkt.out_payload, cpkt.out_len);
+                pkt.payload = replacement.to_vec();
+            }
+        }
+    }));
+    0
+}
+
 // ---------------------------------------------------------------------------
 // table
 // ---------------------------------------------------------------------------
@@ -1422,6 +1459,7 @@ pub static PLATFORM_API: CPlatformApi = CPlatformApi {
     hot_reload_leave: Some(n_hot_reload_leave),
     side_table_key: Some(n_side_table_key),
     side_table_named: Some(n_side_table_named),
+    network_add_rewrite_hook: Some(n_network_add_rewrite_hook),
 };
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1470,14 @@ pub static PLATFORM_API: CPlatformApi = CPlatformApi {
 mod tests {
     use super::*;
     use std::hint::black_box;
+
+    #[test]
+    fn platform_table_v2_exposes_rewrite_hook() {
+        assert_eq!(CPB_VERSION, 2);
+        assert_eq!(PLATFORM_API.version, CPB_VERSION);
+        assert!(PLATFORM_API.network_add_rewrite_hook.is_some());
+        assert!(PLATFORM_API.side_table_named.is_some());
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 

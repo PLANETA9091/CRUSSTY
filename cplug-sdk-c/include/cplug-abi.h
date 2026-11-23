@@ -29,7 +29,7 @@ extern "C" {
 #endif
 
 #define CPAPI_VERSION 3u        /* minimum version every module must accept */
-#define CPAPI_PLATFORM_VERSION 1u
+#define CPAPI_PLATFORM_VERSION 2u
 
 /* Opaque JavaVM* — cast to your JNI bindings' JavaVM type. */
 typedef void* JavaVmPtr;
@@ -72,6 +72,20 @@ typedef void (*cpapi_fault_cb)(
     int32_t signal, uint64_t timestamp_unix, uint64_t count, void* ctx);
 /* Packet hook: 0=pass, 1=drop, 2=disconnect. `pkt` valid during the call. */
 typedef int32_t (*cpapi_packet_cb)(const void* pkt, void* ctx);
+/* Payload-rewrite snapshot (platform v2). payload is runtime-owned and
+ * editable in place; set out_payload/out_len to a module-owned replacement
+ * (the runtime copies it). out_payload NULL keeps the in-place bytes. */
+typedef struct CPacketRewrite {
+    int32_t direction;          /* 0 = inbound, 1 = outbound */
+    uint8_t state;              /* 255 = unknown */
+    uint8_t* payload;
+    size_t payload_len;
+    uint64_t conn_id;
+    const uint8_t* out_payload;
+    size_t out_len;
+} CPacketRewrite;
+/* Rewrite hook: returns 0; it never drops or disconnects. */
+typedef int32_t (*cpapi_packet_rewrite_cb)(CPacketRewrite* pkt, void* ctx);
 /* Save-lifecycle callback; kind 0=autosave/1=manual; status 0=ok/1=failed. */
 typedef void (*cpapi_save_cb)(
     int32_t kind, int32_t status, uint64_t chunks_written, uint64_t duration_ms, void* ctx);
@@ -146,6 +160,9 @@ typedef struct CPlatformApi {
     /* side_table (brick 2); needs an attached thread */
     int32_t  (*side_table_key)(void* obj, uint64_t* out);
     int32_t  (*side_table_named)(const char* name, uint64_t* out);
+
+    /* network rewrite (platform v2, appended last); NULL on v1 runtimes */
+    int32_t  (*network_add_rewrite_hook)(cpapi_packet_rewrite_cb cb, void* ctx);
 } CPlatformApi;
 
 /* Agent -> plugin services. */
