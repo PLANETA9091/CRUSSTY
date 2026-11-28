@@ -13,7 +13,7 @@
 #[allow(dead_code)] // platform bricks are a public API surface; used by modules
 #[allow(ambiguous_glob_reexports)]
 pub mod platform;
-mod scan;
+pub mod scan;
 
 use std::cell::Cell;
 use std::collections::HashMap;
