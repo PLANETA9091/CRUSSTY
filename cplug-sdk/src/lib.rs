@@ -121,6 +121,13 @@ pub fn vm() -> JavaVmPtr {
 /// Single entry into the runtime pipeline: forwards every class load to the
 /// SDK's pattern-matching hook registries (names and bytes). Returns a
 /// patched class only when a byte hook replaced it.
+///
+/// MULTI-MODULE ISOLATION (last line of defense): the whole body runs under
+/// catch_unwind — nothing may unwind through this `extern "C"` boundary
+/// (= process abort). `hooks::dispatch*` already isolate each USER callback;
+/// this wrapper only covers panics in the SDK plumbing itself. A caught
+/// panic degrades to "class runs unpatched" (rc 1) exactly like any other
+/// failure here.
 unsafe extern "C" fn sdk_dispatch_hook(
     _ctx: *mut std::ffi::c_void,
     name: *const std::ffi::c_char,
@@ -129,28 +136,39 @@ unsafe extern "C" fn sdk_dispatch_hook(
     out_data: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    let nm = jni_util::cstr(name);
-    if let Some(nm) = &nm {
-        hooks::dispatch(nm);
-        if !class_data.is_null() && !out_data.is_null() && !out_len.is_null() {
-            let data = unsafe { std::slice::from_raw_parts(class_data, class_data_len) };
-            let alloc_addr = ALLOC.load(Ordering::Relaxed);
-            if alloc_addr != 0 {
-                if let Some(patched) = hooks::dispatch_bytes(nm, data) {
-                    let alloc: unsafe extern "C" fn(usize) -> *mut u8 =
-                        unsafe { std::mem::transmute(alloc_addr) };
-                    let ptr = alloc(patched.len());
-                    if !ptr.is_null() {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(patched.as_ptr(), ptr, patched.len());
-                            *out_data = ptr;
-                            *out_len = patched.len();
+    let body = || -> i32 {
+        let nm = jni_util::cstr(name);
+        if let Some(nm) = &nm {
+            hooks::dispatch(nm);
+            if !class_data.is_null() && !out_data.is_null() && !out_len.is_null() {
+                let data = unsafe { std::slice::from_raw_parts(class_data, class_data_len) };
+                let alloc_addr = ALLOC.load(Ordering::Relaxed);
+                if alloc_addr != 0 {
+                    if let Some(patched) = hooks::dispatch_bytes(nm, data) {
+                        let alloc: unsafe extern "C" fn(usize) -> *mut u8 =
+                            unsafe { std::mem::transmute(alloc_addr) };
+                        let ptr = alloc(patched.len());
+                        if !ptr.is_null() {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(patched.as_ptr(), ptr, patched.len());
+                                *out_data = ptr;
+                                *out_len = patched.len();
+                            }
+                            return 0;
                         }
-                        return 0;
                     }
                 }
             }
         }
+        1
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(rc) => rc,
+        Err(_) => {
+            eprintln!(
+                "[cplug-sdk] dispatch hook PANICKED — class runs unpatched; the server and the other modules continue"
+            );
+            1
+        }
     }
-    1
 }

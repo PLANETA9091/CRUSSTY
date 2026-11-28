@@ -132,6 +132,55 @@ struct LoadedModule {
     /// count), shared with the lock-free lookup map so the dispatcher's
     /// enter/leave/guard path never takes the registry Mutex.
     gate: Arc<ModuleGate>,
+    /// On-disk identity of the library file at admit/reload time (unix:
+    /// dev+inode+mtime). The SIGUSR1 reload trigger consults it to reload
+    /// ONLY the modules whose build actually changed — `crussty reload`
+    /// with several modules installed no longer restarts the modules the
+    /// user did not rebuild (their state, threads and caches survive).
+    /// `None` on non-unix (no stat plumbing here) or in fabricated test
+    /// entries: those always reload (the historical behavior).
+    ident: Option<FileIdent>,
+}
+
+/// File identity for the selective reload (dev, inode, mtime in ns). inode
+/// is the honest signal for build artifacts: the e2e already asserts that a
+/// rebuild produces a NEW inode (mv + replace), and mtime is the fallback
+/// tiebreaker for in-place writes (cargo does both depending on the target).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdent {
+    dev: u64,
+    ino: u64,
+    mtime_ns: i64,
+}
+
+/// Stat a file's identity. `None` = stat failed (file vanished) or non-unix.
+#[cfg(unix)]
+fn file_ident(path: &Path) -> Option<FileIdent> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let rc = unsafe { libc::stat(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some(FileIdent {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        mtime_ns: st.st_mtime as i64,
+    })
+}
+
+/// Has the module's library file on disk changed since the recorded
+/// identity? `Some(false)` = byte-for-byte same file still installed → the
+/// reload trigger SKIPS it; `Some(true)`/`None` = changed, vanished, never
+/// recorded or non-unix → reload (conservative, matches the old behavior).
+#[cfg(unix)]
+fn module_on_disk_changed(id: &str) -> Option<bool> {
+    let reg = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = reg.get(id)?;
+    let recorded = entry.ident?;
+    let current = file_ident(&entry.path)?;
+    Some(current != recorded)
 }
 
 /// TASK-177: const toggle for the A/B rig. `true` = packed-gate lock-free
@@ -497,6 +546,8 @@ fn insert_entry(
         return Err((format!("module '{id}' is already registered"), lib));
     }
     let gate = Arc::new(ModuleGate::with(0, false));
+    // Stat BEFORE the move: the identity of the file as admitted.
+    let ident = file_ident(&path);
     reg.insert(
         id.to_string(),
         LoadedModule {
@@ -511,6 +562,7 @@ fn insert_entry(
             active: 0,
             swapping: false,
             gate: Arc::clone(&gate),
+            ident,
         },
     );
     drop(reg);
@@ -621,6 +673,11 @@ pub fn reload_module(id: &str) -> Result<(), String> {
             entry.gen = old_gen + 1;
             entry.loaded_at_unix = unix_now();
             entry.init_rc = 0;
+            // Refresh the on-disk identity: the NEXT SIGUSR1 must compare
+            // against the file that is live NOW, not against the replaced
+            // build (or the just-reloaded module would reload again and
+            // again on every trigger).
+            entry.ident = file_ident(&path);
             if MODULE_GUARD_LOCKFREE {
                 gate.unreserve();
             } else {
@@ -848,6 +905,18 @@ fn reload_loop() {
             ids.len()
         );
         for id in &ids {
+            // SELECTIVE RELOAD (multi-module): SIGUSR1 says "something was
+            // rebuilt" — only the modules whose library file actually
+            // changed on disk get swapped. Unchanged modules keep their
+            // state (threads, caches, subscriptions) instead of losing it
+            // to a restart they did not need.
+            #[cfg(unix)]
+            if let Some(false) = module_on_disk_changed(id) {
+                eprintln!(
+                    "[crussty:hot-reload] '{id}' unchanged on disk — skipped (state preserved)"
+                );
+                continue;
+            }
             match reload_module(id) {
                 Ok(()) => {
                     eprintln!("[crussty:hot-reload] '{id}' reloaded (dlopen'd fresh + re-init)");
@@ -882,6 +951,7 @@ pub(crate) fn test_seed_module(id: &str, active: usize, swapping: bool) {
             active,
             swapping,
             gate: Arc::clone(&gate),
+            ident: None,
         },
     );
     gates_mutate(|m| {
@@ -962,11 +1032,62 @@ mod tests {
                 active,
                 swapping,
                 gate: Arc::clone(&gate),
+                ident: None,
             },
         );
         gates_mutate(|m| {
             m.insert(id.into(), gate);
         });
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn selective_reload_skips_unchanged_and_flags_changed() {
+        let dir = std::env::temp_dir().join(format!("cplug-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_path = dir.join("libselmod.so");
+        std::fs::write(&lib_path, b"build one").unwrap();
+
+        register_fake("selmod", lib_path.clone(), 1, 0, 0, false);
+        // Give the fabricated entry a REAL on-disk identity (tests fabricate
+        // ident: None = always reload).
+        let ident = file_ident(&lib_path).expect("stat works");
+        registry().lock().unwrap().get_mut("selmod").unwrap().ident = Some(ident);
+
+        // Same file, untouched: the trigger must SKIP it.
+        assert_eq!(
+            module_on_disk_changed("selmod"),
+            Some(false),
+            "unchanged file -> skip"
+        );
+
+        // Rebuild the way cargo/e2e do it (mv + replace = NEW inode).
+        let tmp = dir.join(".tmp.so");
+        std::fs::write(&tmp, b"build two").unwrap();
+        std::fs::rename(&tmp, &lib_path).unwrap();
+        assert_eq!(
+            module_on_disk_changed("selmod"),
+            Some(true),
+            "replaced inode -> reload"
+        );
+
+        // In-place write with the SAME inode but a newer mtime: reload too.
+        std::fs::write(&lib_path, b"build three").unwrap();
+        let new_ident = file_ident(&lib_path).unwrap();
+        if new_ident.ino == ident.ino {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let newer = file_ident(&lib_path).unwrap();
+            assert_ne!(newer.mtime_ns, ident.mtime_ns, "mtime moves on rewrite");
+        }
+
+        // Unknown id -> None (conservative reload decision by the caller).
+        assert_eq!(module_on_disk_changed("no-such-module"), None);
+
+        // Cleanup the shared registry.
+        registry().lock().unwrap().remove("selmod");
+        gates_mutate(|m| { m.remove("selmod"); });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Stub: replacement "loads" but its init fails with rc 7.

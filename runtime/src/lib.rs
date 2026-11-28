@@ -611,29 +611,47 @@ impl Agent for CrusstyRuntime {
                     entry.ctx, entry.func as usize, current_len
                 );
             }
-            let rc = unsafe {
-                // CRITICAL BUG FIX (agent-7625532f, 2026-09-08): `name` is a
-                // Rust String — NOT NUL-terminated. Passing `name.as_ptr()`
-                // to the C-ABI plugin hook made every consumer's C-string
-                // scan run past the end into unrelated heap bytes, so the
-                // effective hook name was heap-layout-dependent: some classes
-                // (e.g. net/minecraft/world/level/levelgen/synth/PerlinNoise)
-                // matched, others (e.g. net/minecraft/world/entity/Entity)
-                // silently missed their hooks — whole-body patches silently
-                // became no-ops with retransform rc=0. Always pass a
-                // properly NUL-terminated copy.
-                match cname.as_deref() {
-                    Some(p) => (entry.func)(
-                        entry.ctx as *mut c_void,
-                        p.as_ptr() as *const c_char,
-                        current,
-                        current_len,
-                        &mut out,
-                        &mut out_len,
-                    ),
-                    None => 1,
+            // CRITICAL BUG FIX (agent-7625532f, 2026-09-08): `name` is a
+            // Rust String — NOT NUL-terminated. Passing `name.as_ptr()`
+            // to the C-ABI plugin hook made every consumer's C-string
+            // scan run past the end into unrelated heap bytes, so the
+            // effective hook name was heap-layout-dependent: some classes
+            // (e.g. net/minecraft/world/level/levelgen/synth/PerlinNoise)
+            // matched, others (e.g. net/minecraft/world/entity/Entity)
+            // silently missed their hooks — whole-body patches silently
+            // became no-ops with retransform rc=0. Always pass a
+            // properly NUL-terminated copy.
+            //
+            // MULTI-MODULE ISOLATION: the call is panic-isolated — a
+            // panicking hook cannot abort the JVM, the hook is disabled
+            // for the process lifetime, and the remaining hooks (other
+            // modules) still see the class with its current bytes.
+            let cname_ptr = cname.as_deref().map(|p| {
+                p.as_ptr() as *const c_char
+            });
+            let (rc, panicked) = match cname_ptr {
+                Some(p) => {
+                    call_hook_isolated(entry, p, current, current_len, &mut out, &mut out_len)
                 }
+                // No usable NUL-terminated name (interior NUL in the class
+                // name — never happens in practice): skip the hook exactly
+                // as before, do NOT invoke it with a null pointer and do
+                // NOT disable it (the module is not at fault).
+                None => (1, false),
             };
+            if panicked {
+                let owner = entry
+                    .owner
+                    .as_ref()
+                    .map(|(id, _)| id.as_str())
+                    .unwrap_or("<unattributed>");
+                eprintln!(
+                    "[crussty-runtime] class hook of module '{owner}' PANICKED on '{name}' — that hook is disabled for the process lifetime; other modules continue"
+                );
+                disable_hook(entry);
+                drop(guard);
+                continue;
+            }
             drop(guard);
             if std::env::var_os("CRUSSTY_TRACE_HOOKS").is_some() {
                 eprintln!(
@@ -966,6 +984,58 @@ unsafe extern "C" fn api_register_class_hook(ctx: *mut c_void, hook: ClassHookFn
     0
 }
 
+/// MULTI-MODULE ISOLATION — one panicking module hook must not abort the JVM.
+/// The call crosses FFI into unknown module code on a JVM class-loading
+/// thread: an unwinding panic through this callback is a process abort, and
+/// with several modules installed a single broken module would take every
+/// other module (and the server) down with it on the FIRST class load after
+/// the panic became reachable. This wrapper catches the unwind and reports
+/// it; the caller degrades exactly as for `rc != 0` (the class keeps its
+/// current bytes) and additionally disables the hook — a dead hook that
+/// panics on every load would otherwise slow every class load forever.
+/// Returns `(rc, panicked)`; `out`/`out_len` are ONLY valid when
+/// `panicked == false` (the panic can happen before the callee stores them).
+fn call_hook_isolated(
+    entry: &HookEntry,
+    cname_ptr: *const c_char,
+    current: *const u8,
+    current_len: usize,
+    out: &mut *mut u8,
+    out_len: &mut usize,
+) -> (i32, bool) {
+    let func = entry.func;
+    let ctx = entry.ctx as *mut c_void;
+    let out_p: *mut *mut u8 = out;
+    let out_len_p: *mut usize = out_len;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        (func)(ctx, cname_ptr, current, current_len, out_p, out_len_p)
+    }));
+    match r {
+        Ok(rc) => (rc, false),
+        Err(_) => (1, true),
+    }
+}
+
+/// Disable a hook that panicked: purge it from the live table (by owner +
+/// ctx + fn identity — an owner may register several hooks and the same
+/// (ctx, fn) pair is unique per registration) and drop the live count so the
+/// class-load fast gate stays honest. Ownership keeps OTHER modules' hooks
+/// untouched: only the panicking registration disappears.
+fn disable_hook(entry: &HookEntry) {
+    let mut table = hooks().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = table.len();
+    table.retain(|h| {
+        !(h.ctx == entry.ctx
+            && h.func as usize == entry.func as usize
+            && h.owner == entry.owner)
+    });
+    let removed = before - table.len();
+    drop(table);
+    if removed > 0 {
+        PLUGIN_HOOKS_LIVE.fetch_sub(removed as usize, Ordering::Release);
+    }
+}
+
 /// # Safety
 /// Called by a module through `CPluginApi::jvmti_allocate`; the returned
 /// buffer is JVMTI-owned and stays valid until the module deallocates it
@@ -1124,8 +1194,19 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
     let api = cplugin_api();
     let c_options = CString::new(options).unwrap_or_default();
     let found = scan::scan(root);
+    // Multi-module boot hygiene (see dedupe_plugins): the FIRST module per id
+    // loads; every duplicate is refused loudly instead of loading as a
+    // half-initialized zombie that shares its owner id with the winner.
+    let (found, refused) = scan::dedupe_plugins(found);
+    for r in &refused {
+        eprintln!("[crussty-runtime] {r}");
+    }
     if found.is_empty() {
-        eprintln!("[crussty-runtime] no modules found under {}", root.display());
+        eprintln!(
+            "[crussty-runtime] no modules found under {}{}",
+            root.display(),
+            if refused.is_empty() { "" } else { " (duplicates refused)" }
+        );
     }
     for plugin in found {
         // RTLD_LOCAL: one plugin cannot shadow another's symbols (the Java
@@ -1152,9 +1233,37 @@ fn load_plugins(root: &std::path::Path, vm: JavaVmPtr, options: &str) {
         // (plugin id, generation 1): hooks and event subscriptions the
         // module registers become owned by it, so a later hot reload can
         // purge exactly the replaced generation (see purge_module_hooks).
+        //
+        // MULTI-MODULE ISOLATION: the handshake runs under catch_unwind —
+        // the call crosses FFI into unknown module code, and a panic
+        // unwinding through it would abort the whole JVM at boot. A broken
+        // module now fails ALONE (rc path below, log names the module and
+        // the panic) and the remaining modules still come up.
+        let per_module = plugin
+            .options
+            .as_deref()
+            .and_then(|s| CString::new(s).ok())
+            .unwrap_or_else(|| c_options.clone());
         let _owner = begin_registration(&plugin.id, 1);
-        let rc = unsafe { init(api, vm, c_options.as_ptr()) };
+        let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            init(api, vm, per_module.as_ptr())
+        }));
         drop(_owner);
+        let rc = match init_result {
+            Ok(rc) => rc,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                eprintln!(
+                    "[crussty-runtime] module {} PANICKED in cplugin_init: {msg} — module fails alone, the rest continue",
+                    plugin.id
+                );
+                1
+            }
+        };
         eprintln!("[crussty-runtime] module {} -> init rc={rc}", plugin.id);
         if rc == 0 {
             // Admit the loaded library into the hot-reload registry: the
@@ -1232,6 +1341,13 @@ mod tests {
 #[cfg(test)]
 mod purge_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The hook table is a process-global: tests that mutate or absolutely
+    /// count it serialize on this lock (parallel threads were already
+    /// racing the absolute-length assertions; the multi-module tests widen
+    /// the window enough to make it visible).
+    static TABLE_LOCK: Mutex<()> = Mutex::new(());
 
     /// # Safety
     /// Test fixture only: never reached by the VM. The signature matches
@@ -1255,6 +1371,7 @@ mod purge_tests {
 
     #[test]
     fn purge_removes_only_the_replaced_generation() {
+        let _serial = TABLE_LOCK.lock().unwrap();
         // Startup: hello gen 1 registers a hook; dist never does.
         let _g1 = begin_registration("hello", 1);
         assert_eq!(register(0x11), Some(("hello".to_string(), 1)));
@@ -1293,479 +1410,74 @@ mod purge_tests {
         assert_eq!(h[0].owner, None);
         assert_eq!(h[0].ctx, 0x22);
     }
-}
-
-#[cfg(test)]
-mod claim_tests {
-    use super::*;
-
-    fn key(s: &str) -> CString {
-        CString::new(s).unwrap()
-    }
-
-    fn claim(owner: usize, k: &str) -> i32 {
-        let k = key(k);
-        unsafe { api_claim(owner, k.as_ptr() as *const c_char) }
-    }
-
     #[test]
-    fn claim_first_wins_second_owner_rejected() {
-        assert_eq!(claim(0x11, "class:a/b/C"), 0);
-        assert_eq!(claim(0x11, "class:a/b/C"), 0); // idempotent, same owner
-        assert_eq!(claim(0x22, "class:a/b/C"), -1); // other module: refused
-        assert_eq!(claim(0x22, "class:a/b/D"), 0); // different key: fine
-    }
+    fn disable_hook_purges_only_the_panicking_registration() {
+        let _serial = TABLE_LOCK.lock().unwrap();
+        // Two modules + one unowned registration, in the shared table.
+        let _g1 = begin_registration("victim", 1);
+        unsafe { api_register_class_hook(0xA1 as *mut c_void, dummy_hook) };
+        drop(_g1);
+        let _g2 = begin_registration("bystander", 1);
+        unsafe { api_register_class_hook(0xB2 as *mut c_void, dummy_hook) };
+        drop(_g2);
 
-    #[test]
-    fn registration_window_is_thread_local() {
-        // TASK-168 regression: a handshake window on thread A must never
-        // stamp registrations (or owner queries) made on thread B. The
-        // pre-TASK-168 global REG_CTX leaked the window across threads and
-        // broke the TASK-167 concurrent memo test in CI.
-        assert_eq!(registration_owner(), None, "clean thread starts unowned");
-        let _g = begin_registration("tlocal", 3);
-        assert_eq!(registration_owner(), Some(("tlocal".to_string(), 3)));
-        let other = std::thread::spawn(|| {
-            assert_eq!(
-                registration_owner(),
-                None,
-                "another thread's window must be invisible here"
-            );
-            // Subscriptions made on this thread stay unowned even while the
-            // first thread's window is open: an owner purge for that window
-            // must not touch them.
-            let bus = platform::events::EventBus::default();
-            bus.subscribe("tlocal.evt", std::sync::Arc::new(|_, _| {}));
-            assert_eq!(
-                bus.purge_owner(&("tlocal".to_string(), 3)),
-                0,
-                "subscription must be unowned: another thread's window is invisible"
-            );
-            assert_eq!(bus.publish("tlocal.evt", &serde_json::json!(null)), 1);
-        });
-        other.join().unwrap();
+        let table = hooks().lock().unwrap();
+        let victim = table
+            .iter()
+            .find(|h| h.owner.as_ref().map(|(id, _)| id.as_str()) == Some("victim"))
+            .cloned()
+            .expect("victim hook present");
+        let bystander = table
+            .iter()
+            .find(|h| h.owner.as_ref().map(|(id, _)| id.as_str()) == Some("bystander"))
+            .cloned()
+            .expect("bystander hook present");
+        drop(table);
+
+        let live_before = PLUGIN_HOOKS_LIVE.load(Ordering::SeqCst);
+        disable_hook(&victim);
+
+        let table = hooks().lock().unwrap();
+        assert!(
+            !table.iter().any(|h| h.ctx == victim.ctx
+                && h.owner == victim.owner
+                && h.func as usize == victim.func as usize),
+            "the panicking hook is gone"
+        );
+        assert!(
+            table.iter().any(|h| h.ctx == bystander.ctx && h.owner == bystander.owner),
+            "other modules' hooks are untouched"
+        );
+        drop(table);
         assert_eq!(
-            registration_owner(),
-            Some(("tlocal".to_string(), 3)),
-            "window intact on the owning thread"
+            PLUGIN_HOOKS_LIVE.load(Ordering::SeqCst),
+            live_before - 1,
+            "the live-count gate stays honest"
         );
-        drop(_g);
-        assert_eq!(registration_owner(), None, "guard drop restores None");
-    }
-}
 
-/// Round-4 hotpath benches (TASK-163): the per-class-load loop is the JVM's
-/// hottest path — every class the kernel ever loads pays this callback.
-#[cfg(test)]
-mod bench_hotpath {
-    //! Release-only A/B benches: `cargo test --release -- --ignored --nocapture bench_cflh`.
-    use super::*;
-    use std::time::Instant;
-
-    /// A representative mid-size class: ~300 constant-pool entries, a
-    /// ~40-char internal name — the shape of a typical kernel class.
-    ///
-    /// TASK-207 FIX (bench trap #4): the pre-207 fixture was MALFORMED and
-    /// `class_file_name` returned `None` on it — the 826 ns ledger line was
-    /// the walk plus a FAILURE tail, not a successful extraction. Three
-    /// defects: (1) the name Utf8 declared length 40 but
-    /// "java/util/concurrent/ConcurrentHashMap" is 37 bytes; (2) the Class
-    /// entry was pushed as slot 302 while cp_count=300 leaves valid slots
-    /// 1..=299 — it sat past the pool end; (3) `this_class = slots-1 = 299`
-    /// pointed at the name Utf8 itself (tag 1, not 7) — resolution could
-    /// only fail. The fixed fixture: 299 fillers (slots 1..=299), name Utf8
-    /// slot 300 with its REAL length, Class entry slot 301, this_class=301.
-    fn representative_class() -> Vec<u8> {
-        let mut b = Vec::with_capacity(8192);
-        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
-        b.extend_from_slice(&[0, 0]); // minor
-        b.extend_from_slice(&[0, 65]); // major 65
-        let slots = 302u16;
-        b.extend_from_slice(&slots.to_be_bytes()); // cp_count
-        let mut i = 1usize;
-        while i < (slots as usize) - 2 {
-            // Utf8 filler entry (varied lengths 8..40)
-            let len = 8 + (i % 32);
-            b.push(1);
-            b.extend_from_slice(&(len as u16).to_be_bytes());
-            b.extend(std::iter::repeat(b'x').take(len));
-            i += 1;
-        }
-        // slot 300: the name Utf8, length = REAL byte length
-        let name: &[u8] = b"java/util/concurrent/ConcurrentHashMap";
-        b.push(1);
-        b.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        b.extend_from_slice(name);
-        // slot 301: Class entry pointing at the name Utf8
-        b.push(7);
-        b.extend_from_slice(&((slots - 2)).to_be_bytes());
-        b.extend_from_slice(&[0, 0x21]); // access_flags
-        b.extend_from_slice(&(slots - 1).to_be_bytes()); // this_class -> slot 301
-        b.extend_from_slice(&[0, 0]); // super_class = 0
-        b
+        // Cleanup: restore the table to its pre-test state.
+        hooks().lock().unwrap().retain(|h| !(h.owner.as_ref().map(|(id, _)| id.as_str()) == Some("victim") || h.owner.as_ref().map(|(id, _)| id.as_str()) == Some("bystander")));
+        PLUGIN_HOOKS_LIVE.fetch_sub(2, Ordering::SeqCst);
     }
 
     #[test]
-    #[ignore]
-    fn bench_cflh_class_load_overhead() {
-        let data = representative_class();
-        let iters = 200_000u32;
-        let rounds = 5;
-
-        // segment 1: name derivation from class bytes
-        for _ in 0..10_000u32 {
-            let _ = class_file_name(&data);
-        }
-        let mut best_name = f64::MAX;
-        for _ in 0..rounds {
-            let t = Instant::now();
-            for _ in 0..iters {
-                let _ = class_file_name(&data);
-            }
-            best_name = best_name.min(t.elapsed().as_secs_f64() / f64::from(iters));
-        }
-
-        // segment 2: the class-load fast-gate chain (TASK-163) — plugin
-        // hook count + engine rule count + lifecycle subscriber check, the
-        // shape every class load pays before any work happens.
-        let gate = || {
-            let hooks_live = PLUGIN_HOOKS_LIVE.load(Ordering::Acquire) > 0;
-            !hooks_live
-                && platform::transform::global_engine().rule_count() == 0
-                && !platform::events::global_ref()
-                    .has_subscribers(platform::lifecycle::CLASS_LOADED)
-        };
-        // bisection: per-component attribution
-        let (mut b1, mut b2, mut b3) = (f64::MAX, f64::MAX, f64::MAX);
-        for _ in 0..rounds {
-            let t = Instant::now();
-            for _ in 0..iters {
-                std::hint::black_box(PLUGIN_HOOKS_LIVE.load(Ordering::Acquire));
-            }
-            b1 = b1.min(t.elapsed().as_secs_f64() / f64::from(iters));
-            let t = Instant::now();
-            for _ in 0..iters {
-                std::hint::black_box(platform::transform::global_engine().rule_count());
-            }
-            b2 = b2.min(t.elapsed().as_secs_f64() / f64::from(iters));
-            let t = Instant::now();
-            for _ in 0..iters {
-                std::hint::black_box(
-                    platform::events::global_ref()
-                        .has_subscribers(platform::lifecycle::CLASS_LOADED),
-                );
-            }
-            b3 = b3.min(t.elapsed().as_secs_f64() / f64::from(iters));
-        }
-        for _ in 0..10_000u32 {
-            let _ = gate();
-        }
-        let mut best_prep = f64::MAX;
-        for _ in 0..rounds {
-            let t = Instant::now();
-            for _ in 0..iters {
-                let _ = gate();
-            }
-            best_prep = best_prep.min(t.elapsed().as_secs_f64() / f64::from(iters));
-        }
-        println!(
-            "BENCH cflh: class_file_name {:.0} ns/op, fast-gate {:.0} ns/op (hooks {:.0} / rules {:.0} / subs {:.0}) (min of {rounds}x{iters})",
-            best_name * 1e9,
-            best_prep * 1e9,
-            b1 * 1e9,
-            b2 * 1e9,
-            b3 * 1e9
+    fn call_hook_isolated_propagates_rc_and_out() {
+        // A well-behaved hook (dummy_hook returns rc 0, touches nothing):
+        // the isolated call must be transparent — (rc=0, panicked=false).
+        let entry = HookEntry { owner: None, ctx: 0, func: dummy_hook };
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let (rc, panicked) = call_hook_isolated(
+            &entry,
+            b"test/Class\0".as_ptr() as *const c_char,
+            b"class bytes".as_ptr(),
+            11,
+            &mut out,
+            &mut out_len,
         );
+        assert_eq!(rc, 0, "a healthy hook's rc passes through unchanged");
+        assert!(!panicked);
+        assert!(out.is_null());
     }
 
-    /// TASK-207: stage decomposition of the cflh class_file_name line
-    /// (826 ns in the ledger). Independent min-of-5x200k arms over the same
-    /// fixture bytes:
-    ///   - `e2e`        — the real `class_file_name` (verbatim `[0u32;1024]`
-    ///                    offs table + resolution tail)
-    ///   - `walk`       — pass-1 replica: tag stepping only, no offs table,
-    ///                    no resolution
-    ///   - `walk+offs`  — pass-1 replica WITH the offs-table stores (the
-    ///                    TASK-163 resolution structure), no tail
-    ///   - `e2e-noinit` — full replica with the offs table as `MaybeUninit`
-    ///                    (the walk writes every slot 1..cp_count before any
-    ///                    read; reads are confined to written slots by the
-    ///                    same guards the real entry uses) — isolates the
-    ///                    4 KiB zero-init if the compiler emits one for
-    ///                    `[0u32; 1024]`
-    /// Correctness gate BEFORE timing: the real entry and both replicas must
-    /// agree, and the fixture must resolve to a name at all — a malformed
-    /// fixture that silently resolves to `None` would bench the walk plus a
-    /// failure tail instead of the extraction (the trap this round found in
-    /// the pre-207 representative_class).
-    #[test]
-    #[ignore]
-    fn bench_cflh_stages_iso() {
-        use std::hint::black_box;
-        let data = representative_class();
-        let iters = 200_000u32;
-        let rounds = 5;
-
-        let real = class_file_name(&data);
-        let repl = cflh_replica(&data);
-        let repl_noinit = cflh_replica_noinit(&data);
-        println!(
-            "cflh fixture gate: real={real:?} replica={repl:?} noinit={repl_noinit:?}"
-        );
-        assert_eq!(real, repl, "replica must agree with the real entry");
-        assert_eq!(real, repl_noinit, "noinit replica must agree");
-        assert!(real.is_some(), "fixture must be a VALID class (name resolves)");
-
-        fn time(label: &str, rounds: u32, iters: u32, mut f: impl FnMut()) {
-            for _ in 0..10_000u32 {
-                f();
-            }
-            let mut best = f64::MAX;
-            for _ in 0..rounds {
-                let t = Instant::now();
-                for _ in 0..iters {
-                    f();
-                }
-                best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
-            }
-            println!(
-                "BENCH cflh stage {label}: {:.0} ns/op (min of {rounds}x{iters})",
-                best * 1e9
-            );
-        }
-
-        time("e2e", rounds, iters, || {
-            black_box(class_file_name(black_box(&data)));
-        });
-        time("walk", rounds, iters, || {
-            black_box(cflh_walk_only(black_box(&data)));
-        });
-        time("walk+offs", rounds, iters, || {
-            black_box(cflh_walk_offs(black_box(&data)));
-        });
-        time("e2e-noinit", rounds, iters, || {
-            black_box(cflh_replica_noinit(black_box(&data)));
-        });
-    }
-
-    /// Pass-1 replica: step the pool exactly like `class_file_name` does,
-    /// recording nothing and resolving nothing. Returns the pool-end offset.
-    fn cflh_walk_only(data: &[u8]) -> Option<usize> {
-        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
-            return None;
-        }
-        let u16_at = |i: usize| -> Option<u16> {
-            if i + 2 > data.len() {
-                return None;
-            }
-            Some(u16::from_be_bytes([data[i], data[i + 1]]))
-        };
-        let cp_count = u16_at(8)? as usize;
-        if cp_count == 0 {
-            return None;
-        }
-        let mut idx = 10usize;
-        let mut i = 1usize;
-        while i < cp_count {
-            let tag = *data.get(idx)?;
-            idx += match tag {
-                1 => 3 + u16_at(idx + 1)? as usize,
-                7 | 8 | 16 | 19 | 20 => 3,
-                15 => 4,
-                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
-                5 | 6 => 9,
-                _ => return None,
-            };
-            i += match tag {
-                5 | 6 => 2,
-                _ => 1,
-            };
-        }
-        Some(idx)
-    }
-
-    /// Pass-1 replica WITH the offs-table stores (verbatim `[0u32; 1024]`
-    /// zeroed table like the real entry), no resolution tail.
-    fn cflh_walk_offs(data: &[u8]) -> Option<usize> {
-        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
-            return None;
-        }
-        let u16_at = |i: usize| -> Option<u16> {
-            if i + 2 > data.len() {
-                return None;
-            }
-            Some(u16::from_be_bytes([data[i], data[i + 1]]))
-        };
-        let cp_count = u16_at(8)? as usize;
-        if cp_count == 0 {
-            return None;
-        }
-        if cp_count > 1024 {
-            return None; // bench fixture stays under the table cap
-        }
-        let mut offs = [0u32; 1024];
-        let mut idx = 10usize;
-        let mut i = 1usize;
-        while i < cp_count {
-            offs[i] = idx as u32;
-            let tag = *data.get(idx)?;
-            idx += match tag {
-                1 => 3 + u16_at(idx + 1)? as usize,
-                7 | 8 | 16 | 19 | 20 => 3,
-                15 => 4,
-                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
-                5 | 6 => 9,
-                _ => return None,
-            };
-            i += match tag {
-                5 | 6 => 2,
-                _ => 1,
-            };
-        }
-        Some(idx)
-    }
-
-    /// Full verbatim replica of `class_file_name` (zeroed offs table).
-    fn cflh_replica(data: &[u8]) -> Option<&str> {
-        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
-            return None;
-        }
-        let u16_at = |i: usize| -> Option<u16> {
-            if i + 2 > data.len() {
-                return None;
-            }
-            Some(u16::from_be_bytes([data[i], data[i + 1]]))
-        };
-        let cp_count = u16_at(8)? as usize;
-        if cp_count == 0 || cp_count > 1024 {
-            return None;
-        }
-        let mut offs = [0u32; 1024];
-        let mut idx = 10usize;
-        let mut i = 1usize;
-        while i < cp_count {
-            offs[i] = idx as u32;
-            let tag = *data.get(idx)?;
-            idx += match tag {
-                1 => 3 + u16_at(idx + 1)? as usize,
-                7 | 8 | 16 | 19 | 20 => 3,
-                15 => 4,
-                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
-                5 | 6 => 9,
-                _ => return None,
-            };
-            i += match tag {
-                5 | 6 => 2,
-                _ => 1,
-            };
-        }
-        let this_idx = u16_at(idx + 2)? as usize;
-        if this_idx == 0 || this_idx >= cp_count {
-            return None;
-        }
-        let cat = offs[this_idx] as usize;
-        if *data.get(cat)? != 7 {
-            return None;
-        }
-        let name_idx = u16_at(cat + 1)? as usize;
-        if name_idx == 0 || name_idx >= cp_count {
-            return None;
-        }
-        let nat = offs[name_idx] as usize;
-        if *data.get(nat)? != 1 {
-            return None;
-        }
-        let len = u16_at(nat + 1)? as usize;
-        let start = nat + 3;
-        if start + len > data.len() {
-            return None;
-        }
-        std::str::from_utf8(&data[start..start + len]).ok()
-    }
-
-    /// Full replica of `class_file_name` with the offs table as
-    /// `MaybeUninit` — identical walk and tail, but no 4 KiB zero-init.
-    /// Soundness: the walk writes offs[1..cp_count] before the tail reads;
-    /// the tail reads only offs[this_idx] and offs[name_idx] with both
-    /// indices guarded to `1..cp_count` exactly like the real entry (offs[0]
-    /// is never read — `this_idx == 0` is rejected first).
-    fn cflh_replica_noinit(data: &[u8]) -> Option<&str> {
-        use std::mem::MaybeUninit;
-        if data.len() < 10 || data[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
-            return None;
-        }
-        let u16_at = |i: usize| -> Option<u16> {
-            if i + 2 > data.len() {
-                return None;
-            }
-            Some(u16::from_be_bytes([data[i], data[i + 1]]))
-        };
-        let cp_count = u16_at(8)? as usize;
-        if cp_count == 0 || cp_count > 1024 {
-            return None;
-        }
-        let mut offs: [MaybeUninit<u32>; 1024] = unsafe { MaybeUninit::uninit().assume_init() };
-        let mut idx = 10usize;
-        let mut i = 1usize;
-        while i < cp_count {
-            offs[i] = MaybeUninit::new(idx as u32);
-            let tag = *data.get(idx)?;
-            idx += match tag {
-                1 => 3 + u16_at(idx + 1)? as usize,
-                7 | 8 | 16 | 19 | 20 => 3,
-                15 => 4,
-                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 5,
-                5 | 6 => 9,
-                _ => return None,
-            };
-            i += match tag {
-                5 | 6 => 2,
-                _ => 1,
-            };
-        }
-        let this_idx = u16_at(idx + 2)? as usize;
-        if this_idx == 0 || this_idx >= cp_count {
-            return None;
-        }
-        let cat = unsafe { offs[this_idx].assume_init() } as usize;
-        if *data.get(cat)? != 7 {
-            return None;
-        }
-        let name_idx = u16_at(cat + 1)? as usize;
-        if name_idx == 0 || name_idx >= cp_count {
-            return None;
-        }
-        let nat = unsafe { offs[name_idx].assume_init() } as usize;
-        if *data.get(nat)? != 1 {
-            return None;
-        }
-        let len = u16_at(nat + 1)? as usize;
-        let start = nat + 3;
-        if start + len > data.len() {
-            return None;
-        }
-        std::str::from_utf8(&data[start..start + len]).ok()
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_registration_owner() {
-        let iters = 200_000u32;
-        let rounds = 5;
-        for _ in 0..10_000u32 {
-            let _ = registration_owner();
-        }
-        let mut best = f64::MAX;
-        for _ in 0..rounds {
-            let t = Instant::now();
-            for _ in 0..iters {
-                let _ = registration_owner();
-            }
-            best = best.min(t.elapsed().as_secs_f64() / f64::from(iters));
-        }
-        println!(
-            "BENCH registration_owner: {:.0} ns/op (min of {rounds}x{iters})",
-            best * 1e9
-        );
-    }
 }

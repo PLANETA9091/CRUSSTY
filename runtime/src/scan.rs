@@ -31,6 +31,35 @@ pub struct CPlugin {
     pub id: String,
     /// Declared dependencies (manifest `dependencies`), empty if none.
     pub deps: Vec<String>,
+    /// Manifest `options` (same `k=v;k=v` format as the global agent
+    /// options). When present it is passed to THIS module's `cplugin_init`
+    /// instead of the global string — modules no longer parse each other's
+    /// settings. `None` keeps the historical behavior (global options).
+    pub options: Option<String>,
+}
+
+/// Multi-module boot hygiene: two directories claiming the same id must not
+/// both load. The first (scan order = sorted path) wins; every later
+/// duplicate is refused LOUDLY — a silent second load would double-register
+/// hooks under one owner id (a hot reload purge of that id would kill BOTH
+/// modules' hooks) and the hot-reload registry would refuse the duplicate
+/// anyway ("already registered"), leaving a half-initialized zombie.
+pub fn dedupe_plugins(found: Vec<CPlugin>) -> (Vec<CPlugin>, Vec<String>) {
+    let mut kept = Vec::with_capacity(found.len());
+    let mut refused = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in found {
+        if !seen.insert(p.id.clone()) {
+            refused.push(format!(
+                "duplicate module id '{}' at {} refused (another directory owns this id)",
+                p.id,
+                p.lib_path.display()
+            ));
+            continue;
+        }
+        kept.push(p);
+    }
+    (kept, refused)
 }
 
 /// Scan `root` recursively for plugins. Plugins are directories containing a
@@ -157,6 +186,10 @@ fn load_manifest(manifest_path: &Path) -> Option<CPlugin> {
     // existing file inside the plugin directory — an absolute path (POSIX
     // `/`, Windows `C:\`, UNC `\\`) or any `..`-escaping component in `main`
     // marks the manifest as malformed and the whole plugin is skipped.
+    let options = v
+        .get("options")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
     let entry = match v.get("main").and_then(|s| s.as_str()) {
         Some(m) if !is_absolute_path(m) && !m.split(['/', '\\']).any(|c| c == "..") => {
             dir.join(m)
@@ -171,6 +204,7 @@ fn load_manifest(manifest_path: &Path) -> Option<CPlugin> {
         lib_path: entry,
         id,
         deps,
+        options,
     })
 }
 
@@ -517,5 +551,60 @@ mod tests {
         );
         assert!(scan(&root).is_empty());
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multi_module_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_options_are_parsed() {
+        let dir = std::env::temp_dir().join(format!("cplug-opts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("module.json"),
+            r#"{"id":"optsmod","options":"seed=42;regen=off"}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("liboptsmod.so"), b"x").unwrap();
+        let found = scan(&dir);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].options.as_deref(),
+            Some("seed=42;regen=off"),
+            "manifest options reach the module"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_without_options_is_none() {
+        let dir = std::env::temp_dir().join(format!("cplug-noopts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("module.json"), r#"{"id":"noopts"}"#).unwrap();
+        fs::write(dir.join("libnoopts.so"), b"x").unwrap();
+        let found = scan(&dir);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].options.is_none(), "no options field -> None -> global options passed");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dedupe_keeps_first_and_refuses_later_ids() {
+        let mk = |id: &str, file: &str| CPlugin {
+            lib_path: PathBuf::from(file),
+            id: id.to_string(),
+            deps: vec![],
+            options: None,
+        };
+        let found = vec![mk("saves", "/mods/a/liba.so"), mk("faster", "/mods/b/libb.so"), mk("saves", "/mods/c/libc.so"), mk("saves", "/mods/d/libd.so")];
+        let (kept, refused) = dedupe_plugins(found);
+        let ids: Vec<&str> = kept.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["saves", "faster"], "first occurrence per id wins");
+        assert_eq!(kept[0].lib_path.to_string_lossy(), "/mods/a/liba.so");
+        assert_eq!(refused.len(), 2, "both duplicates refused loudly");
+        assert!(refused[0].contains("libc.so"), "refusal names the refused path");
+        assert!(refused[0].contains("duplicate module id 'saves'"));
     }
 }
