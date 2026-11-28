@@ -93,6 +93,31 @@ pub type PacketHookCb = unsafe extern "C" fn(
     ctx: *mut c_void,
 ) -> i32;
 
+/// Mutable packet snapshot handed to a REWRITE hook (valid for the call only).
+///
+/// `payload` is the runtime's buffer and may be edited in place (same length).
+/// For a length change set `out_payload`/`out_len` to a module-owned buffer;
+/// the runtime copies it before the callback returns, so the module keeps
+/// ownership. `out_payload = NULL` keeps the in-place bytes. A rewrite hook
+/// never drops or disconnects (use [`PacketHookCb`] for verdicts).
+#[repr(C)]
+pub struct CPacketRewrite {
+    pub direction: i32, // 0 = inbound, 1 = outbound
+    /// Protocol state when known; 255 = the seam could not resolve it
+    /// (outbound encode time has no connection object).
+    pub state: u8,
+    /// Runtime-owned payload buffer, editable in place.
+    pub payload: *mut u8,
+    pub payload_len: usize,
+    pub conn_id: u64,
+    /// Optional replacement payload (module-owned, copied by the runtime).
+    pub out_payload: *const u8,
+    pub out_len: usize,
+}
+
+/// Rewrite callback: mutate the packet in place or publish a replacement.
+pub type PacketRewriteCb = unsafe extern "C" fn(pkt: *mut CPacketRewrite, ctx: *mut c_void) -> i32;
+
 /// Save-lifecycle callback (`save_events` brick).
 /// kind: 0 = autosave, 1 = manual; status: 0 = ok, 1 = failed.
 pub type SaveCb = unsafe extern "C" fn(
@@ -217,9 +242,15 @@ pub struct CPlatformApi {
     // --- side_table (brick 2) -------------------------------------------------
     pub side_table_key: Option<unsafe extern "C" fn(obj: *mut c_void, out: *mut u64) -> i32>,
     pub side_table_named: Option<unsafe extern "C" fn(name: *const c_char, out: *mut u64) -> i32>,
+
+    /// (v3.1+) Payload-rewriting hook: sees every intercepted packet and may
+    /// edit or replace its bytes. NULL on older runtimes — check before use.
+    /// Appended LAST so the existing offsets stay binary-compatible.
+    pub network_add_rewrite_hook:
+        Option<unsafe extern "C" fn(cb: PacketRewriteCb, ctx: *mut c_void) -> i32>,
 }
 
-pub const CPB_VERSION: u32 = 1;
+pub const CPB_VERSION: u32 = 2;
 
 /// Agent -> plugin services.
 #[repr(C)]
